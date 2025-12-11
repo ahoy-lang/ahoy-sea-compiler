@@ -1,0 +1,397 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+)
+
+// Preprocessor handles C preprocessor directives
+type Preprocessor struct {
+	defines      map[string]string
+	includePaths []string
+	processed    map[string]bool  // Track processed files to avoid cycles
+	mu           sync.RWMutex      // For thread-safe define access
+	typedefMap   map[string]*StructDef // External typedefs from headers
+	structMap    map[string]*StructDef // External structs from headers
+}
+
+func NewPreprocessor() *Preprocessor {
+	return &Preprocessor{
+		defines:      make(map[string]string),
+		includePaths: []string{"/usr/include", "/usr/local/include", "."},
+		processed:    make(map[string]bool),
+		typedefMap:   make(map[string]*StructDef),
+		structMap:    make(map[string]*StructDef),
+	}
+}
+
+func (p *Preprocessor) AddIncludePath(path string) {
+	p.includePaths = append(p.includePaths, path)
+}
+
+func (p *Preprocessor) Define(name, value string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.defines[name] = value
+}
+
+func (p *Preprocessor) IsDefined(name string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	_, ok := p.defines[name]
+	return ok
+}
+
+func (p *Preprocessor) Process(source string) (string, error) {
+	lines := strings.Split(source, "\n")
+	var result strings.Builder
+	
+	// Stack for conditional compilation
+	type condState struct {
+		active bool  // Whether this block is active
+		taken  bool  // Whether any branch was taken
+	}
+	condStack := []condState{{active: true, taken: false}}
+	
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		
+		// Handle preprocessor directives
+		if strings.HasPrefix(trimmed, "#") {
+			directive := strings.Fields(trimmed)
+			if len(directive) == 0 {
+				continue
+			}
+			
+			cmd := directive[0]
+			
+			switch cmd {
+			case "#include":
+				if !condStack[len(condStack)-1].active {
+					continue
+				}
+				
+				if len(directive) < 2 {
+					return "", fmt.Errorf("line %d: #include requires filename", i+1)
+				}
+				
+				filename := strings.Join(directive[1:], " ")
+				filename = strings.Trim(filename, `"<>`)
+				
+				// Read and process included file
+				content, err := p.processInclude(filename)
+				if err != nil {
+					// For now, just skip includes we can't find (libc headers)
+					result.WriteString(fmt.Sprintf("// Skipped: #include %s\n", filename))
+					continue
+				}
+				
+				result.WriteString(content)
+				result.WriteString("\n")
+				
+			case "#define":
+				if !condStack[len(condStack)-1].active {
+					continue
+				}
+				
+				if len(directive) < 2 {
+					return "", fmt.Errorf("line %d: #define requires name", i+1)
+				}
+				
+				name := directive[1]
+				value := ""
+				if len(directive) > 2 {
+					value = strings.Join(directive[2:], " ")
+				}
+				
+				p.Define(name, value)
+				result.WriteString(fmt.Sprintf("// #define %s %s\n", name, value))
+				
+			case "#ifdef":
+				if len(directive) < 2 {
+					return "", fmt.Errorf("line %d: #ifdef requires name", i+1)
+				}
+				
+				name := directive[1]
+				active := condStack[len(condStack)-1].active && p.IsDefined(name)
+				condStack = append(condStack, condState{active: active, taken: active})
+				
+			case "#ifndef":
+				if len(directive) < 2 {
+					return "", fmt.Errorf("line %d: #ifndef requires name", i+1)
+				}
+				
+				name := directive[1]
+				active := condStack[len(condStack)-1].active && !p.IsDefined(name)
+				condStack = append(condStack, condState{active: active, taken: active})
+				
+			case "#else":
+				if len(condStack) <= 1 {
+					return "", fmt.Errorf("line %d: #else without #ifdef/#ifndef", i+1)
+				}
+				
+				parent := condStack[len(condStack)-2].active
+				current := &condStack[len(condStack)-1]
+				current.active = parent && !current.taken
+				
+			case "#endif":
+				if len(condStack) <= 1 {
+					return "", fmt.Errorf("line %d: #endif without #ifdef/#ifndef", i+1)
+				}
+				
+				condStack = condStack[:len(condStack)-1]
+				
+			case "#if", "#elif", "#undef", "#pragma":
+				// Not implemented yet - just skip
+				result.WriteString(fmt.Sprintf("// %s\n", trimmed))
+				
+			default:
+				result.WriteString(fmt.Sprintf("// %s\n", trimmed))
+			}
+			
+			continue
+		}
+		
+		// Only include line if we're in an active block
+		if condStack[len(condStack)-1].active {
+			// Expand macros
+			expanded := p.expandMacros(line)
+			result.WriteString(expanded)
+			result.WriteString("\n")
+		}
+	}
+	
+	return result.String(), nil
+}
+
+func (p *Preprocessor) processInclude(filename string) (string, error) {
+	// Check if already processed (avoid cycles)
+	if p.processed[filename] {
+		return "", nil
+	}
+	
+	// Try to find the file
+	var fullPath string
+	var found bool
+	
+	for _, searchPath := range p.includePaths {
+		testPath := filepath.Join(searchPath, filename)
+		if _, err := os.Stat(testPath); err == nil {
+			fullPath = testPath
+			found = true
+			break
+		}
+	}
+	
+	if !found {
+		return "", fmt.Errorf("include file not found: %s", filename)
+	}
+	
+	// Read file
+	content, err := os.ReadFile(fullPath)
+	if err != nil {
+		return "", err
+	}
+	
+	// Mark as processed
+	p.processed[fullPath] = true
+	
+	// Recursively process
+	return p.Process(string(content))
+}
+
+func (p *Preprocessor) expandMacros(line string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	
+	result := line
+	
+	// Replace macros in the line
+	for name, value := range p.defines {
+		// Use word boundary matching
+		result = replaceIdentifier(result, name, value)
+	}
+	
+	return result
+}
+
+func replaceIdentifier(text, identifier, replacement string) string {
+	var result strings.Builder
+	i := 0
+	
+	for i < len(text) {
+		// Check if we found the identifier
+		if strings.HasPrefix(text[i:], identifier) {
+			// Check if it's a complete identifier (not part of another word)
+			if (i == 0 || !isIdentifierChar(text[i-1])) &&
+			   (i+len(identifier) >= len(text) || !isIdentifierChar(text[i+len(identifier)])) {
+				result.WriteString(replacement)
+				i += len(identifier)
+				continue
+			}
+		}
+		
+		result.WriteByte(text[i])
+		i++
+	}
+	
+	return result.String()
+}
+
+func isIdentifierChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// ProcessFile is a convenience function to preprocess a file
+func (p *Preprocessor) ProcessFile(filename string) (string, error) {
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		return "", err
+	}
+	
+	return p.Process(string(content))
+}
+
+// ExtractTypesFromHeader parses a header file to extract typedef and struct definitions
+func (p *Preprocessor) ExtractTypesFromHeader(filename string) error {
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+	
+	lines := strings.Split(string(content), "\n")
+	
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		
+		// Match: typedef struct { ... } TypeName;
+		if strings.HasPrefix(line, "typedef struct") {
+			// Collect multi-line struct definition
+			structDef := line
+			braceCount := strings.Count(line, "{") - strings.Count(line, "}")
+			
+			for braceCount > 0 && i+1 < len(lines) {
+				i++
+				nextLine := strings.TrimSpace(lines[i])
+				structDef += " " + nextLine
+				braceCount += strings.Count(nextLine, "{") - strings.Count(nextLine, "}")
+			}
+			
+			// Parse the typedef
+			p.parseTypedefStruct(structDef)
+		}
+	}
+	
+	return nil
+}
+
+// parseTypedefStruct parses a typedef struct definition
+func (p *Preprocessor) parseTypedefStruct(def string) {
+	// Example: typedef struct { float x; float y; } Vector2;
+	// Example: typedef struct Color { unsigned char r, g, b, a; } Color;
+	
+	// Find the type name (after closing brace)
+	closeBraceIdx := strings.LastIndex(def, "}")
+	if closeBraceIdx == -1 {
+		return
+	}
+	
+	afterBrace := strings.TrimSpace(def[closeBraceIdx+1:])
+	afterBrace = strings.TrimSuffix(afterBrace, ";")
+	afterBrace = strings.TrimSpace(afterBrace)
+	
+	typeName := afterBrace
+	if typeName == "" {
+		return
+	}
+	
+	// Extract member definitions between braces
+	openBraceIdx := strings.Index(def, "{")
+	if openBraceIdx == -1 {
+		return
+	}
+	
+	membersStr := def[openBraceIdx+1 : closeBraceIdx]
+	members := p.parseStructMembers(membersStr)
+	
+	// Create struct type
+	structType := &StructDef{
+		Name:    typeName,
+		Members: members,
+	}
+	
+	p.typedefMap[typeName] = structType
+	p.structMap[typeName] = structType
+}
+
+// parseStructMembers parses struct member declarations
+func (p *Preprocessor) parseStructMembers(membersStr string) []StructMember {
+	var members []StructMember
+	
+	// Split by semicolon to get individual member declarations
+	declarations := strings.Split(membersStr, ";")
+	
+	for _, decl := range declarations {
+		decl = strings.TrimSpace(decl)
+		if decl == "" {
+			continue
+		}
+		
+		// Parse declaration like "float x, y" or "unsigned char r"
+		parts := strings.Fields(decl)
+		if len(parts) < 2 {
+			continue
+		}
+		
+		// Build type name from all but last part
+		typeParts := parts[:len(parts)-1]
+		typeStr := strings.Join(typeParts, " ")
+		
+		// Last part contains variable name(s), possibly comma-separated
+		namesStr := parts[len(parts)-1]
+		names := strings.Split(namesStr, ",")
+		
+		for _, name := range names {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				members = append(members, StructMember{
+					Name: name,
+					Type: p.mapTypeString(typeStr),
+				})
+			}
+		}
+	}
+	
+	return members
+}
+
+// mapTypeString converts C type string to internal type
+func (p *Preprocessor) mapTypeString(typeStr string) string {
+	typeStr = strings.TrimSpace(typeStr)
+	
+	switch typeStr {
+	case "int", "signed int":
+		return "int"
+	case "unsigned int", "unsigned":
+		return "int" // Treat as int for now
+	case "char", "signed char":
+		return "char"
+	case "unsigned char":
+		return "char" // Treat as char for now
+	case "float":
+		return "float"
+	case "double":
+		return "double"
+	case "void":
+		return "void"
+	default:
+		// Could be a pointer or custom type
+		if strings.HasSuffix(typeStr, "*") {
+			return typeStr // Keep pointer notation
+		}
+		return typeStr // Return as-is for custom types
+	}
+}
