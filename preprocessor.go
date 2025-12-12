@@ -28,14 +28,15 @@ func NewPreprocessor() *Preprocessor {
 	}
 }
 
-func (p *Preprocessor) AddIncludePath(path string) {
-	p.includePaths = append(p.includePaths, path)
-}
-
+// Define adds a preprocessor define
 func (p *Preprocessor) Define(name, value string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.defines[name] = value
+}
+
+func (p *Preprocessor) AddIncludePath(path string) {
+	p.includePaths = append(p.includePaths, path)
 }
 
 func (p *Preprocessor) IsDefined(name string) bool {
@@ -282,10 +283,49 @@ func (p *Preprocessor) ExtractTypesFromHeader(filename string) error {
 			
 			// Parse the typedef
 			p.parseTypedefStruct(structDef)
+		} else if strings.HasPrefix(line, "typedef ") && !strings.Contains(line, "{") {
+			// Simple typedef alias: typedef OldType NewType;
+			p.parseSimpleTypedef(line)
 		}
 	}
 	
 	return nil
+}
+
+// parseSimpleTypedef parses a simple type alias
+func (p *Preprocessor) parseSimpleTypedef(line string) {
+	// Example: typedef Texture Texture2D;
+	// Example: typedef struct Color Color;
+	
+	line = strings.TrimPrefix(line, "typedef")
+	line = strings.TrimSpace(line)
+	line = strings.TrimSuffix(line, ";")
+	line = strings.TrimSpace(line)
+	
+	// Split into tokens
+	tokens := strings.Fields(line)
+	if len(tokens) < 2 {
+		return
+	}
+	
+	// Last token is the new type name
+	newTypeName := tokens[len(tokens)-1]
+	// Everything before is the old type
+	oldType := strings.Join(tokens[:len(tokens)-1], " ")
+	
+	// For simple aliases, we just create a struct with the same definition as the original
+	// If the original is in our structMap, copy it
+	if existing, ok := p.structMap[oldType]; ok {
+		p.typedefMap[newTypeName] = existing
+		p.structMap[newTypeName] = existing
+	} else {
+		// Otherwise, create a placeholder struct
+		// This allows the typedef to be recognized even if we don't know the full definition
+		p.typedefMap[newTypeName] = &StructDef{
+			Name: newTypeName,
+			Members: []StructMember{},
+		}
+	}
 }
 
 // parseTypedefStruct parses a typedef struct definition

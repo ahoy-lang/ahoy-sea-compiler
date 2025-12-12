@@ -56,17 +56,25 @@ func (cp *CompilerPipeline) Compile() error {
 		}
 		start := time.Now()
 		
-		// Extract types from common raylib headers if they exist
-		raylibHeaders := []string{
+		// Extract types from common headers if they exist
+		commonHeaders := []string{
 			"/home/lee/Documents/clibs/raylib/src/raylib.h",
 			"/home/lee/Documents/clibs/raylib/src/raymath.h",
+			"/usr/include/stdint.h",
+			"/usr/include/x86_64-linux-gnu/sys/types.h",
 		}
 		
-		for _, header := range raylibHeaders {
+		for _, header := range commonHeaders {
 			if _, err := os.Stat(header); err == nil {
 				preprocessor.ExtractTypesFromHeader(header)
 			}
 		}
+		
+		// Add common signal constants as defines
+		preprocessor.Define("SIGSEGV", "11")
+		preprocessor.Define("SIGILL", "4")
+		preprocessor.Define("SIGFPE", "8")
+		preprocessor.Define("SIGABRT", "6")
 		
 		preprocessedSource, err = preprocessor.Process(cp.source)
 		if err != nil {
@@ -90,6 +98,11 @@ func (cp *CompilerPipeline) Compile() error {
 		cp.parser.structs[name] = structDef
 		// Also add typedef alias
 		cp.parser.typedefs[name] = name
+	}
+	// Pass typedef aliases to parser
+	for alias := range preprocessor.typedefMap {
+		// Register the alias as a known typedef
+		cp.parser.typedefs[alias] = alias
 	}
 	cp.ast, err = cp.parser.Parse()
 	if err != nil {

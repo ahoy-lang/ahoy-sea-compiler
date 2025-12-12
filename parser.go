@@ -1725,8 +1725,38 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 			return p.parseStatementExpression()
 		}
 		
-		// Check for cast or compound literal
-		if p.match(INT, CHAR_KW, FLOAT, DOUBLE, STRUCT, UNION, VOID, UNSIGNED, SIGNED, LONG, SHORT) || p.isTypeName() {
+		// Check for cast: (typename)
+		// We need to distinguish (Type)expr from (expr)
+		// Strategy: A cast has the pattern: ( type-specifiers * ) where there's a ) after the type
+		// Use lookahead to check if this looks like a cast before committing
+		
+		isCast := false
+		
+		// Definite type keywords indicate a cast
+		if p.match(INT, CHAR_KW, FLOAT, DOUBLE, VOID, UNSIGNED, SIGNED, LONG, SHORT, CONST) {
+			isCast = true
+		} else if p.match(STRUCT, UNION) {
+			// struct/union is definitely a type
+			isCast = true
+		} else if p.isTypeName() {
+			// It's a typedef - need to check if it's being used as a type or variable
+			// Heuristic: if next token after identifier is * or ), it's likely a cast
+			// (TypeName*) expr   -> cast
+			// (TypeName) expr    -> could be cast or paren expr
+			// (varname + 1)      -> paren expr
+			
+			// Peek ahead: after the identifier, what comes next?
+			if p.pos+1 < len(p.tokens) {
+				nextToken := p.tokens[p.pos+1]
+				if nextToken.Type == STAR || nextToken.Type == RPAREN {
+					// (TypeName*) or (TypeName) - likely a cast
+					isCast = true
+				}
+			}
+		}
+		
+		if isCast {
+			// Parse as cast
 			castType := p.parseType()
 			if p.match(RPAREN) {
 				p.advance()
@@ -1736,7 +1766,7 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 					return p.parseCompoundLiteral(castType)
 				}
 				
-				// Regular cast
+				// Regular cast: (Type)expr
 				expr, err := p.parseUnary()
 				if err != nil {
 					return nil, err
@@ -1747,15 +1777,18 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 					Children: []*ASTNode{expr},
 				}, nil
 			}
+			// If no RPAREN, this is a parse error
+			return nil, fmt.Errorf("expected ) after type in cast at line %d", p.current().Line)
 		}
 		
+		// Not a cast, parse as regular parenthesized expression
 		expr, err := p.parseExpression()
 		if err != nil {
 			return nil, err
 		}
 		
 		if !p.match(RPAREN) {
-			return nil, fmt.Errorf("expected )")
+			return nil, fmt.Errorf("expected ) at line %d, got %s", p.current().Line, p.current().Lexeme)
 		}
 		p.advance()
 		
