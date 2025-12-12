@@ -220,10 +220,20 @@ func (cp *CompilerPipeline) AssembleAndLink(outputBinary string) error {
 		return fmt.Errorf("failed to write assembly: %w", err)
 	}
 	
-	// Assemble and link with GCC
+	// Assemble and link with GCC  
 	gccArgs := []string{"-no-pie", asmFile, "-o", outputBinary}
 	
-	// Add library flags
+	// Add Raylib library flags
+	gccArgs = append(gccArgs,
+		"-L/home/lee/Documents/clibs/raylib/src",
+		"-lraylib",
+		"-lm",
+		"-lpthread",
+		"-ldl",
+		"-lrt",
+	)
+	
+	// Add any additional library flags from options
 	if len(cp.options.LibraryFlags) > 0 {
 		gccArgs = append(gccArgs, cp.options.LibraryFlags...)
 	}
@@ -275,7 +285,6 @@ func (cp *CompilerPipeline) AssembleAndLinkNative(outputBinary string) error {
 		"-lpthread",
 		"-ldl",
 		"-lrt",
-		"-lX11",
 	}
 	
 	cmd := exec.Command("gcc", gccArgs...)
@@ -452,16 +461,22 @@ func runCompiler() {
 		
 		err := cmd.Run()
 		
-		if options.Verbose {
-			fmt.Printf("\n=== Program Finished ===\n")
-		}
-		
 		if err != nil {
+			if options.Verbose {
+				fmt.Printf("\n=== Program Crashed ===\n")
+			}
 			if exitErr, ok := err.(*exec.ExitError); ok {
+				if options.Verbose {
+					fmt.Fprintf(os.Stderr, "Exit code: %d\n", exitErr.ExitCode())
+				}
 				os.Exit(exitErr.ExitCode())
 			}
 			fmt.Fprintf(os.Stderr, "\nProgram error: %v\n", err)
 			os.Exit(1)
+		}
+		
+		if options.Verbose {
+			fmt.Printf("\n=== Program Finished Successfully ===\n")
 		}
 		
 		if options.Verbose {

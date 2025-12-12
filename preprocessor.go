@@ -21,7 +21,7 @@ type Preprocessor struct {
 func NewPreprocessor() *Preprocessor {
 	p := &Preprocessor{
 		defines:      make(map[string]string),
-		includePaths: []string{"/usr/include", "/usr/local/include", "."},
+		includePaths: []string{"/usr/include", "/usr/local/include", ".", "/home/lee/Documents/clibs/raylib/src"},
 		processed:    make(map[string]bool),
 		typedefMap:   make(map[string]*StructDef),
 		structMap:    make(map[string]*StructDef),
@@ -32,6 +32,117 @@ func NewPreprocessor() *Preprocessor {
 	p.defines["true"] = "1"
 	p.defines["false"] = "0"
 	
+	// Parse raylib.h to get actual constant values
+	p.parseRaylibHeader()
+	
+	return p
+}
+
+// parseRaylibHeader parses raylib.h to extract enum constants
+func (p *Preprocessor) parseRaylibHeader() {
+	raylibPath := "/home/lee/Documents/clibs/raylib/src/raylib.h"
+	content, err := os.ReadFile(raylibPath)
+	if err != nil {
+		// If we can't read raylib.h, add some fallback defines
+		fmt.Fprintf(os.Stderr, "Warning: Could not read %s: %v\n", raylibPath, err)
+		p.addFallbackDefines()
+		return
+	}
+	
+	lines := strings.Split(string(content), "\n")
+	inEnum := false
+	enumValue := 0
+	
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		
+		// Skip comments
+		if strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*") {
+			continue
+		}
+		
+		// Check for #define directives
+		if strings.HasPrefix(line, "#define") {
+			parts := strings.Fields(line)
+			if len(parts) >= 3 {
+				name := parts[1]
+				value := strings.Join(parts[2:], " ")
+				// Clean up the value
+				value = strings.TrimSpace(value)
+				value = strings.Split(value, "//")[0] // Remove trailing comments
+				value = strings.TrimSpace(value)
+				
+				// Only add simple numeric or identifier defines
+				if len(value) > 0 && (isNumeric(value) || p.IsDefined(value)) {
+					p.defines[name] = value
+				}
+			}
+			continue
+		}
+		
+		// Check for enum start
+		if strings.Contains(line, "typedef enum") || (strings.Contains(line, "enum") && strings.Contains(line, "{")) {
+			inEnum = true
+			enumValue = 0
+			continue
+		}
+		
+		// Check for enum end
+		if inEnum && strings.Contains(line, "}") {
+			inEnum = false
+			continue
+		}
+		
+		// Parse enum values
+		if inEnum {
+			// Remove comments
+			line = strings.Split(line, "//")[0]
+			line = strings.TrimSpace(line)
+			
+			if line == "" || line == "{" {
+				continue
+			}
+			
+			// Handle enum entries
+			if strings.Contains(line, "=") {
+				// Explicit value: NAME = value,
+				parts := strings.Split(line, "=")
+				if len(parts) >= 2 {
+					name := strings.TrimSpace(parts[0])
+					valueStr := strings.TrimSuffix(strings.TrimSpace(parts[1]), ",")
+					valueStr = strings.TrimSpace(valueStr)
+					
+					// Parse the value (might be hex like 0x00000040)
+					if strings.HasPrefix(valueStr, "0x") || strings.HasPrefix(valueStr, "0X") {
+						// Hex value
+						var val int
+						fmt.Sscanf(valueStr, "%x", &val)
+						p.defines[name] = fmt.Sprintf("%d", val)
+						enumValue = val + 1
+					} else {
+						// Try to parse as decimal
+						var val int
+						n, _ := fmt.Sscanf(valueStr, "%d", &val)
+						if n == 1 {
+							p.defines[name] = fmt.Sprintf("%d", val)
+							enumValue = val + 1
+						}
+					}
+				}
+			} else {
+				// Implicit value: NAME,
+				name := strings.TrimSuffix(strings.TrimSpace(line), ",")
+				if name != "" && name != "{" && name != "}" {
+					p.defines[name] = fmt.Sprintf("%d", enumValue)
+					enumValue++
+				}
+			}
+		}
+	}
+}
+
+// addFallbackDefines adds hardcoded fallback defines if raylib.h can't be read
+func (p *Preprocessor) addFallbackDefines() {
 	// Add raylib log levels
 	p.defines["LOG_ALL"] = "0"
 	p.defines["LOG_TRACE"] = "1"
@@ -68,8 +179,25 @@ func NewPreprocessor() *Preprocessor {
 	p.defines["SHADER_UNIFORM_IVEC3"] = "6"
 	p.defines["SHADER_UNIFORM_IVEC4"] = "7"
 	p.defines["SHADER_UNIFORM_SAMPLER2D"] = "8"
-	
-	return p
+}
+
+// Helper to check if a string is numeric
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		return len(s) > 2
+	}
+	if strings.HasPrefix(s, "-") {
+		s = s[1:]
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // Define adds a preprocessor define

@@ -93,19 +93,22 @@ func NewInstructionSelector() *InstructionSelector {
 	
 	// Add standard library external symbols
 	is.globalVars["stderr"] = &Symbol{
-		Name:     "stderr",
-		Type:     "void*",
-		IsGlobal: true,
+		Name:       "stderr",
+		Type:       "void*",
+		IsGlobal:   true,
+		IsExternal: true,
 	}
 	is.globalVars["stdout"] = &Symbol{
-		Name:     "stdout",
-		Type:     "void*",
-		IsGlobal: true,
+		Name:       "stdout",
+		Type:       "void*",
+		IsGlobal:   true,
+		IsExternal: true,
 	}
 	is.globalVars["stdin"] = &Symbol{
-		Name:     "stdin",
-		Type:     "void*",
-		IsGlobal: true,
+		Name:       "stdin",
+		Type:       "void*",
+		IsGlobal:   true,
+		IsExternal: true,
 	}
 	
 	// Add raylib color constants as external symbols

@@ -70,6 +70,7 @@ type Symbol struct {
 	Name       string
 	Offset     int  // Stack offset for locals
 	IsGlobal   bool
+	IsExternal bool // For libc symbols like stderr, stdout, stdin
 	Size       int
 	Type       string
 	ArraySize  int  // For arrays, 0 if not an array

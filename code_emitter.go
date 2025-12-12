@@ -71,6 +71,10 @@ func (ce *CodeEmitter) emitBssSection() {
 	
 	ce.bssSection.WriteString("    .bss\n")
 	for name, sym := range ce.globalVars {
+		// Skip external symbols (libc provides these)
+		if sym.IsExternal {
+			continue
+		}
 		ce.bssSection.WriteString(fmt.Sprintf("    .comm %s,%d,%d\n", name, sym.Size, sym.Size))
 	}
 }
@@ -125,8 +129,8 @@ func (ce *CodeEmitter) emitFunction(name string, startIdx *int) {
 	ce.output.WriteString("    pushq %rbp\n")
 	ce.output.WriteString("    movq %rsp, %rbp\n")
 	
-	// Calculate stack size needed
-	ce.stackSize = ce.calculateStackSize(*startIdx)
+	// Calculate stack size needed (skip the label instruction itself)
+	ce.stackSize = ce.calculateStackSize(*startIdx + 1)
 	if ce.stackSize > 0 {
 		// Align to 16 bytes
 		ce.stackSize = (ce.stackSize + 15) & ^15
@@ -172,7 +176,7 @@ func (ce *CodeEmitter) calculateStackSize(startIdx int) int {
 		
 		operands := []*Operand{instr.Dst, instr.Src1, instr.Src2}
 		for _, op := range operands {
-			if op != nil && op.Type == "mem" && op.Offset < 0 {
+			if op != nil && (op.Type == "mem" || op.Type == "var") && op.Offset < 0 {
 				offset := -op.Offset
 				if offset > maxOffset {
 					maxOffset = offset
@@ -737,10 +741,7 @@ func (ce *CodeEmitter) loadFloatIfNeeded(op *Operand, tempReg string) string {
 
 func (ce *CodeEmitter) emitCall(instr *IRInstruction) {
 	// Arguments should already be in registers from OpMov instructions
-	// Just need to align stack and call
-	
-	// Align stack to 16 bytes
-	ce.output.WriteString("    andq $-16, %rsp\n")
+	// Stack alignment should be handled in function prologue, not here
 	
 	// Call
 	ce.output.WriteString(fmt.Sprintf("    call %s\n", instr.Src1.Value))
@@ -766,7 +767,7 @@ func (ce *CodeEmitter) formatOperand(op *Operand) string {
 		return op.Value
 	case "mem":
 		if op.Offset == 0 {
-			return "(%%rbp)"
+			return "(%rbp)"
 		}
 		return fmt.Sprintf("%d(%%rbp)", op.Offset)
 	case "var":
