@@ -108,6 +108,7 @@ func (cp *CompilerPipeline) Compile() error {
 	
 	cp.selector = NewInstructionSelector()
 	cp.selector.structs = cp.parser.structs  // Pass struct definitions
+	cp.selector.typedefs = cp.parser.typedefs  // Pass typedef aliases
 	err = cp.selector.SelectInstructions(cp.ast)
 	if err != nil {
 		return fmt.Errorf("instruction selection error: %w", err)

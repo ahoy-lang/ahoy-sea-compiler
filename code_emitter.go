@@ -15,12 +15,14 @@ type CodeEmitter struct {
 	instructions []*IRInstruction
 	stringLits   map[string]string
 	globalVars   map[string]*Symbol
+	floatLits    map[string]string  // float literal value -> label
 	
 	currentFunc   string
 	stackSize     int
 	usedRegisters []int
 	
 	labelCounter  int
+	floatCounter  int
 }
 
 func NewCodeEmitter(instructions []*IRInstruction, stringLits map[string]string, globalVars map[string]*Symbol) *CodeEmitter {
@@ -28,26 +30,37 @@ func NewCodeEmitter(instructions []*IRInstruction, stringLits map[string]string,
 		instructions:  instructions,
 		stringLits:    stringLits,
 		globalVars:    globalVars,
+		floatLits:     make(map[string]string),
 	}
 }
 
 func (ce *CodeEmitter) Emit() string {
-	ce.emitDataSection()
 	ce.emitBssSection()
 	ce.emitTextSection()
+	// Emit data section last, after we've discovered all float literals
+	ce.emitDataSection()
 	
 	return ce.buildOutput()
 }
 
 func (ce *CodeEmitter) emitDataSection() {
-	if len(ce.stringLits) == 0 {
+	if len(ce.stringLits) == 0 && len(ce.floatLits) == 0 {
 		return
 	}
 	
 	ce.rodataSection.WriteString("    .section .rodata\n")
+	
+	// Emit string literals
 	for label, str := range ce.stringLits {
 		ce.rodataSection.WriteString(fmt.Sprintf("%s:\n", label))
 		ce.rodataSection.WriteString(fmt.Sprintf("    .string \"%s\"\n", escapeString(str)))
+	}
+	
+	// Emit float literals
+	for label, value := range ce.floatLits {
+		ce.rodataSection.WriteString(fmt.Sprintf("    .align 8\n"))
+		ce.rodataSection.WriteString(fmt.Sprintf("%s:\n", label))
+		ce.rodataSection.WriteString(fmt.Sprintf("    .double %s\n", value))
 	}
 }
 
@@ -314,6 +327,20 @@ func (ce *CodeEmitter) emitMov(dst, src *Operand) {
 	dstStr := ce.formatOperand(dst)
 	srcStr := ce.formatOperand(src)
 	
+	// Handle floating point immediate values
+	if src.Type == "imm" && strings.Contains(src.Value, ".") {
+		// It's a float literal - store in .rodata and load address
+		label, exists := ce.floatLits[src.Value]
+		if !exists {
+			ce.floatCounter++
+			label = fmt.Sprintf(".FC%d", ce.floatCounter)
+			ce.floatLits[label] = src.Value
+		}
+		// Load the float constant as a 64-bit integer from .rodata
+		ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %s\n", label, dstStr))
+		return
+	}
+	
 	// Handle label (string literals, addresses) - use leaq
 	if src.Type == "label" {
 		ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %s\n", src.Value, dstStr))
@@ -362,7 +389,15 @@ func (ce *CodeEmitter) emitDiv(dst, src1, src2 *Operand) {
 	// Division requires RAX and RDX
 	ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", ce.formatOperand(src1)))
 	ce.output.WriteString("    cqto\n")
-	ce.output.WriteString(fmt.Sprintf("    idivq %s\n", ce.formatOperand(src2)))
+	
+	// idivq cannot take immediate operands - load to register first
+	if src2.Type == "imm" {
+		ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", ce.formatOperand(src2)))
+		ce.output.WriteString("    idivq %r11\n")
+	} else {
+		ce.output.WriteString(fmt.Sprintf("    idivq %s\n", ce.formatOperand(src2)))
+	}
+	
 	ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", ce.formatOperand(dst)))
 }
 
@@ -370,7 +405,15 @@ func (ce *CodeEmitter) emitMod(dst, src1, src2 *Operand) {
 	// Modulo - result in RDX
 	ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", ce.formatOperand(src1)))
 	ce.output.WriteString("    cqto\n")
-	ce.output.WriteString(fmt.Sprintf("    idivq %s\n", ce.formatOperand(src2)))
+	
+	// idivq cannot take immediate operands - load to register first
+	if src2.Type == "imm" {
+		ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", ce.formatOperand(src2)))
+		ce.output.WriteString("    idivq %r11\n")
+	} else {
+		ce.output.WriteString(fmt.Sprintf("    idivq %s\n", ce.formatOperand(src2)))
+	}
+	
 	ce.output.WriteString(fmt.Sprintf("    movq %%rdx, %s\n", ce.formatOperand(dst)))
 }
 
@@ -410,12 +453,12 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 		
 		if src.IsGlobal {
 			// Global array: load from symbol + offset
-			ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %%rax\n", src.Value))
-			ce.output.WriteString(fmt.Sprintf("    movq (%%rax, %%r11, 1), %s\n", dstReg))
+			ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %%rdx\n", src.Value))
+			ce.output.WriteString(fmt.Sprintf("    movq (%%rdx, %%r11, 1), %s\n", dstReg))
 		} else {
 			// Local array: load from rbp + base_offset + computed_offset
-			ce.output.WriteString(fmt.Sprintf("    leaq %d(%%rbp), %%rax\n", src.Offset))
-			ce.output.WriteString(fmt.Sprintf("    movq (%%rax, %%r11, 1), %s\n", dstReg))
+			ce.output.WriteString(fmt.Sprintf("    leaq %d(%%rbp), %%rdx\n", src.Offset))
+			ce.output.WriteString(fmt.Sprintf("    movq (%%rdx, %%r11, 1), %s\n", dstReg))
 		}
 	case "addr":
 		// Address-of: compute address and store in dst

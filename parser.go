@@ -265,7 +265,7 @@ func (p *Parser) parseTopLevel() (*ASTNode, error) {
 		p.advance()
 		
 		// typedef struct { ... } Name; or typedef struct Name Name;
-		if p.match(STRUCT) {
+		if p.match(STRUCT, UNION) {
 			p.advance()
 			
 			var structName string
@@ -385,8 +385,8 @@ func (p *Parser) parseTopLevel() (*ASTNode, error) {
 		return nil, nil
 	}
 	
-	// Skip struct/typedef/enum - parse struct definitions
-	if p.match(STRUCT) {
+	// Skip struct/union/typedef/enum - parse struct/union definitions
+	if p.match(STRUCT, UNION) {
 		err := p.parseStructDef()
 		if err != nil {
 			return nil, err
@@ -428,18 +428,94 @@ func (p *Parser) parseType() string {
 		p.advance()
 	}
 	
-	// Base type
+	// Type modifiers (unsigned, signed, long, short)
+	for p.match(UNSIGNED, SIGNED, LONG, SHORT) {
+		typ += p.current().Lexeme + " "
+		p.advance()
+	}
+	
+	// Base type (optional after modifiers - defaults to int)
 	if p.match(INT, VOID, CHAR_KW, FLOAT, DOUBLE) {
 		typ += p.current().Lexeme
 		p.advance()
-	} else if p.match(STRUCT) {
+	} else if p.match(STRUCT, UNION) {
+		structOrUnion := p.current().Lexeme  // "struct" or "union"
 		p.advance()
 		if p.match(IDENTIFIER) {
-			typ = "struct " + p.current().Lexeme
+			typ = structOrUnion + " " + p.current().Lexeme
 			p.advance()
+		} else if p.match(LBRACE) {
+			// Anonymous struct/union definition
+			// Generate a unique name for it
+			anonName := fmt.Sprintf("__anon_%s_%d", structOrUnion, p.pos)
+			typ = structOrUnion + " " + anonName
+			
+			// Parse the struct/union definition properly
+			p.advance() // skip {
+			
+			var members []StructMember
+			offset := 0
+			for !p.match(RBRACE) && !p.match(EOF) {
+				// Parse field type
+				fieldType := p.parseType()
+				
+				// Parse field name
+				if !p.match(IDENTIFIER) {
+					// Skip this - might be an error but continue parsing
+					p.advance()
+					continue
+				}
+				fieldName := p.current().Lexeme
+				p.advance()
+				
+				// Calculate size (simplified - just use 8 bytes for everything)
+				fieldSize := 8
+				
+				members = append(members, StructMember{
+					Name:   fieldName,
+					Type:   fieldType,
+					Offset: offset,
+					Size:   fieldSize,
+				})
+				
+				// For unions, all members are at offset 0
+				if structOrUnion == "union" {
+					offset = 0
+				} else {
+					offset += fieldSize
+				}
+				
+				// Expect semicolon
+				if !p.match(SEMICOLON) {
+					// Skip if no semicolon - just continue to next iteration
+					continue
+				}
+				p.advance() // Skip the semicolon
+			}
+			
+			// We're now at } - advance past it
+			if p.match(RBRACE) {
+				p.advance()
+			} else {
+				// Shouldn't happen but skip to closing brace if needed
+				for !p.match(RBRACE) && !p.match(EOF) {
+					p.advance()
+				}
+				if p.match(RBRACE) {
+					p.advance()
+				}
+			}
+			
+			// Register the anonymous struct/union
+			p.structs[anonName] = &StructDef{
+				Name:    anonName,
+				Members: members,
+				Size:    offset,
+			}
 		}
-	} else if p.match(IDENTIFIER) {
-		// Could be a typedef
+	} else if p.match(IDENTIFIER) && typ == "" {
+		// Only treat as typedef if we don't have modifiers already
+		// (e.g., "long y" - y is the variable name, not a type)
 		typeName := p.current().Lexeme
 		p.advance()
 		// Resolve typedef if it exists
@@ -450,6 +526,18 @@ func (p *Parser) parseType() string {
 	for p.match(STAR) {
 		typ += "*"
 		p.advance()
+	}
+	
+	// If we have modifiers but no base type, default to int
+	// (e.g., "long" means "long int", "unsigned" means "unsigned int")
+	// Check if typ ends with a space (indicating modifier without base type)
+	if len(typ) > 0 && typ[len(typ)-1] == ' ' {
+		typ += "int"
+	}
+	
+	// If typ is still empty, return int as default
+	if typ == "" {
+		typ = "int"
 	}
 	
 	return typ
@@ -612,6 +700,13 @@ func (p *Parser) parseFunction(name string, returnType string) (*ASTNode, error)
 		
 		if p.match(COMMA) {
 			p.advance()
+			// Check for variadic ...
+			if p.match(DOT) && p.peek(1).Type == DOT && p.peek(2).Type == DOT {
+				p.advance() // skip first .
+				p.advance() // skip second .
+				p.advance() // skip third .
+				// Variadic function - just continue to closing paren
+			}
 		}
 	}
 	
@@ -697,8 +792,8 @@ func (p *Parser) parseBlock() (*ASTNode, error) {
 }
 
 func (p *Parser) parseStatement() (*ASTNode, error) {
-	// Variable declaration (with optional storage class)
-	if p.match(INT, CHAR_KW, FLOAT, DOUBLE, STATIC, CONST, STRUCT) {
+	// Variable declaration (with optional storage class and type modifiers)
+	if p.match(INT, CHAR_KW, FLOAT, DOUBLE, STATIC, CONST, STRUCT, UNION, UNSIGNED, SIGNED, LONG, SHORT) {
 		return p.parseVarDecl()
 	}
 	
@@ -1532,7 +1627,7 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 		
 		// Try to parse as a type
 		var sizeVal int
-		if p.match(INT, CHAR_KW, VOID, FLOAT, DOUBLE, STRUCT) || p.isTypeName() {
+		if p.match(INT, CHAR_KW, VOID, FLOAT, DOUBLE, STRUCT, UNION, UNSIGNED, SIGNED, LONG, SHORT) || p.isTypeName() {
 			// Type
 			typeName := p.parseType()
 			sizeVal = p.getTypeSize(typeName)
@@ -1631,7 +1726,7 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 		}
 		
 		// Check for cast or compound literal
-		if p.match(INT, CHAR_KW, FLOAT, DOUBLE, STRUCT, VOID) || p.isTypeName() {
+		if p.match(INT, CHAR_KW, FLOAT, DOUBLE, STRUCT, UNION, VOID, UNSIGNED, SIGNED, LONG, SHORT) || p.isTypeName() {
 			castType := p.parseType()
 			if p.match(RPAREN) {
 				p.advance()

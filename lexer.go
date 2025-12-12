@@ -20,7 +20,12 @@ const (
 	CHAR_KW
 	FLOAT
 	DOUBLE
+	UNSIGNED
+	SIGNED
+	LONG
+	SHORT
 	STRUCT
+	UNION
 	TYPEDEF
 	ENUM
 	CONST
@@ -122,7 +127,12 @@ var keywords = map[string]TokenType{
 	"char":     CHAR_KW,
 	"float":    FLOAT,
 	"double":   DOUBLE,
+	"unsigned": UNSIGNED,
+	"signed":   SIGNED,
+	"long":     LONG,
+	"short":    SHORT,
 	"struct":   STRUCT,
+	"union":    UNION,
 	"typedef":  TYPEDEF,
 	"enum":     ENUM,
 	"const":    CONST,
