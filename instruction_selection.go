@@ -61,6 +61,11 @@ type IRInstruction struct {
 	Src2 *Operand
 }
 
+type FunctionSignature struct {
+	ReturnType string
+	ParamTypes []string
+}
+
 type InstructionSelector struct {
 	instructions []*IRInstruction
 	currentFunc  string
@@ -70,7 +75,7 @@ type InstructionSelector struct {
 	// Symbol tables
 	localVars    map[string]*Symbol
 	globalVars   map[string]*Symbol
-	functions    map[string]bool        // Track defined functions
+	functions    map[string]*FunctionSignature // Track function signatures
 	stringLits   map[string]string
 	structs      map[string]*StructDef  // Struct definitions from parser
 	typedefs     map[string]string      // Typedef aliases from parser
@@ -84,7 +89,7 @@ func NewInstructionSelector() *InstructionSelector {
 		instructions: []*IRInstruction{},
 		localVars:    make(map[string]*Symbol),
 		globalVars:   make(map[string]*Symbol),
-		functions:    make(map[string]bool),
+		functions:    make(map[string]*FunctionSignature),
 		stringLits:   make(map[string]string),
 		structs:      make(map[string]*StructDef),
 		typedefs:     make(map[string]string),
@@ -150,6 +155,128 @@ func (is *InstructionSelector) emit(op OpCode, dst, src1, src2 *Operand) {
 	})
 }
 
+// getTypeSize returns the size in bytes of a type
+func (is *InstructionSelector) getTypeSize(typ string) int {
+	return is.getTypeSizeHelper(typ, make(map[string]bool))
+}
+
+func (is *InstructionSelector) getTypeSizeHelper(typ string, visited map[string]bool) int {
+	// Prevent infinite recursion
+	if visited[typ] {
+		return 8 // Default size to break cycle
+	}
+	visited[typ] = true
+	
+	// Remove const/static modifiers
+	typ = strings.TrimSpace(typ)
+	for {
+		trimmed := false
+		for _, prefix := range []string{"static ", "const ", "extern ", "volatile ", "register "} {
+			if strings.HasPrefix(typ, prefix) {
+				typ = strings.TrimSpace(typ[len(prefix):])
+				trimmed = true
+				break
+			}
+		}
+		if !trimmed {
+			break
+		}
+	}
+	
+	// Pointers are 8 bytes
+	if len(typ) > 0 && typ[len(typ)-1] == '*' {
+		return 8
+	}
+	
+	// Check for struct types
+	if len(typ) > 7 && typ[:7] == "struct " {
+		structName := typ[7:]
+		structName = strings.TrimSpace(structName)
+		if structDef, ok := is.structs[structName]; ok {
+			return structDef.Size
+		}
+		return 8 // Default struct size
+	}
+	
+	// Check for typedef'd types
+	if actualType, ok := is.typedefs[typ]; ok {
+		return is.getTypeSizeHelper(actualType, visited)
+	}
+	
+	// Basic types
+	switch typ {
+	case "char", "signed char", "unsigned char":
+		return 1
+	case "short", "short int", "signed short", "unsigned short":
+		return 2
+	case "int", "signed int", "unsigned int", "long", "signed long", "unsigned long":
+		return 4
+	case "long long", "signed long long", "unsigned long long":
+		return 8
+	case "float":
+		return 4
+	case "double":
+		return 8
+	case "void":
+		return 0
+	default:
+		return 8
+	}
+}
+
+// isLargeStruct returns true if the type is a struct larger than 16 bytes
+func (is *InstructionSelector) isLargeStruct(typ string) bool {
+	return is.isLargeStructHelper(typ, make(map[string]bool))
+}
+
+func (is *InstructionSelector) isLargeStructHelper(typ string, visited map[string]bool) bool {
+	// Prevent infinite recursion
+	if visited[typ] {
+		return false
+	}
+	visited[typ] = true
+	
+	// Remove qualifiers
+	typ = strings.TrimSpace(typ)
+	for {
+		trimmed := false
+		for _, prefix := range []string{"static ", "const ", "extern ", "volatile ", "register "} {
+			if strings.HasPrefix(typ, prefix) {
+				typ = strings.TrimSpace(typ[len(prefix):])
+				trimmed = true
+				break
+			}
+		}
+		if !trimmed {
+			break
+		}
+	}
+	
+	// Not a large struct if it's a pointer
+	if len(typ) > 0 && typ[len(typ)-1] == '*' {
+		return false
+	}
+	
+	// Check if it's a struct type
+	structName := typ
+	if len(typ) > 7 && typ[:7] == "struct " {
+		structName = typ[7:]
+	} else if actualType, ok := is.typedefs[typ]; ok {
+		// Resolve typedef
+		return is.isLargeStructHelper(actualType, visited)
+	} else {
+		// Not a struct
+		return false
+	}
+	
+	structName = strings.TrimSpace(structName)
+	if structDef, ok := is.structs[structName]; ok {
+		return structDef.Size > 16
+	}
+	
+	return false
+}
+
 // resolveType resolves typedef aliases to actual struct names
 // Handles pointers by stripping them before resolution and re-adding after
 func (is *InstructionSelector) resolveType(typ string) string {
@@ -196,8 +323,11 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 		}
 		
 	case NodeFunction:
-		// Track the function name
-		is.functions[node.Name] = true
+		// Track the function signature
+		is.functions[node.Name] = &FunctionSignature{
+			ReturnType: node.ReturnType,
+			ParamTypes: node.ParamTypes,
+		}
 		
 		// Skip external function declarations (no body)
 		if node.Children == nil || len(node.Children) == 0 {
@@ -559,7 +689,7 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			varOp := &Operand{Type: "var", Value: node.VarName, IsGlobal: true}
 			is.emit(OpLoad, temp, varOp, nil)
 			return temp, nil
-		} else if is.functions[node.VarName] {
+		} else if _, ok := is.functions[node.VarName]; ok {
 			// Function name used as value (function pointer)
 			// Return a label operand representing the function address
 			return &Operand{Type: "label", Value: node.VarName}, nil
@@ -1227,6 +1357,12 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		return value, nil
 		
 	case NodeCall:
+		// Check if this function returns a large struct
+		var returnType string
+		if funcSig, ok := is.functions[node.Name]; ok {
+			returnType = funcSig.ReturnType
+		}
+		
 		// Evaluate arguments
 		args := []*Operand{}
 		for _, argNode := range node.Children {
@@ -1237,11 +1373,36 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			args = append(args, arg)
 		}
 		
-		// Move arguments to calling convention registers
+		// Check if we need to allocate space for a large struct return
+		var retSlot *Operand
 		argRegs := []string{"rdi", "rsi", "rdx", "rcx", "r8", "r9"}
+		argStartIdx := 0
+		
+		if returnType != "" && is.isLargeStruct(returnType) {
+			// Allocate space for return value on stack
+			structSize := is.getTypeSize(returnType)
+			is.stackOffset -= structSize
+			if is.stackOffset%16 != 0 {
+				is.stackOffset -= is.stackOffset % 16
+			}
+			
+			retSlotOffset := is.stackOffset
+			retSlot = &Operand{
+				Type:     "mem",  // Use "mem" type to prevent register allocation
+				Offset:   retSlotOffset,
+				DataType: returnType,
+			}
+			
+			// Pass pointer to return slot as hidden first argument in rdi
+			is.emit(OpLoadAddr, &Operand{Type: "reg", Value: "rdi"}, retSlot, nil)
+			argStartIdx = 1 // Regular arguments start at rsi
+		}
+		
+		// Move arguments to calling convention registers
 		for i, arg := range args {
-			if i < len(argRegs) {
-				regOp := &Operand{Type: "reg", Value: argRegs[i]}
+			regIdx := i + argStartIdx
+			if regIdx < len(argRegs) {
+				regOp := &Operand{Type: "reg", Value: argRegs[regIdx]}
 				is.emit(OpMov, regOp, arg, nil)
 			}
 		}
@@ -1250,6 +1411,13 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		result := is.newTemp()
 		funcOp := &Operand{Type: "label", Value: node.Name}
 		is.emit(OpCall, result, funcOp, &Operand{Type: "imm", Value: fmt.Sprintf("%d", len(args))})
+		
+		// If we used a return slot, the result is there, not in rax
+		if retSlot != nil {
+			result.DataType = returnType
+			result.Offset = retSlot.Offset
+			result.Type = "mem"
+		}
 		
 		return result, nil
 		

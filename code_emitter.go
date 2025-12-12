@@ -301,6 +301,35 @@ func (ce *CodeEmitter) emitInstruction(instr *IRInstruction) {
 	case OpLoad:
 		ce.emitLoad(instr.Dst, instr.Src1)
 		
+	case OpLoadAddr:
+		// Load address of variable/memory location
+		dstStr := ce.formatOperand(instr.Dst)
+		src1 := instr.Src1
+		
+		if src1.Type == "var" {
+			if src1.IsGlobal {
+				ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %s\n", src1.Value, dstStr))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    leaq %d(%%rbp), %s\n", src1.Offset, dstStr))
+			}
+		} else if src1.Type == "mem" {
+			ce.output.WriteString(fmt.Sprintf("    leaq %d(%%rbp), %s\n", src1.Offset, dstStr))
+		} else if src1.Type == "temp" {
+			// Temp might have been allocated on stack - check allocator mapping
+			// For now, try to use formatOperand but strip the dereference
+			srcStr := ce.formatOperand(src1)
+			// If srcStr is like offset(%rbp), use leaq with it
+			if strings.Contains(srcStr, "(%rbp)") {
+				ce.output.WriteString(fmt.Sprintf("    leaq %s, %s\n", srcStr, dstStr))
+			} else {
+				// Shouldn't happen - fallback to moving the value
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", srcStr, dstStr))
+			}
+		} else {
+			// Fallback
+			ce.output.WriteString(fmt.Sprintf("    leaq %s, %s\n", ce.formatOperand(src1), dstStr))
+		}
+		
 	case OpStore:
 		ce.emitStore(instr.Dst, instr.Src1)
 		

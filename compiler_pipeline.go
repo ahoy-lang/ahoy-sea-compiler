@@ -140,6 +140,12 @@ func (cp *CompilerPipeline) Compile() error {
 	cp.selector.structs = cp.parser.structs  // Pass struct definitions
 	cp.selector.typedefs = cp.parser.typedefs  // Pass typedef aliases
 	cp.selector.enums = cp.parser.enums  // Pass enum constants
+	
+	// Pass function signatures from preprocessor
+	for funcName, funcSig := range preprocessor.functionSigs {
+		cp.selector.functions[funcName] = funcSig
+	}
+	
 	err = cp.selector.SelectInstructions(cp.ast)
 	if err != nil {
 		return fmt.Errorf("instruction selection error: %w", err)

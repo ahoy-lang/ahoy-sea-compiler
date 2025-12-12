@@ -10,12 +10,13 @@ import (
 
 // Preprocessor handles C preprocessor directives
 type Preprocessor struct {
-	defines      map[string]string
-	includePaths []string
-	processed    map[string]bool  // Track processed files to avoid cycles
-	mu           sync.RWMutex      // For thread-safe define access
-	typedefMap   map[string]*StructDef // External typedefs from headers
-	structMap    map[string]*StructDef // External structs from headers
+	defines       map[string]string
+	includePaths  []string
+	processed     map[string]bool  // Track processed files to avoid cycles
+	mu            sync.RWMutex      // For thread-safe define access
+	typedefMap    map[string]*StructDef // External typedefs from headers
+	structMap     map[string]*StructDef // External structs from headers
+	functionSigs  map[string]*FunctionSignature // Function signatures from headers
 }
 
 func NewPreprocessor() *Preprocessor {
@@ -25,6 +26,7 @@ func NewPreprocessor() *Preprocessor {
 		processed:    make(map[string]bool),
 		typedefMap:   make(map[string]*StructDef),
 		structMap:    make(map[string]*StructDef),
+		functionSigs: make(map[string]*FunctionSignature),
 	}
 	
 	// Add standard built-in macros
@@ -448,6 +450,7 @@ func (p *Preprocessor) ExtractTypesFromHeader(filename string) error {
 	
 	lines := strings.Split(string(content), "\n")
 	
+	// First pass: collect all struct and typedef definitions
 	for i := 0; i < len(lines); i++ {
 		line := strings.TrimSpace(lines[i])
 		
@@ -470,7 +473,15 @@ func (p *Preprocessor) ExtractTypesFromHeader(filename string) error {
 			// Simple typedef alias: typedef OldType NewType;
 			p.parseSimpleTypedef(line)
 		}
+		// Also extract function declarations for tracking return types
+		// Look for RLAPI function declarations (raylib API functions)
+		if strings.Contains(line, "RLAPI ") || (strings.Contains(line, "(") && strings.Contains(line, ");")) {
+			p.parseFunctionDeclaration(line)
+		}
 	}
+	
+	// Second pass: resolve struct sizes now that all structs are known
+	p.resolveStructSizes()
 	
 	return nil
 }
@@ -515,6 +526,7 @@ func (p *Preprocessor) parseSimpleTypedef(line string) {
 func (p *Preprocessor) parseTypedefStruct(def string) {
 	// Example: typedef struct { float x; float y; } Vector2;
 	// Example: typedef struct Color { unsigned char r, g, b, a; } Color;
+	// Example: typedef struct RenderTexture { ... } RenderTexture;
 	
 	// Find the type name (after closing brace)
 	closeBraceIdx := strings.LastIndex(def, "}")
@@ -531,8 +543,17 @@ func (p *Preprocessor) parseTypedefStruct(def string) {
 		return
 	}
 	
-	// Extract member definitions between braces
+	// Extract struct name if it exists (between "struct" and "{")
+	var structName string
 	openBraceIdx := strings.Index(def, "{")
+	if openBraceIdx != -1 {
+		beforeBrace := def[:openBraceIdx]
+		beforeBrace = strings.TrimPrefix(beforeBrace, "typedef")
+		beforeBrace = strings.TrimPrefix(beforeBrace, "struct")
+		structName = strings.TrimSpace(beforeBrace)
+	}
+	
+	// Extract member definitions between braces
 	if openBraceIdx == -1 {
 		return
 	}
@@ -540,19 +561,35 @@ func (p *Preprocessor) parseTypedefStruct(def string) {
 	membersStr := def[openBraceIdx+1 : closeBraceIdx]
 	members := p.parseStructMembers(membersStr)
 	
+	// Calculate total size
+	totalSize := 0
+	for _, member := range members {
+		if member.Offset+member.Size > totalSize {
+			totalSize = member.Offset + member.Size
+		}
+	}
+	
 	// Create struct type
 	structType := &StructDef{
 		Name:    typeName,
 		Members: members,
+		Size:    totalSize,
 	}
 	
+	// Store under the typedef name
 	p.typedefMap[typeName] = structType
 	p.structMap[typeName] = structType
+	
+	// Also store under the struct name if it exists and is different
+	if structName != "" && structName != typeName {
+		p.structMap[structName] = structType
+	}
 }
 
 // parseStructMembers parses struct member declarations
 func (p *Preprocessor) parseStructMembers(membersStr string) []StructMember {
 	var members []StructMember
+	offset := 0
 	
 	// Split by semicolon to get individual member declarations
 	declarations := strings.Split(membersStr, ";")
@@ -577,18 +614,116 @@ func (p *Preprocessor) parseStructMembers(membersStr string) []StructMember {
 		namesStr := parts[len(parts)-1]
 		names := strings.Split(namesStr, ",")
 		
+		memberType := p.mapTypeString(typeStr)
+		// Get size for basic types only during parsing
+		// Struct sizes will be calculated later
+		memberSize := p.getBasicTypeSize(memberType)
+		
 		for _, name := range names {
 			name = strings.TrimSpace(name)
 			if name != "" {
 				members = append(members, StructMember{
-					Name: name,
-					Type: p.mapTypeString(typeStr),
+					Name:   name,
+					Type:   memberType,
+					Offset: offset,
+					Size:   memberSize,
 				})
+				offset += memberSize
 			}
 		}
 	}
 	
 	return members
+}
+
+// getBasicTypeSize returns size of basic types without recursion
+func (p *Preprocessor) getBasicTypeSize(typ string) int {
+	typ = strings.TrimSpace(typ)
+	
+	// Pointers are 8 bytes
+	if strings.HasSuffix(typ, "*") {
+		return 8
+	}
+	
+	// Basic types
+	switch typ {
+	case "char", "signed char", "unsigned char":
+		return 1
+	case "short", "short int", "signed short", "unsigned short":
+		return 2
+	case "int", "signed int", "unsigned int":
+		return 4
+	case "long", "signed long", "unsigned long", "long long", "signed long long", "unsigned long long":
+		return 8
+	case "float":
+		return 4
+	case "double":
+		return 8
+	case "void":
+		return 0
+	default:
+		// For unknown types (including other structs), use a placeholder
+		// The actual size will be resolved later
+		return 0
+	}
+}
+
+// getTypeSize returns the size in bytes of a type
+func (p *Preprocessor) getTypeSize(typ string) int {
+	return p.getTypeSizeHelper(typ, make(map[string]bool))
+}
+
+func (p *Preprocessor) getTypeSizeHelper(typ string, visited map[string]bool) int {
+	// Prevent infinite recursion
+	if visited[typ] {
+		return 8 // Default to break cycle
+	}
+	visited[typ] = true
+	
+	typ = strings.TrimSpace(typ)
+	
+	// Pointers are 8 bytes
+	if strings.HasSuffix(typ, "*") {
+		return 8
+	}
+	
+	// Check if it's a known struct
+	if structDef, ok := p.structMap[typ]; ok {
+		return structDef.Size
+	}
+	
+	// Check for struct prefix
+	if strings.HasPrefix(typ, "struct ") {
+		structName := strings.TrimSpace(typ[7:])
+		if structDef, ok := p.structMap[structName]; ok {
+			return structDef.Size
+		}
+	}
+	
+	// Check typedef map
+	if structDef, ok := p.typedefMap[typ]; ok {
+		return structDef.Size
+	}
+	
+	// Basic types
+	switch typ {
+	case "char", "signed char", "unsigned char":
+		return 1
+	case "short", "short int", "signed short", "unsigned short":
+		return 2
+	case "int", "signed int", "unsigned int":
+		return 4
+	case "long", "signed long", "unsigned long", "long long", "signed long long", "unsigned long long":
+		return 8
+	case "float":
+		return 4
+	case "double":
+		return 8
+	case "void":
+		return 0
+	default:
+		return 8 // Default for unknown types
+	}
 }
 
 // mapTypeString converts C type string to internal type
@@ -617,4 +752,115 @@ func (p *Preprocessor) mapTypeString(typeStr string) string {
 		}
 		return typeStr // Return as-is for custom types
 	}
+}
+
+// parseFunctionDeclaration parses a function declaration to extract return type
+func (p *Preprocessor) parseFunctionDeclaration(line string) {
+	// Clean up the line
+	line = strings.TrimSpace(line)
+	line = strings.ReplaceAll(line, "RLAPI ", "")
+	
+	// Skip if it doesn't look like a function declaration
+	if !strings.Contains(line, "(") || !strings.Contains(line, ")") {
+		return
+	}
+	
+	// Find the function name and return type
+	// Format: ReturnType FunctionName(params);
+	parenIdx := strings.Index(line, "(")
+	if parenIdx == -1 {
+		return
+	}
+	
+	beforeParen := strings.TrimSpace(line[:parenIdx])
+	parts := strings.Fields(beforeParen)
+	if len(parts) < 2 {
+		return
+	}
+	
+	// Last part is function name, everything before is return type
+	funcName := parts[len(parts)-1]
+	returnType := strings.Join(parts[:len(parts)-1], " ")
+	
+	// Extract parameter types
+	paramStart := parenIdx + 1
+	paramEnd := strings.Index(line[paramStart:], ")")
+	if paramEnd == -1 {
+		return
+	}
+	
+	paramsStr := strings.TrimSpace(line[paramStart : paramStart+paramEnd])
+	var paramTypes []string
+	
+	if paramsStr != "" && paramsStr != "void" {
+		// Split by comma
+		params := strings.Split(paramsStr, ",")
+		for _, param := range params {
+			param = strings.TrimSpace(param)
+			// Extract just the type (remove parameter name)
+			paramParts := strings.Fields(param)
+			if len(paramParts) > 0 {
+				// Simple heuristic: type is everything except last token (which is usually the name)
+				// But if there's a *, it might be part of the type
+				if len(paramParts) == 1 {
+					paramTypes = append(paramTypes, paramParts[0])
+				} else {
+					// Take all but last unless last is a pointer indicator
+					paramType := strings.Join(paramParts[:len(paramParts)-1], " ")
+					paramTypes = append(paramTypes, paramType)
+				}
+			}
+		}
+	}
+	
+	// Store the function signature
+	p.functionSigs[funcName] = &FunctionSignature{
+		ReturnType: returnType,
+		ParamTypes: paramTypes,
+	}
+}
+
+// resolveStructSizes computes actual sizes of all structs after they're all parsed
+func (p *Preprocessor) resolveStructSizes() {
+// Keep resolving until no changes (handles nested structs)
+maxIterations := 10
+for iter := 0; iter < maxIterations; iter++ {
+changed := false
+
+for _, structDef := range p.structMap {
+if structDef.Size > 0 {
+continue // Already computed
+}
+
+// Compute size from members
+totalSize := 0
+allResolved := true
+
+for i := range structDef.Members {
+member := &structDef.Members[i]
+if member.Size == 0 {
+// Try to resolve the member size
+memberSize := p.getTypeSizeHelper(member.Type, make(map[string]bool))
+if memberSize > 0 {
+member.Size = memberSize
+member.Offset = totalSize
+totalSize += memberSize
+} else {
+allResolved = false
+}
+} else {
+totalSize = member.Offset + member.Size
+}
+}
+
+if allResolved && totalSize > 0 {
+structDef.Size = totalSize
+changed = true
+}
+}
+
+if !changed {
+break
+}
+}
 }
