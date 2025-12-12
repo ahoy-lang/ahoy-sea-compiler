@@ -399,8 +399,8 @@ func (ce *CodeEmitter) emitBinaryOp(op string, dst, src1, src2 *Operand) {
 	// Move src1 to dst
 	ce.emitMov(dst, src1)
 	
-	// Apply operation
-	src2Str := ce.formatOperand(src2)
+	// Apply operation - handle float immediates
+	src2Str := ce.loadFloatIfNeeded(src2, "%r10")
 	dstStr := ce.formatOperand(dst)
 	
 	if dst.Type == "mem" && src2.Type == "mem" {
@@ -414,7 +414,7 @@ func (ce *CodeEmitter) emitBinaryOp(op string, dst, src1, src2 *Operand) {
 func (ce *CodeEmitter) emitMul(dst, src1, src2 *Operand) {
 	ce.emitMov(dst, src1)
 	
-	src2Str := ce.formatOperand(src2)
+	src2Str := ce.loadFloatIfNeeded(src2, "%r10")
 	dstStr := ce.formatOperand(dst)
 	dstIsMem := strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")")
 	
@@ -435,8 +435,13 @@ func (ce *CodeEmitter) emitDiv(dst, src1, src2 *Operand) {
 	
 	// idivq cannot take immediate operands - load to register first
 	if src2.Type == "imm" {
-		ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", ce.formatOperand(src2)))
-		ce.output.WriteString("    idivq %r11\n")
+		src2Str := ce.loadFloatIfNeeded(src2, "%r11")
+		if src2Str == "%r11" {
+			ce.output.WriteString("    idivq %r11\n")
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", src2Str))
+			ce.output.WriteString("    idivq %r11\n")
+		}
 	} else {
 		ce.output.WriteString(fmt.Sprintf("    idivq %s\n", ce.formatOperand(src2)))
 	}
@@ -451,8 +456,13 @@ func (ce *CodeEmitter) emitMod(dst, src1, src2 *Operand) {
 	
 	// idivq cannot take immediate operands - load to register first
 	if src2.Type == "imm" {
-		ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", ce.formatOperand(src2)))
-		ce.output.WriteString("    idivq %r11\n")
+		src2Str := ce.loadFloatIfNeeded(src2, "%r11")
+		if src2Str == "%r11" {
+			ce.output.WriteString("    idivq %r11\n")
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", src2Str))
+			ce.output.WriteString("    idivq %r11\n")
+		}
 	} else {
 		ce.output.WriteString(fmt.Sprintf("    idivq %s\n", ce.formatOperand(src2)))
 	}
@@ -468,13 +478,32 @@ func (ce *CodeEmitter) emitShift(op string, dst, src1, src2 *Operand) {
 		ce.output.WriteString(fmt.Sprintf("    movq %s, %%rcx\n", ce.formatOperand(src2)))
 		ce.output.WriteString(fmt.Sprintf("    %s %%cl, %s\n", op, ce.formatOperand(dst)))
 	} else {
-		ce.output.WriteString(fmt.Sprintf("    %s %s, %s\n", op, ce.formatOperand(src2), ce.formatOperand(dst)))
+		// Handle float immediates
+		src2Str := ce.loadFloatIfNeeded(src2, "%rcx")
+		if src2Str == "%rcx" {
+			ce.output.WriteString(fmt.Sprintf("    %s %%cl, %s\n", op, ce.formatOperand(dst)))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    %s %s, %s\n", op, src2Str, ce.formatOperand(dst)))
+		}
 	}
 }
 
 func (ce *CodeEmitter) emitComparison(setcc string, dst, src1, src2 *Operand) {
 	src1Str := ce.formatOperand(src1)
 	src2Str := ce.formatOperand(src2)
+	
+	// Handle float immediates - they need to be in .rodata
+	if src2.Type == "imm" && strings.Contains(src2.Value, ".") {
+		label, exists := ce.floatLits[src2.Value]
+		if !exists {
+			ce.floatCounter++
+			label = fmt.Sprintf(".FC%d", ce.floatCounter)
+			ce.floatLits[label] = src2.Value
+		}
+		// Load into a register for comparison
+		ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %%r10\n", label))
+		src2Str = "%r10"
+	}
 	
 	src1IsMem := strings.Contains(src1Str, "(") && strings.Contains(src1Str, ")")
 	src2IsMem := strings.Contains(src2Str, "(") && strings.Contains(src2Str, ")")
@@ -603,14 +632,22 @@ func (ce *CodeEmitter) emitStore(dst, src *Operand) {
 		
 		if dst.IsGlobal {
 			if src.Type == "imm" || srcIsMem {
-				ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", srcStr))
+				// Handle float immediates
+				loadedStr := ce.loadFloatIfNeeded(src, "%rax")
+				if loadedStr != "%rax" {
+					ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", loadedStr))
+				}
 				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s(%%rip)\n", dst.Value))
 			} else {
 				ce.output.WriteString(fmt.Sprintf("    movq %s, %s(%%rip)\n", srcStr, dst.Value))
 			}
 		} else {
-			if srcIsMem {
-				ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", srcStr))
+			if srcIsMem || src.Type == "imm" {
+				// Handle float immediates
+				loadedStr := ce.loadFloatIfNeeded(src, "%rax")
+				if loadedStr != "%rax" {
+					ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", loadedStr))
+				}
 				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %d(%%rbp)\n", dst.Offset))
 			} else {
 				ce.output.WriteString(fmt.Sprintf("    movq %s, %d(%%rbp)\n", srcStr, dst.Offset))
@@ -627,7 +664,11 @@ func (ce *CodeEmitter) emitStore(dst, src *Operand) {
 		// Get source value into rax
 		srcReg := ce.formatOperand(src)
 		if src.Type == "imm" {
-			ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", srcReg))
+			// Use helper for float immediates
+			loadedStr := ce.loadFloatIfNeeded(src, "%rax")
+			if loadedStr != "%rax" {
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", loadedStr))
+			}
 		} else {
 			ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", srcReg))
 		}
@@ -660,6 +701,12 @@ func (ce *CodeEmitter) emitStore(dst, src *Operand) {
 			// Need to load source into register first
 			if src.Type == "label" {
 				ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %%rax\n", srcReg))
+			} else if src.Type == "imm" {
+				// Use helper for float immediates
+				loadedStr := ce.loadFloatIfNeeded(src, "%rax")
+				if loadedStr != "%rax" {
+					ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", loadedStr))
+				}
 			} else {
 				ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", srcReg))
 			}
@@ -670,6 +717,22 @@ func (ce *CodeEmitter) emitStore(dst, src *Operand) {
 	default:
 		ce.emitMov(dst, src)
 	}
+}
+
+// Helper to load a float immediate into a register if needed
+func (ce *CodeEmitter) loadFloatIfNeeded(op *Operand, tempReg string) string {
+	if op.Type == "imm" && strings.Contains(op.Value, ".") {
+		// Float immediate - load from .rodata
+		label, exists := ce.floatLits[op.Value]
+		if !exists {
+			ce.floatCounter++
+			label = fmt.Sprintf(".FC%d", ce.floatCounter)
+			ce.floatLits[label] = op.Value
+		}
+		ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %s\n", label, tempReg))
+		return tempReg
+	}
+	return ce.formatOperand(op)
 }
 
 func (ce *CodeEmitter) emitCall(instr *IRInstruction) {
@@ -697,6 +760,7 @@ func (ce *CodeEmitter) formatOperand(op *Operand) string {
 	case "reg":
 		return "%" + op.Value
 	case "imm":
+		// Don't format float immediates - they should be handled specially
 		return "$" + op.Value
 	case "label":
 		return op.Value

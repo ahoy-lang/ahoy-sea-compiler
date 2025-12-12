@@ -252,68 +252,48 @@ func (cp *CompilerPipeline) AssembleAndLinkNative(outputBinary string) error {
 	// Use already-generated assembly text
 	asmText := cp.assembly
 	
-	// Add _start stub that calls main and exits
-	startStub := `    .globl _start
-_start:
-    xorq %rbp, %rbp
-    call main
-    movq %rax, %rdi
-    movq $60, %rax
-    syscall
-
-`
-	
-	// Insert _start after first .text directive
-	fullAsm := asmText
-	if strings.Contains(fullAsm, "    .text\n") {
-		fullAsm = strings.Replace(fullAsm, "    .text\n", "    .text\n\n"+startStub, 1)
-	} else {
-		fullAsm = "    .text\n" + startStub + asmText
-	}
-	
 	if cp.options.Verbose {
-		fmt.Printf("  Assembling %d bytes of code\n", len(fullAsm))
+		fmt.Printf("  Assembling %d bytes of code\n", len(asmText))
 	}
 	
-	// Create assembler and generate machine code
-	assembler := NewAssembler()
-	machineCode, err := assembler.AssembleText(fullAsm)
+	// Write assembly to temp file
+	asmFile := "/tmp/native_output.s"
+	err := os.WriteFile(asmFile, []byte(asmText), 0644)
 	if err != nil {
-		return fmt.Errorf("machine code generation failed: %w", err)
+		// Fall back to old method if file write fails
+		return fmt.Errorf("failed to write assembly: %w", err)
 	}
 	
-	symbols := assembler.GetSymbols()
-	
-	// Get data sections
-	rodata, data, bssSize := cp.emitter.GetSections()
-	
-	// Create linker
-	linker := NewLinker()
-	linker.SetSections(machineCode, rodata, data, bssSize)
-	
-	// Add all symbols from assembler
-	for name, offset := range symbols {
-		linker.AddSymbol(name, offset, "text")
+	// Use GCC to assemble and link with Raylib
+	gccArgs := []string{
+		"-no-pie",
+		asmFile,
+		"-o", outputBinary,
+		"-L/home/lee/Documents/clibs/raylib/src",
+		"-lraylib",
+		"-lm",
+		"-lpthread",
+		"-ldl",
+		"-lrt",
+		"-lX11",
 	}
 	
-	// Set entry point to _start
-	linker.SetEntryPoint("_start")
-	
-	// Link to create executable
-	executable, err := linker.Link()
+	cmd := exec.Command("gcc", gccArgs...)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("linking failed: %w", err)
-	}
-	
-	// Write executable to file
-	err = os.WriteFile(outputBinary, executable, 0755)
-	if err != nil {
-		return fmt.Errorf("failed to write executable: %w", err)
+		fmt.Fprintf(os.Stderr, "GCC output: %s\n", output)
+		// Save assembly for debugging
+		os.WriteFile("/tmp/failed_native.s", []byte(asmText), 0644)
+		fmt.Fprintf(os.Stderr, "Assembly saved to: /tmp/failed_native.s\n")
+		return fmt.Errorf("native assembly/linking failed: %w", err)
 	}
 	
 	if cp.options.Verbose {
 		fmt.Printf("  Output: %s\n", outputBinary)
-		fmt.Printf("  Size: %d bytes\n", len(executable))
+		fi, _ := os.Stat(outputBinary)
+		if fi != nil {
+			fmt.Printf("  Size: %d bytes\n", fi.Size())
+		}
 		fmt.Printf("  Completed in %v\n", time.Since(start))
 	}
 	
