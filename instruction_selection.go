@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Three-address code intermediate representation
 type OpCode int
@@ -41,12 +44,14 @@ const (
 )
 
 type Operand struct {
-	Type      string // "reg", "imm", "var", "label", "mem", "array"
-	Value     string
-	Offset    int
-	IsGlobal  bool
-	Size      int
-	IndexTemp *Operand // For array indexing, holds the calculated offset
+	Type       string // "reg", "imm", "var", "label", "mem", "array"
+	Value      string
+	Offset     int
+	IsGlobal   bool
+	Size       int
+	IndexTemp  *Operand // For array indexing, holds the calculated offset
+	DataType   string   // Track the C type (e.g., "int", "struct Foo*")
+	SourcePtr  *Operand // For dereferenced values, track the original pointer
 }
 
 type IRInstruction struct {
@@ -65,9 +70,11 @@ type InstructionSelector struct {
 	// Symbol tables
 	localVars    map[string]*Symbol
 	globalVars   map[string]*Symbol
+	functions    map[string]bool        // Track defined functions
 	stringLits   map[string]string
 	structs      map[string]*StructDef  // Struct definitions from parser
 	typedefs     map[string]string      // Typedef aliases from parser
+	enums        map[string]int         // Enum constants from parser
 	
 	stackOffset  int
 }
@@ -77,9 +84,11 @@ func NewInstructionSelector() *InstructionSelector {
 		instructions: []*IRInstruction{},
 		localVars:    make(map[string]*Symbol),
 		globalVars:   make(map[string]*Symbol),
+		functions:    make(map[string]bool),
 		stringLits:   make(map[string]string),
 		structs:      make(map[string]*StructDef),
 		typedefs:     make(map[string]string),
+		enums:        make(map[string]int),
 	}
 	
 	// Add standard library external symbols
@@ -97,6 +106,20 @@ func NewInstructionSelector() *InstructionSelector {
 		Name:     "stdin",
 		Type:     "void*",
 		IsGlobal: true,
+	}
+	
+	// Add raylib color constants as external symbols
+	colorType := "Color"
+	rayColors := []string{"RED", "WHITE", "BLACK", "GRAY", "LIGHTGRAY", "DARKGRAY",
+		"YELLOW", "GOLD", "ORANGE", "PINK", "MAROON", "GREEN", "LIME", "DARKGREEN",
+		"SKYBLUE", "BLUE", "DARKBLUE", "PURPLE", "VIOLET", "DARKPURPLE",
+		"BEIGE", "BROWN", "DARKBROWN", "RAYWHITE", "MAGENTA"}
+	for _, color := range rayColors {
+		is.globalVars[color] = &Symbol{
+			Name:     color,
+			Type:     colorType,
+			IsGlobal: true,
+		}
 	}
 	
 	return is
@@ -170,6 +193,9 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 		}
 		
 	case NodeFunction:
+		// Track the function name
+		is.functions[node.Name] = true
+		
 		// Skip external function declarations (no body)
 		if node.Children == nil || len(node.Children) == 0 {
 			// External function - just track it (no code generation)
@@ -187,8 +213,13 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 		argRegs := []string{"rdi", "rsi", "rdx", "rcx", "r8", "r9"}
 		for i, param := range node.Params {
 			is.stackOffset -= 8
+			paramType := ""
+			if i < len(node.ParamTypes) {
+				paramType = node.ParamTypes[i]
+			}
 			is.localVars[param] = &Symbol{
 				Name:   param,
+				Type:   paramType,
 				Offset: is.stackOffset,
 				Size:   8,
 			}
@@ -215,6 +246,22 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 		// Calculate size based on type and array size
 		varSize := 8  // Default for int/pointer
 		dataType := node.DataType
+		
+		// Strip storage class specifiers (static, const, extern, etc.)
+		dataType = strings.TrimSpace(dataType)
+		for {
+			trimmed := false
+			for _, prefix := range []string{"static ", "const ", "extern ", "volatile ", "register "} {
+				if strings.HasPrefix(dataType, prefix) {
+					dataType = strings.TrimSpace(dataType[len(prefix):])
+					trimmed = true
+					break
+				}
+			}
+			if !trimmed {
+				break
+			}
+		}
 		
 		// Check if it's a struct type
 		if len(dataType) > 7 && dataType[:7] == "struct " {
@@ -492,18 +539,29 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		return &Operand{Type: "label", Value: label}, nil
 		
 	case NodeIdentifier:
+		// Check for enum constants first
+		if val, ok := is.enums[node.VarName]; ok {
+			return &Operand{Type: "imm", Value: fmt.Sprintf("%d", val)}, nil
+		}
+		
 		if sym, ok := is.localVars[node.VarName]; ok {
 			temp := is.newTemp()
+			temp.DataType = sym.Type
 			varOp := &Operand{Type: "var", Value: node.VarName, Offset: sym.Offset}
 			is.emit(OpLoad, temp, varOp, nil)
 			return temp, nil
-		} else if _, ok := is.globalVars[node.VarName]; ok {
+		} else if sym, ok := is.globalVars[node.VarName]; ok {
 			temp := is.newTemp()
+			temp.DataType = sym.Type
 			varOp := &Operand{Type: "var", Value: node.VarName, IsGlobal: true}
 			is.emit(OpLoad, temp, varOp, nil)
 			return temp, nil
+		} else if is.functions[node.VarName] {
+			// Function name used as value (function pointer)
+			// Return a label operand representing the function address
+			return &Operand{Type: "label", Value: node.VarName}, nil
 		}
-		return nil, fmt.Errorf("undefined variable: %s", node.VarName)
+		return nil, fmt.Errorf("undefined variable: %s (in function: %s)", node.VarName, is.currentFunc)
 		
 	case NodeBinaryOp:
 		left, err := is.selectExpression(node.Children[0])
@@ -629,6 +687,11 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			// Dereference operator - load from pointer
 			// operand contains the address, load from it
 			is.emit(OpLoad, result, &Operand{Type: "ptr", Value: operand.Value, IndexTemp: operand}, nil)
+			
+			// If operand has type info like "Type*", result should be "Type"
+			if operand.DataType != "" && strings.HasSuffix(operand.DataType, "*") {
+				result.DataType = strings.TrimSpace(operand.DataType[:len(operand.DataType)-1])
+			}
 			return result, nil
 		default:
 			return nil, fmt.Errorf("unknown unary operator: %s", node.Operator)
@@ -715,27 +778,79 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		memberName := node.MemberName
 		isPtr := node.IsPointer  // true for -> operator
 		
-		// Get base variable
-		if baseNode.Type != NodeIdentifier {
-			return nil, fmt.Errorf("member access base must be identifier")
-		}
-		
-		varName := baseNode.VarName
-		var baseOffset int
-		var isGlobal bool
+		var baseTemp *Operand
 		var structType string
 		
-		// Look up variable
-		if sym, ok := is.localVars[varName]; ok {
-			baseOffset = sym.Offset
-			isGlobal = false
-			structType = sym.Type
-		} else if sym, ok := is.globalVars[varName]; ok {
-			baseOffset = 0
-			isGlobal = true
-			structType = sym.Type
+		// Handle different base node types
+		if baseNode.Type == NodeIdentifier {
+			// Simple case: variable.member or variable->member
+			varName := baseNode.VarName
+			var baseOffset int
+			var isGlobal bool
+			
+			// Look up variable
+			if sym, ok := is.localVars[varName]; ok {
+				baseOffset = sym.Offset
+				isGlobal = false
+				structType = sym.Type
+			} else if sym, ok := is.globalVars[varName]; ok {
+				baseOffset = 0
+				isGlobal = true
+				structType = sym.Type
+			} else {
+				return nil, fmt.Errorf("undefined variable: %s", varName)
+			}
+			
+			// Create temp for base address
+			baseTemp = &Operand{Type: "var", Value: varName, Offset: baseOffset, IsGlobal: isGlobal, DataType: structType}
+		} else if !isPtr && baseNode.Type == NodeUnaryOp && baseNode.Operator == "*" {
+			// Special case: (*ptr).member should be treated as ptr->member
+			// Evaluate the pointer expression
+			baseTempVal, err := is.selectExpression(baseNode.Children[0])
+			if err != nil {
+				return nil, err
+			}
+			baseTemp = baseTempVal
+			structType = baseTemp.DataType
+			if structType == "" {
+				structType = baseNode.Children[0].DataType
+			}
+			// Treat it as pointer access
+			isPtr = true
 		} else {
-			return nil, fmt.Errorf("undefined variable: %s", varName)
+			// Complex expression as base (e.g., (cast)->member, deref->member)
+			// Evaluate the base expression
+			baseTempVal, err := is.selectExpression(baseNode)
+			if err != nil {
+				return nil, err
+			}
+			baseTemp = baseTempVal
+			
+			// Get type from base operand first (set by cast/dereference)
+			structType = baseTemp.DataType
+			
+			// If still empty, try to get from base node
+			if structType == "" {
+				structType = baseNode.DataType
+			}
+			
+			// If type is still empty, try to infer from structure
+			if structType == "" {
+				// Check if it's a dereference of a typed expression
+				if baseNode.Type == NodeUnaryOp && baseNode.Operator == "*" && len(baseNode.Children) > 0 {
+					// Get type from the dereferenced expression
+					innerType := baseNode.Children[0].DataType
+					// Remove one level of pointer
+					if strings.HasSuffix(innerType, "*") {
+						structType = innerType[:len(innerType)-1]
+						structType = strings.TrimSpace(structType)
+					}
+				}
+			}
+			
+			if structType == "" {
+				return nil, fmt.Errorf("member access on expression with unknown type")
+			}
 		}
 		
 		// Resolve typedef aliases to actual struct types
@@ -743,11 +858,13 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		
 		// Extract struct name from type (e.g., "struct Point*" -> "Point")
 		structName := structType
+		origStructType := structType  // Save for error reporting
 		
 		// Strip pointers
 		for len(structName) > 0 && structName[len(structName)-1] == '*' {
 			structName = structName[:len(structName)-1]
 		}
+		structName = strings.TrimSpace(structName)
 		
 		// Strip "struct " or "union " prefix
 		if len(structName) > 7 && structName[:7] == "struct " {
@@ -755,11 +872,16 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		} else if len(structName) > 6 && structName[:6] == "union " {
 			structName = structName[6:]
 		}
+		structName = strings.TrimSpace(structName)
 		
 		// Find struct definition
 		structDef, ok := is.structs[structName]
 		if !ok {
-			return nil, fmt.Errorf("undefined struct: %s", structName)
+			// Better error message for debugging
+			if origStructType == "" && structName == "" {
+				return nil, fmt.Errorf("member access '%s' on expression with no type information (base type: %v, base node type: %d)", memberName, baseTemp, baseNode.Type)
+			}
+			return nil, fmt.Errorf("undefined struct: '%s' (from type: '%s')", structName, origStructType)
 		}
 		
 		// Find member offset
@@ -775,16 +897,21 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			return nil, fmt.Errorf("struct %s has no member %s", structName, memberName)
 		}
 		
-		// Calculate final offset: base + member_offset
-		finalOffset := baseOffset + memberOffset
-		
 		// Load member value
 		result := is.newTemp()
 		if isPtr {
-			// ptr->member: load pointer, then load from (ptr + offset)
-			ptrTemp := is.newTemp()
-			ptrOp := &Operand{Type: "var", Value: varName, Offset: baseOffset, IsGlobal: isGlobal}
-			is.emit(OpLoad, ptrTemp, ptrOp, nil)
+			// ptr->member: load pointer value, then load from (ptr + memberOffset)
+			var ptrTemp *Operand
+			
+			if baseTemp.Type == "var" {
+				// Load the pointer from variable
+				ptrTempReg := is.newTemp()
+				is.emit(OpLoad, ptrTempReg, baseTemp, nil)
+				ptrTemp = ptrTempReg
+			} else {
+				// Base is already a value (temp/reg)
+				ptrTemp = baseTemp
+			}
 			
 			// Add member offset to pointer
 			if memberOffset != 0 {
@@ -799,35 +926,41 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			is.emit(OpLoad, result, memberOp, nil)
 		} else {
 			// struct.member: direct access
-			memberOp := &Operand{Type: "var", Value: varName, Offset: finalOffset, IsGlobal: isGlobal}
-			is.emit(OpLoad, result, memberOp, nil)
+			// This only works for simple variable bases
+			if baseTemp.Type == "var" {
+				finalOffset := baseTemp.Offset + memberOffset
+				memberOp := &Operand{Type: "var", Value: baseTemp.Value, Offset: finalOffset, IsGlobal: baseTemp.IsGlobal}
+				is.emit(OpLoad, result, memberOp, nil)
+			} else if baseTemp.Type == "temp" {
+				// Temp holds a struct value (from statement expression or function return)
+				// Treat the temp as a pointer to the struct and load the member
+				// Add member offset to the temp pointer
+				var ptrTemp *Operand
+				if memberOffset != 0 {
+					offsetOp := &Operand{Type: "imm", Value: fmt.Sprintf("%d", memberOffset)}
+					ptrWithOffset := is.newTemp()
+					is.emit(OpAdd, ptrWithOffset, baseTemp, offsetOp)
+					ptrTemp = ptrWithOffset
+				} else {
+					ptrTemp = baseTemp
+				}
+				
+				// Load from pointer
+				memberOp := &Operand{Type: "ptr", IndexTemp: ptrTemp}
+				is.emit(OpLoad, result, memberOp, nil)
+			} else {
+				return nil, fmt.Errorf("dot access on non-variable expression not yet supported (in function: %s, member: %s, baseType: %s)", 
+					is.currentFunc, memberName, baseTemp.Type)
+			}
 		}
 		
 		return result, nil
 		
 	case NodeAssignment:
-		// Handle array assignment: arr[i] = value
+		// Handle array assignment: arr[i] = value or expr[i] = value
 		if node.Children[0].Type == NodeArrayAccess {
 			arrayNode := node.Children[0]
 			baseNode := arrayNode.Children[0]
-			
-			if baseNode.Type != NodeIdentifier {
-				return nil, fmt.Errorf("array base must be identifier")
-			}
-			
-			varName := baseNode.VarName
-			var baseOffset int
-			var isGlobal bool
-			
-			if sym, ok := is.localVars[varName]; ok {
-				baseOffset = sym.Offset
-				isGlobal = false
-			} else if _, ok := is.globalVars[varName]; ok {
-				baseOffset = 0
-				isGlobal = true
-			} else {
-				return nil, fmt.Errorf("undefined array: %s", varName)
-			}
 			
 			// Get index
 			index, err := is.selectExpression(arrayNode.Children[1])
@@ -841,20 +974,56 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				return nil, err
 			}
 			
-			// Calculate offset
+			// Calculate byte offset: index * 8
 			elementSize := &Operand{Type: "imm", Value: "8"}
-			offsetTemp := is.newTemp()
-			is.emit(OpMul, offsetTemp, index, elementSize)
+			byteOffset := is.newTemp()
+			is.emit(OpMul, byteOffset, index, elementSize)
 			
-			// Store to array[index]
-			arrayOp := &Operand{
-				Type:      "array",
-				Value:     varName,
-				Offset:    baseOffset,
-				IsGlobal:  isGlobal,
-				IndexTemp: offsetTemp,
+			// Check if base is a simple identifier (local/global array)
+			if baseNode.Type == NodeIdentifier {
+				varName := baseNode.VarName
+				var baseOffset int
+				var isGlobal bool
+				
+				if sym, ok := is.localVars[varName]; ok {
+					baseOffset = sym.Offset
+					isGlobal = false
+				} else if _, ok := is.globalVars[varName]; ok {
+					baseOffset = 0
+					isGlobal = true
+				} else {
+					return nil, fmt.Errorf("undefined array: %s", varName)
+				}
+				
+				// Use the optimized array access path
+				arrayOp := &Operand{
+					Type:      "array",
+					Value:     varName,
+					Offset:    baseOffset,
+					IsGlobal:  isGlobal,
+					IndexTemp: byteOffset,
+				}
+				is.emit(OpStore, arrayOp, value, nil)
+			} else {
+				// Base is a complex expression (member access, pointer, etc.)
+				// Evaluate it to get the pointer/array address
+				baseAddr, err := is.selectExpression(baseNode)
+				if err != nil {
+					return nil, err
+				}
+				
+				// Add base address + offset
+				finalAddr := is.newTemp()
+				is.emit(OpAdd, finalAddr, baseAddr, byteOffset)
+				
+				// Store to the computed address
+				ptrOp := &Operand{
+					Type:      "ptr",
+					IndexTemp: finalAddr,
+				}
+				is.emit(OpStore, ptrOp, value, nil)
 			}
-			is.emit(OpStore, arrayOp, value, nil)
+			
 			return value, nil
 		}
 		
@@ -865,35 +1034,59 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			memberName := memberNode.MemberName
 			isPtr := memberNode.IsPointer
 			
-			if baseNode.Type != NodeIdentifier {
-				return nil, fmt.Errorf("member access base must be identifier")
-			}
-			
-			varName := baseNode.VarName
-			var baseOffset int
-			var isGlobal bool
 			var structType string
+			var baseTemp *Operand
 			
-			// Look up variable
-			if sym, ok := is.localVars[varName]; ok {
-				baseOffset = sym.Offset
-				isGlobal = false
-				structType = sym.Type
-			} else if sym, ok := is.globalVars[varName]; ok {
-				baseOffset = 0
-				isGlobal = true
-				structType = sym.Type
+			// Handle base - can be identifier or complex expression
+			if baseNode.Type == NodeIdentifier {
+				varName := baseNode.VarName
+				var baseOffset int
+				var isGlobal bool
+				
+				// Look up variable
+				if sym, ok := is.localVars[varName]; ok {
+					baseOffset = sym.Offset
+					isGlobal = false
+					structType = sym.Type
+				} else if sym, ok := is.globalVars[varName]; ok {
+					baseOffset = 0
+					isGlobal = true
+					structType = sym.Type
+				} else {
+					return nil, fmt.Errorf("undefined variable: %s", varName)
+				}
+				
+				baseTemp = &Operand{Type: "var", Value: varName, Offset: baseOffset, IsGlobal: isGlobal}
 			} else {
-				return nil, fmt.Errorf("undefined variable: %s", varName)
+				// Complex expression - evaluate it
+				baseTempVal, err := is.selectExpression(baseNode)
+				if err != nil {
+					return nil, err
+				}
+				baseTemp = baseTempVal
+				structType = baseTemp.DataType
+				if structType == "" {
+					structType = baseNode.DataType
+				}
 			}
+			
+			// Resolve typedef and get struct name
+			structType = is.resolveType(structType)
 			
 			// Extract struct name
 			structName := structType
-			if len(structType) > 7 && structType[:7] == "struct " {
-				structName = structType[7:]
-			} else if len(structType) > 6 && structType[:6] == "union " {
-				structName = structType[6:]
+			// Strip pointers
+			for len(structName) > 0 && structName[len(structName)-1] == '*' {
+				structName = structName[:len(structName)-1]
 			}
+			structName = strings.TrimSpace(structName)
+			
+			if len(structName) > 7 && structName[:7] == "struct " {
+				structName = structName[7:]
+			} else if len(structName) > 6 && structName[:6] == "union " {
+				structName = structName[6:]
+			}
+			structName = strings.TrimSpace(structName)
 			
 			// Find struct definition
 			structDef, ok := is.structs[structName]
@@ -923,9 +1116,17 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			// Store to member
 			if isPtr {
 				// ptr->member: load pointer, add offset, store
-				ptrTemp := is.newTemp()
-				ptrOp := &Operand{Type: "var", Value: varName, Offset: baseOffset, IsGlobal: isGlobal}
-				is.emit(OpLoad, ptrTemp, ptrOp, nil)
+				var ptrTemp *Operand
+				
+				if baseTemp.Type == "var" {
+					// Load pointer from variable
+					ptrTempReg := is.newTemp()
+					is.emit(OpLoad, ptrTempReg, baseTemp, nil)
+					ptrTemp = ptrTempReg
+				} else {
+					// Base is already a value
+					ptrTemp = baseTemp
+				}
 				
 				// Add member offset
 				if memberOffset != 0 {
@@ -939,18 +1140,49 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				memberOp := &Operand{Type: "ptr", IndexTemp: ptrTemp}
 				is.emit(OpStore, memberOp, value, nil)
 			} else {
-				// struct.member: direct store
-				finalOffset := baseOffset + memberOffset
-				memberOp := &Operand{Type: "var", Value: varName, Offset: finalOffset, IsGlobal: isGlobal}
-				is.emit(OpStore, memberOp, value, nil)
+				// struct.member: direct access
+				// Need to compute address of base, add member offset, and store
+				
+				if baseTemp.Type == "var" {
+					// Simple variable
+					finalOffset := baseTemp.Offset + memberOffset
+					memberOp := &Operand{Type: "var", Value: baseTemp.Value, Offset: finalOffset, IsGlobal: baseTemp.IsGlobal}
+					is.emit(OpStore, memberOp, value, nil)
+					return value, nil
+				} else {
+					// Complex expression - need address
+					// For now, treat as error - dot operator on complex expressions needs address-of support
+					return nil, fmt.Errorf("dot access on complex expression for assignment not yet supported")
+				}
 			}
 			
 			return value, nil
 		}
 		
+		// Dereference assignment: *ptr = value
+		if node.Children[0].Type == NodeUnaryOp && node.Children[0].Operator == "*" {
+			// Get the pointer expression
+			ptrExpr, err := is.selectExpression(node.Children[0].Children[0])
+			if err != nil {
+				return nil, err
+			}
+			
+			// Get value to store
+			value, err := is.selectExpression(node.Children[1])
+			if err != nil {
+				return nil, err
+			}
+			
+			// Store to pointer
+			ptrOp := &Operand{Type: "ptr", IndexTemp: ptrExpr}
+			is.emit(OpStore, ptrOp, value, nil)
+			return value, nil
+		}
+		
 		// Regular variable assignment
 		if node.Children[0].Type != NodeIdentifier {
-			return nil, fmt.Errorf("invalid assignment target")
+			return nil, fmt.Errorf("invalid assignment target: type=%d, operator=%s (in function: %s)", 
+				node.Children[0].Type, node.Operator, is.currentFunc)
 		}
 		
 		value, err := is.selectExpression(node.Children[1])
@@ -1053,11 +1285,18 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		// Extract struct name from type
 		structType := node.DataType
 		structName := structType
-		if len(structType) > 7 && structType[:7] == "struct " {
-			structName = structType[7:]
-		} else if len(structType) > 6 && structType[:6] == "union " {
-			structName = structType[6:]
+		// Strip pointers
+		for len(structName) > 0 && structName[len(structName)-1] == '*' {
+			structName = structName[:len(structName)-1]
 		}
+		structName = strings.TrimSpace(structName)
+		
+		if len(structName) > 7 && structName[:7] == "struct " {
+			structName = structName[7:]
+		} else if len(structName) > 6 && structName[:6] == "union " {
+			structName = structName[6:]
+		}
+		structName = strings.TrimSpace(structName)
 		
 		// Find struct definition
 		structDef, ok := is.structs[structName]
@@ -1155,12 +1394,16 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		
 	case NodeCast:
 		// Type cast: (Type)expr
-		// For now, just evaluate the expression and ignore the cast
-		// TODO: Handle different type sizes and conversions properly
 		if len(node.Children) < 1 {
 			return nil, fmt.Errorf("cast needs operand")
 		}
-		return is.selectExpression(node.Children[0])
+		result, err := is.selectExpression(node.Children[0])
+		if err != nil {
+			return nil, err
+		}
+		// Preserve the cast type information
+		result.DataType = node.DataType
+		return result, nil
 		
 	default:
 		return nil, fmt.Errorf("unknown expression type: %d", node.Type)

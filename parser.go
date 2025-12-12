@@ -98,6 +98,7 @@ type Parser struct {
 	pos      int
 	structs  map[string]*StructDef // Track struct definitions
 	typedefs map[string]string     // Track typedef aliases: alias -> actual type
+	enums    map[string]int        // Track enum constants: name -> value
 }
 
 func NewParser(source string) *Parser {
@@ -109,6 +110,7 @@ func NewParser(source string) *Parser {
 		pos:      0,
 		structs:  make(map[string]*StructDef),
 		typedefs: make(map[string]string),
+		enums:    make(map[string]int),
 	}
 }
 
@@ -394,8 +396,16 @@ func (p *Parser) parseTopLevel() (*ASTNode, error) {
 		return nil, nil
 	}
 	
-	if p.match(TYPEDEF, ENUM) {
+	if p.match(TYPEDEF) {
 		p.skipStructOrTypedef()
+		return nil, nil
+	}
+	
+	if p.match(ENUM) {
+		err := p.parseEnumDef()
+		if err != nil {
+			return nil, err
+		}
 		return nil, nil
 	}
 	
@@ -513,13 +523,27 @@ func (p *Parser) parseType() string {
 				Size:    offset,
 			}
 		}
-	} else if p.match(IDENTIFIER) && typ == "" {
-		// Only treat as typedef if we don't have modifiers already
-		// (e.g., "long y" - y is the variable name, not a type)
+	} else if p.match(IDENTIFIER) {
+		// Check if this could be a typedef name
 		typeName := p.current().Lexeme
-		p.advance()
-		// Resolve typedef if it exists
-		typ = p.resolveTypedef(typeName)
+		resolvedType := p.resolveTypedef(typeName)
+		
+		// If it resolves to something different, it's a typedef
+		if resolvedType != typeName {
+			p.advance()
+			typ += resolvedType
+		} else if typ == "" {
+			// No modifiers yet - treat as type name (typedef or unknown type)
+			p.advance()
+			typ = resolvedType
+		} else {
+			// Has modifiers like "static" - check if this looks like a type name
+			// If the identifier starts with uppercase or is known pattern, treat as type
+			// Otherwise it's the variable name
+			// For now, consume it as a type name if we haven't seen a base type yet
+			p.advance()
+			typ += typeName
+		}
 	}
 	
 	// Pointers
@@ -640,6 +664,82 @@ func (p *Parser) parseStructDef() error {
 		Name:    structName,
 		Members: members,
 		Size:    currentOffset,
+	}
+	
+	return nil
+}
+
+func (p *Parser) parseEnumDef() error {
+	p.advance() // skip 'enum'
+	
+	// Optional enum name
+	if p.match(IDENTIFIER) {
+		_ = p.current().Lexeme // enumName not used yet
+		p.advance()
+	}
+	
+	// Check for just declaration (enum Foo;)
+	if p.match(SEMICOLON) {
+		p.advance()
+		return nil // Forward declaration, ignore
+	}
+	
+	if !p.match(LBRACE) {
+		return fmt.Errorf("expected { or ; after enum name")
+	}
+	p.advance() // skip {
+	
+	// Parse enum values
+	currentValue := 0
+	for !p.match(RBRACE) && !p.match(EOF) {
+		if !p.match(IDENTIFIER) {
+			p.advance()
+			continue
+		}
+		
+		constName := p.current().Lexeme
+		p.advance()
+		
+		// Check for explicit value
+		if p.match(ASSIGN) {
+			p.advance()
+			
+			// Parse the value - for simplicity, only handle number literals
+			if p.match(NUMBER) {
+				value, err := strconv.Atoi(p.current().Lexeme)
+				if err == nil {
+					currentValue = value
+				}
+				p.advance()
+			} else {
+				// Skip complex expressions
+				for !p.match(COMMA, RBRACE, EOF) {
+					p.advance()
+				}
+			}
+		}
+		
+		// Store enum constant
+		p.enums[constName] = currentValue
+		currentValue++
+		
+		// Optional comma
+		if p.match(COMMA) {
+			p.advance()
+		}
+	}
+	
+	if !p.match(RBRACE) {
+		return fmt.Errorf("expected } at end of enum")
+	}
+	p.advance()
+	
+	// Optional variable name and semicolon
+	if p.match(IDENTIFIER) {
+		p.advance()
+	}
+	if p.match(SEMICOLON) {
+		p.advance()
 	}
 	
 	return nil

@@ -250,6 +250,14 @@ func (a *Assembler) encodeInstruction(line string) error {
 		return a.encodeMovzbq(parts[1:])
 	case "testq":
 		return a.encodeTest(parts[1:])
+	case "leaq":
+		return a.encodeLea(parts[1:])
+	case "salq", "shlq":
+		return a.encodeShift(0xE0, parts[1:]) // SAL/SHL use /4
+	case "sarq":
+		return a.encodeShift(0xF8, parts[1:]) // SAR uses /7
+	case "shrq":
+		return a.encodeShift(0xE8, parts[1:]) // SHR uses /5
 	default:
 		return fmt.Errorf("unsupported mnemonic: %s", mnemonic)
 	}
@@ -349,6 +357,202 @@ func (a *Assembler) encodeMov(operands []string) error {
 		return nil
 	}
 	
+	// Check for RIP-relative addressing: symbol(%rip)
+	if strings.Contains(src, "(%rip)") && dstReg != -1 {
+		// movq symbol(%rip), %reg - load from RIP-relative address
+		symbol := strings.TrimSuffix(src, "(%rip)")
+		symbol = strings.TrimSpace(symbol)
+		
+		rex := byte(0x48)
+		if dstReg >= 8 {
+			rex |= 0x04 // REX.R
+			dstReg -= 8
+		}
+		
+		a.emit(rex, 0x8B)
+		// ModR/M: 00 reg 101 (RIP-relative)
+		modrm := byte(0x05) | byte((dstReg&7)<<3)
+		a.emit(modrm)
+		
+		// Add relocation
+		a.relocations = append(a.relocations, Relocation{
+			Type:   R_X86_64_PC32,
+			Offset: uint64(len(a.code)),
+			Symbol: symbol,
+			Addend: -4,
+		})
+		a.emitInt32(0)
+		return nil
+	}
+	
+	if strings.Contains(dst, "(%rip)") && srcReg != -1 {
+		// movq %reg, symbol(%rip) - store to RIP-relative address
+		symbol := strings.TrimSuffix(dst, "(%rip)")
+		symbol = strings.TrimSpace(symbol)
+		
+		rex := byte(0x48)
+		if srcReg >= 8 {
+			rex |= 0x04 // REX.R
+			srcReg -= 8
+		}
+		
+		a.emit(rex, 0x89)
+		// ModR/M: 00 reg 101 (RIP-relative)
+		modrm := byte(0x05) | byte((srcReg&7)<<3)
+		a.emit(modrm)
+		
+		// Add relocation
+		a.relocations = append(a.relocations, Relocation{
+			Type:   R_X86_64_PC32,
+			Offset: uint64(len(a.code)),
+			Symbol: symbol,
+			Addend: -4,
+		})
+		a.emitInt32(0)
+		return nil
+	}
+	
+	// Check for memory addressing: (%reg) or offset(%reg)
+	if strings.Contains(dst, "(%") && strings.HasSuffix(dst, ")") {
+		// movq %src, (%dst) or movq %src, offset(%dst)
+		if srcReg == -1 {
+			return fmt.Errorf("source must be register for memory store")
+		}
+		
+		// Parse destination: (%reg) or offset(%reg)
+		memStr := dst
+		// Extract base register (everything after the last %)
+		lastPct := strings.LastIndex(memStr, "%")
+		if lastPct == -1 {
+			return fmt.Errorf("invalid memory operand: %s", dst)
+		}
+		baseRegStr := memStr[lastPct:]
+		baseRegStr = strings.TrimSuffix(baseRegStr, ")")
+		baseReg := parseRegister(baseRegStr)
+		if baseReg == -1 {
+			return fmt.Errorf("invalid base register in: %s", dst)
+		}
+		
+		// Extract offset (everything before the %)
+		offsetStr := strings.TrimPrefix(memStr[:lastPct], "(")
+		offsetStr = strings.TrimSuffix(offsetStr, "(")
+		offset := int32(0)
+		if offsetStr != "" {
+			val, err := strconv.ParseInt(offsetStr, 10, 32)
+			if err != nil {
+				return fmt.Errorf("invalid offset in: %s (offset: %s)", dst, offsetStr)
+			}
+			offset = int32(val)
+		}
+		
+		// REX.W prefix
+		rex := byte(0x48)
+		if srcReg >= 8 {
+			rex |= 0x04 // REX.R
+		}
+		if baseReg >= 8 {
+			rex |= 0x01 // REX.B
+		}
+		a.emit(rex, 0x89)
+		
+		// ModR/M byte
+		if offset == 0 && (baseReg&7) != 5 { // Not RBP
+			// [base] - mod=00
+			modrm := byte(0x00) | byte((srcReg&7)<<3) | byte(baseReg&7)
+			a.emit(modrm)
+			if (baseReg & 7) == 4 { // RSP needs SIB
+				a.emit(0x24) // SIB: scale=0, index=none, base=RSP
+			}
+		} else if offset >= -128 && offset <= 127 {
+			// [base+disp8] - mod=01
+			modrm := byte(0x40) | byte((srcReg&7)<<3) | byte(baseReg&7)
+			a.emit(modrm)
+			if (baseReg & 7) == 4 { // RSP needs SIB
+				a.emit(0x24)
+			}
+			a.emit(byte(offset))
+		} else {
+			// [base+disp32] - mod=10
+			modrm := byte(0x80) | byte((srcReg&7)<<3) | byte(baseReg&7)
+			a.emit(modrm)
+			if (baseReg & 7) == 4 { // RSP needs SIB
+				a.emit(0x24)
+			}
+			a.emitInt32(offset)
+		}
+		return nil
+	}
+	
+	if strings.Contains(src, "(%") && strings.HasSuffix(src, ")") {
+		// movq (%src), %dst or movq offset(%src), %dst
+		if dstReg == -1 {
+			return fmt.Errorf("destination must be register for memory load")
+		}
+		
+		// Parse source: (%reg) or offset(%reg)
+		memStr := src
+		// Extract base register (everything after the last %)
+		lastPct := strings.LastIndex(memStr, "%")
+		if lastPct == -1 {
+			return fmt.Errorf("invalid memory operand: %s", src)
+		}
+		baseRegStr := memStr[lastPct:]
+		baseRegStr = strings.TrimSuffix(baseRegStr, ")")
+		baseReg := parseRegister(baseRegStr)
+		if baseReg == -1 {
+			return fmt.Errorf("invalid base register in: %s", src)
+		}
+		
+		// Extract offset (everything before the %)
+		offsetStr := strings.TrimPrefix(memStr[:lastPct], "(")
+		offsetStr = strings.TrimSuffix(offsetStr, "(")
+		offset := int32(0)
+		if offsetStr != "" {
+			val, err := strconv.ParseInt(offsetStr, 10, 32)
+			if err != nil {
+				return fmt.Errorf("invalid offset in: %s (offset: %s)", src, offsetStr)
+			}
+			offset = int32(val)
+		}
+		
+		// REX.W prefix
+		rex := byte(0x48)
+		if dstReg >= 8 {
+			rex |= 0x04 // REX.R
+		}
+		if baseReg >= 8 {
+			rex |= 0x01 // REX.B
+		}
+		a.emit(rex, 0x8B)
+		
+		// ModR/M byte
+		if offset == 0 && (baseReg&7) != 5 { // Not RBP
+			// [base] - mod=00
+			modrm := byte(0x00) | byte((dstReg&7)<<3) | byte(baseReg&7)
+			a.emit(modrm)
+			if (baseReg & 7) == 4 { // RSP needs SIB
+				a.emit(0x24)
+			}
+		} else if offset >= -128 && offset <= 127 {
+			// [base+disp8] - mod=01
+			modrm := byte(0x40) | byte((dstReg&7)<<3) | byte(baseReg&7)
+			a.emit(modrm)
+			if (baseReg & 7) == 4 { // RSP needs SIB
+				a.emit(0x24)
+			}
+			a.emit(byte(offset))
+		} else {
+			// [base+disp32] - mod=10
+			modrm := byte(0x80) | byte((dstReg&7)<<3) | byte(baseReg&7)
+			a.emit(modrm)
+			if (baseReg & 7) == 4 { // RSP needs SIB
+				a.emit(0x24)
+			}
+			a.emitInt32(offset)
+		}
+		return nil
+	}
+	
 	return fmt.Errorf("unsupported mov operands: %s, %s", src, dst)
 }
 
@@ -367,6 +571,42 @@ func (a *Assembler) encodeImul(operands []string) error {
 	
 	src := strings.TrimSuffix(strings.TrimSpace(operands[0]), ",")
 	dst := strings.TrimSpace(operands[1])
+	
+	// Check for immediate source: imulq $imm, %reg
+	if strings.HasPrefix(src, "$") {
+		dstReg := parseRegister(dst)
+		if dstReg == -1 {
+			return fmt.Errorf("destination must be register for imul")
+		}
+		
+		imm, err := parseImmediate(src)
+		if err != nil {
+			return err
+		}
+		
+		rex := byte(0x48)
+		if dstReg >= 8 {
+			rex |= 0x05 // REX.RB (dst is both src and dst)
+			dstReg -= 8
+		}
+		a.emit(rex)
+		
+		// Use imul r64, r64, imm32 form (opcode 0x69)
+		if imm >= -128 && imm <= 127 {
+			// Sign-extended imm8
+			a.emit(0x6B)
+			modrm := byte(0xC0) | byte((dstReg&7)<<3) | byte(dstReg&7)
+			a.emit(modrm)
+			a.emit(byte(imm))
+		} else {
+			// imm32
+			a.emit(0x69)
+			modrm := byte(0xC0) | byte((dstReg&7)<<3) | byte(dstReg&7)
+			a.emit(modrm)
+			a.emitInt32(int32(imm))
+		}
+		return nil
+	}
 	
 	srcReg := parseRegister(src)
 	dstReg := parseRegister(dst)
@@ -643,6 +883,169 @@ func (a *Assembler) encodeTest(operands []string) error {
 
 func (a *Assembler) emit(bytes ...byte) {
 	a.code = append(a.code, bytes...)
+}
+
+func (a *Assembler) encodeLea(operands []string) error {
+	// leaq label(%rip), %reg or leaq offset(%base), %reg
+	if len(operands) != 2 {
+		return fmt.Errorf("lea requires 2 operands")
+	}
+	
+	src := strings.TrimSpace(strings.TrimSuffix(operands[0], ","))
+	dst := strings.TrimSpace(operands[1])
+	
+	dstReg := parseRegister(dst)
+	if dstReg < 0 {
+		return fmt.Errorf("invalid destination register: %s", dst)
+	}
+	
+	// Check for RIP-relative addressing: label(%rip)
+	if strings.Contains(src, "(%rip)") {
+		label := strings.TrimSuffix(src, "(%rip)")
+		label = strings.TrimSpace(label)
+		
+		// leaq label(%rip), reg
+		// Opcode: REX.W + 0x8D /r with ModR/M 00 reg 101
+		// REX.W = 0x48
+		rex := byte(0x48)
+		if dstReg >= 8 {
+			rex |= 0x04 // REX.R
+			dstReg -= 8
+		}
+		
+		a.emit(rex, 0x8D)
+		// ModR/M: 00 reg 101 (RIP-relative)
+		modrm := byte(0x05) | byte(dstReg<<3)
+		a.emit(modrm)
+		
+		// Add relocation for the displacement (4 bytes)
+		a.relocations = append(a.relocations, Relocation{
+			Type:   R_X86_64_PC32,
+			Offset: uint64(len(a.code)),
+			Symbol: label,
+			Addend: -4,
+		})
+		a.emitInt32(0) // Placeholder for displacement
+		
+		return nil
+	}
+	
+	// Check for regular addressing: offset(%base)
+	if strings.Contains(src, "(%") && strings.HasSuffix(src, ")") {
+		// Parse: offset(%base)
+		memStr := src
+		lastPct := strings.LastIndex(memStr, "%")
+		if lastPct == -1 {
+			return fmt.Errorf("invalid memory operand: %s", src)
+		}
+		baseRegStr := memStr[lastPct:]
+		baseRegStr = strings.TrimSuffix(baseRegStr, ")")
+		baseReg := parseRegister(baseRegStr)
+		if baseReg == -1 {
+			return fmt.Errorf("invalid base register in: %s", src)
+		}
+		
+		offsetStr := strings.TrimPrefix(memStr[:lastPct], "(")
+		offsetStr = strings.TrimSuffix(offsetStr, "(")
+		offset := int32(0)
+		if offsetStr != "" {
+			val, err := strconv.ParseInt(offsetStr, 10, 32)
+			if err != nil {
+				return fmt.Errorf("invalid offset in: %s", src)
+			}
+			offset = int32(val)
+		}
+		
+		// LEA offset(%base), %dst
+		rex := byte(0x48)
+		if dstReg >= 8 {
+			rex |= 0x04 // REX.R
+			dstReg -= 8
+		}
+		if baseReg >= 8 {
+			rex |= 0x01 // REX.B
+			baseReg -= 8
+		}
+		
+		a.emit(rex, 0x8D)
+		
+		// ModR/M
+		if offset == 0 && (baseReg&7) != 5 { // Not RBP
+			modrm := byte(0x00) | byte((dstReg&7)<<3) | byte(baseReg&7)
+			a.emit(modrm)
+			if (baseReg & 7) == 4 { // RSP needs SIB
+				a.emit(0x24)
+			}
+		} else if offset >= -128 && offset <= 127 {
+			modrm := byte(0x40) | byte((dstReg&7)<<3) | byte(baseReg&7)
+			a.emit(modrm)
+			if (baseReg & 7) == 4 { // RSP needs SIB
+				a.emit(0x24)
+			}
+			a.emit(byte(offset))
+		} else {
+			modrm := byte(0x80) | byte((dstReg&7)<<3) | byte(baseReg&7)
+			a.emit(modrm)
+			if (baseReg & 7) == 4 { // RSP needs SIB
+				a.emit(0x24)
+			}
+			a.emitInt32(offset)
+		}
+		return nil
+	}
+	
+	return fmt.Errorf("unsupported lea addressing mode: %s", src)
+}
+
+func (a *Assembler) encodeShift(modrmExt byte, operands []string) error {
+	// shift $imm, %reg or shift %cl, %reg
+	if len(operands) != 2 {
+		return fmt.Errorf("shift requires 2 operands")
+	}
+	
+	src := strings.TrimSpace(strings.TrimSuffix(operands[0], ","))
+	dst := strings.TrimSpace(operands[1])
+	
+	dstReg := parseRegister(dst)
+	if dstReg < 0 {
+		return fmt.Errorf("invalid destination register: %s", dst)
+	}
+	
+	rex := byte(0x48)
+	if dstReg >= 8 {
+		rex |= 0x01 // REX.B
+		dstReg -= 8
+	}
+	
+	// Check for immediate shift
+	if strings.HasPrefix(src, "$") {
+		imm, err := parseImmediate(src)
+		if err != nil {
+			return err
+		}
+		
+		a.emit(rex)
+		if imm == 1 {
+			// Special encoding for shift by 1
+			a.emit(0xD1)
+			a.emit(modrmExt | byte(dstReg&7))
+		} else {
+			// Shift by immediate byte
+			a.emit(0xC1)
+			a.emit(modrmExt | byte(dstReg&7))
+			a.emit(byte(imm))
+		}
+		return nil
+	}
+	
+	// Check for shift by CL register
+	if src == "%cl" || src == "%rcx" {
+		a.emit(rex, 0xD3)
+		a.emit(modrmExt | byte(dstReg&7))
+		return nil
+	}
+	
+	return fmt.Errorf("unsupported shift operands: %s, %s", src, dst)
 }
 
 func (a *Assembler) emitInt32(val int32) {

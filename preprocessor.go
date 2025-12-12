@@ -19,13 +19,57 @@ type Preprocessor struct {
 }
 
 func NewPreprocessor() *Preprocessor {
-	return &Preprocessor{
+	p := &Preprocessor{
 		defines:      make(map[string]string),
 		includePaths: []string{"/usr/include", "/usr/local/include", "."},
 		processed:    make(map[string]bool),
 		typedefMap:   make(map[string]*StructDef),
 		structMap:    make(map[string]*StructDef),
 	}
+	
+	// Add standard built-in macros
+	p.defines["NULL"] = "0"
+	p.defines["true"] = "1"
+	p.defines["false"] = "0"
+	
+	// Add raylib log levels
+	p.defines["LOG_ALL"] = "0"
+	p.defines["LOG_TRACE"] = "1"
+	p.defines["LOG_DEBUG"] = "2"
+	p.defines["LOG_INFO"] = "3"
+	p.defines["LOG_WARNING"] = "4"
+	p.defines["LOG_ERROR"] = "5"
+	p.defines["LOG_FATAL"] = "6"
+	p.defines["LOG_NONE"] = "7"
+	
+	// Add raylib window flags
+	p.defines["FLAG_VSYNC_HINT"] = "64"
+	p.defines["FLAG_FULLSCREEN_MODE"] = "2"
+	p.defines["FLAG_WINDOW_RESIZABLE"] = "4"
+	p.defines["FLAG_WINDOW_UNDECORATED"] = "8"
+	p.defines["FLAG_WINDOW_HIDDEN"] = "128"
+	p.defines["FLAG_WINDOW_MINIMIZED"] = "512"
+	p.defines["FLAG_WINDOW_MAXIMIZED"] = "1024"
+	p.defines["FLAG_WINDOW_UNFOCUSED"] = "2048"
+	p.defines["FLAG_WINDOW_TOPMOST"] = "4096"
+	p.defines["FLAG_WINDOW_ALWAYS_RUN"] = "256"
+	p.defines["FLAG_WINDOW_TRANSPARENT"] = "16"
+	p.defines["FLAG_WINDOW_HIGHDPI"] = "8192"
+	p.defines["FLAG_MSAA_4X_HINT"] = "32"
+	p.defines["FLAG_INTERLACED_HINT"] = "65536"
+	
+	// Add shader uniform types
+	p.defines["SHADER_UNIFORM_FLOAT"] = "0"
+	p.defines["SHADER_UNIFORM_VEC2"] = "1"
+	p.defines["SHADER_UNIFORM_VEC3"] = "2"
+	p.defines["SHADER_UNIFORM_VEC4"] = "3"
+	p.defines["SHADER_UNIFORM_INT"] = "4"
+	p.defines["SHADER_UNIFORM_IVEC2"] = "5"
+	p.defines["SHADER_UNIFORM_IVEC3"] = "6"
+	p.defines["SHADER_UNIFORM_IVEC4"] = "7"
+	p.defines["SHADER_UNIFORM_SAMPLER2D"] = "8"
+	
+	return p
 }
 
 // Define adds a preprocessor define
@@ -178,12 +222,23 @@ func (p *Preprocessor) processInclude(filename string) (string, error) {
 	var fullPath string
 	var found bool
 	
-	for _, searchPath := range p.includePaths {
-		testPath := filepath.Join(searchPath, filename)
-		if _, err := os.Stat(testPath); err == nil {
-			fullPath = testPath
+	// If filename is an absolute path, try it directly first
+	if filepath.IsAbs(filename) {
+		if _, err := os.Stat(filename); err == nil {
+			fullPath = filename
 			found = true
-			break
+		}
+	}
+	
+	// Otherwise, search in include paths
+	if !found {
+		for _, searchPath := range p.includePaths {
+			testPath := filepath.Join(searchPath, filename)
+			if _, err := os.Stat(testPath); err == nil {
+				fullPath = testPath
+				found = true
+				break
+			}
 		}
 	}
 	

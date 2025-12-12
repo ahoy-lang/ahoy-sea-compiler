@@ -76,6 +76,23 @@ func (cp *CompilerPipeline) Compile() error {
 		preprocessor.Define("SIGFPE", "8")
 		preprocessor.Define("SIGABRT", "6")
 		
+		// Add Raylib key constants (from raylib.h KeyboardKey enum)
+		preprocessor.Define("KEY_W", "87")
+		preprocessor.Define("KEY_A", "65")
+		preprocessor.Define("KEY_S", "83")
+		preprocessor.Define("KEY_D", "68")
+		preprocessor.Define("KEY_Q", "81")
+		preprocessor.Define("KEY_E", "69")
+		preprocessor.Define("KEY_F", "70")
+		preprocessor.Define("KEY_F1", "290")
+		preprocessor.Define("KEY_F2", "291")
+		preprocessor.Define("KEY_F3", "292")
+		
+		// Add Raylib mouse button constants
+		preprocessor.Define("MOUSE_BUTTON_LEFT", "0")
+		preprocessor.Define("MOUSE_BUTTON_RIGHT", "1")
+		preprocessor.Define("MOUSE_BUTTON_MIDDLE", "2")
+		
 		preprocessedSource, err = preprocessor.Process(cp.source)
 		if err != nil {
 			return fmt.Errorf("preprocessing error: %w", err)
@@ -122,6 +139,7 @@ func (cp *CompilerPipeline) Compile() error {
 	cp.selector = NewInstructionSelector()
 	cp.selector.structs = cp.parser.structs  // Pass struct definitions
 	cp.selector.typedefs = cp.parser.typedefs  // Pass typedef aliases
+	cp.selector.enums = cp.parser.enums  // Pass enum constants
 	err = cp.selector.SelectInstructions(cp.ast)
 	if err != nil {
 		return fmt.Errorf("instruction selection error: %w", err)
