@@ -257,9 +257,18 @@ func (ce *CodeEmitter) emitInstruction(instr *IRInstruction) {
 		
 	case OpNot:
 		ce.emitMov(instr.Dst, instr.Src1)
-		ce.output.WriteString(fmt.Sprintf("    testq %s, %s\n", ce.formatOperand(instr.Dst), ce.formatOperand(instr.Dst)))
-		ce.output.WriteString(fmt.Sprintf("    sete %%al\n"))
-		ce.output.WriteString(fmt.Sprintf("    movzbq %%al, %s\n", ce.formatOperand(instr.Dst)))
+		dstStr := ce.formatOperand(instr.Dst)
+		if strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")") {
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", dstStr))
+			ce.output.WriteString("    testq %rax, %rax\n")
+			ce.output.WriteString("    sete %al\n")
+			ce.output.WriteString("    movzbq %al, %rax\n")
+			ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    testq %s, %s\n", dstStr, dstStr))
+			ce.output.WriteString("    sete %al\n")
+			ce.output.WriteString(fmt.Sprintf("    movzbq %%al, %s\n", dstStr))
+		}
 		
 	case OpShl:
 		ce.emitShift("salq", instr.Dst, instr.Src1, instr.Src2)
@@ -298,11 +307,23 @@ func (ce *CodeEmitter) emitInstruction(instr *IRInstruction) {
 		ce.output.WriteString(fmt.Sprintf("    jmp %s\n", instr.Dst.Value))
 		
 	case OpJz:
-		ce.output.WriteString(fmt.Sprintf("    testq %s, %s\n", ce.formatOperand(instr.Src1), ce.formatOperand(instr.Src1)))
+		src1Str := ce.formatOperand(instr.Src1)
+		if strings.Contains(src1Str, "(") && strings.Contains(src1Str, ")") {
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", src1Str))
+			ce.output.WriteString("    testq %rax, %rax\n")
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    testq %s, %s\n", src1Str, src1Str))
+		}
 		ce.output.WriteString(fmt.Sprintf("    jz %s\n", instr.Dst.Value))
 		
 	case OpJnz:
-		ce.output.WriteString(fmt.Sprintf("    testq %s, %s\n", ce.formatOperand(instr.Src1), ce.formatOperand(instr.Src1)))
+		src1Str := ce.formatOperand(instr.Src1)
+		if strings.Contains(src1Str, "(") && strings.Contains(src1Str, ")") {
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", src1Str))
+			ce.output.WriteString("    testq %rax, %rax\n")
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    testq %s, %s\n", src1Str, src1Str))
+		}
 		ce.output.WriteString(fmt.Sprintf("    jnz %s\n", instr.Dst.Value))
 		
 	case OpLabel:
@@ -337,7 +358,13 @@ func (ce *CodeEmitter) emitMov(dst, src *Operand) {
 			ce.floatLits[label] = src.Value
 		}
 		// Load the float constant as a 64-bit integer from .rodata
-		ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %s\n", label, dstStr))
+		dstIsMem := strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")")
+		if dstIsMem {
+			ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %%rax\n", label))
+			ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %s\n", label, dstStr))
+		}
 		return
 	}
 	
@@ -351,13 +378,21 @@ func (ce *CodeEmitter) emitMov(dst, src *Operand) {
 	if dst.Type == "mem" && src.Type == "imm" {
 		ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", srcStr))
 		ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
-	} else if dst.Type == "mem" && src.Type == "mem" {
+		return
+	}
+	
+	// Check for memory-to-memory by pattern (both have (%reg) syntax)
+	srcIsMem := strings.Contains(srcStr, "(") && strings.Contains(srcStr, ")")
+	dstIsMem := strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")")
+	
+	if srcIsMem && dstIsMem {
 		// Memory to memory through register
 		ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", srcStr))
 		ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
-	} else {
-		ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", srcStr, dstStr))
+		return
 	}
+	
+	ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", srcStr, dstStr))
 }
 
 func (ce *CodeEmitter) emitBinaryOp(op string, dst, src1, src2 *Operand) {
@@ -381,8 +416,16 @@ func (ce *CodeEmitter) emitMul(dst, src1, src2 *Operand) {
 	
 	src2Str := ce.formatOperand(src2)
 	dstStr := ce.formatOperand(dst)
+	dstIsMem := strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")")
 	
-	ce.output.WriteString(fmt.Sprintf("    imulq %s, %s\n", src2Str, dstStr))
+	if dstIsMem {
+		// imul doesn't support memory destination - use rax
+		ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", dstStr))
+		ce.output.WriteString(fmt.Sprintf("    imulq %s, %%rax\n", src2Str))
+		ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+	} else {
+		ce.output.WriteString(fmt.Sprintf("    imulq %s, %s\n", src2Str, dstStr))
+	}
 }
 
 func (ce *CodeEmitter) emitDiv(dst, src1, src2 *Operand) {
@@ -430,18 +473,53 @@ func (ce *CodeEmitter) emitShift(op string, dst, src1, src2 *Operand) {
 }
 
 func (ce *CodeEmitter) emitComparison(setcc string, dst, src1, src2 *Operand) {
-	ce.output.WriteString(fmt.Sprintf("    cmpq %s, %s\n", ce.formatOperand(src2), ce.formatOperand(src1)))
+	src1Str := ce.formatOperand(src1)
+	src2Str := ce.formatOperand(src2)
+	
+	src1IsMem := strings.Contains(src1Str, "(") && strings.Contains(src1Str, ")")
+	src2IsMem := strings.Contains(src2Str, "(") && strings.Contains(src2Str, ")")
+	
+	if src1IsMem && src2IsMem {
+		// Both are memory - load one into register
+		ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", src1Str))
+		ce.output.WriteString(fmt.Sprintf("    cmpq %s, %%rax\n", src2Str))
+	} else {
+		ce.output.WriteString(fmt.Sprintf("    cmpq %s, %s\n", src2Str, src1Str))
+	}
+	
 	ce.output.WriteString(fmt.Sprintf("    %s %%al\n", setcc))
-	ce.output.WriteString(fmt.Sprintf("    movzbq %%al, %s\n", ce.formatOperand(dst)))
+	
+	dstStr := ce.formatOperand(dst)
+	dstIsMem := strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")")
+	
+	if dstIsMem {
+		ce.output.WriteString("    movzbq %al, %rax\n")
+		ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+	} else {
+		ce.output.WriteString(fmt.Sprintf("    movzbq %%al, %s\n", dstStr))
+	}
 }
 
 func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 	switch src.Type {
 	case "var":
-		if src.IsGlobal {
-			ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %s\n", src.Value, ce.formatOperand(dst)))
+		dstStr := ce.formatOperand(dst)
+		// Check if destination is also memory
+		if strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")") {
+			// Load through register
+			if src.IsGlobal {
+				ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %%rax\n", src.Value))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movq %d(%%rbp), %%rax\n", src.Offset))
+			}
+			ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
 		} else {
-			ce.output.WriteString(fmt.Sprintf("    movq %d(%%rbp), %s\n", src.Offset, ce.formatOperand(dst)))
+			// Direct load to register
+			if src.IsGlobal {
+				ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %s\n", src.Value, dstStr))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movq %d(%%rbp), %s\n", src.Offset, dstStr))
+			}
 		}
 	case "array":
 		// Load from array[index]: base(%rbp) + index_temp
@@ -462,18 +540,56 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 		}
 	case "addr":
 		// Address-of: compute address and store in dst
-		if src.IsGlobal {
-			ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %s\n", src.Value, ce.formatOperand(dst)))
+		dstStr := ce.formatOperand(dst)
+		dstIsMem := strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")")
+		
+		if dstIsMem {
+			// Destination is memory, go through rax
+			if src.IsGlobal {
+				ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %%rax\n", src.Value))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    leaq %d(%%rbp), %%rax\n", src.Offset))
+			}
+			ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
 		} else {
-			ce.output.WriteString(fmt.Sprintf("    leaq %d(%%rbp), %s\n", src.Offset, ce.formatOperand(dst)))
+			// Destination is register
+			if src.IsGlobal {
+				ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %s\n", src.Value, dstStr))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    leaq %d(%%rbp), %s\n", src.Offset, dstStr))
+			}
 		}
 	case "ptr":
 		// Dereference: load from address in IndexTemp
 		ptrReg := ce.formatOperand(src.IndexTemp)
-		ce.output.WriteString(fmt.Sprintf("    movq (%s), %s\n", ptrReg, ce.formatOperand(dst)))
+		ptrIsMem := strings.Contains(ptrReg, "(") && strings.Contains(ptrReg, ")")
+		
+		dstStr := ce.formatOperand(dst)
+		dstIsMem := strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")")
+		
+		// If pointer is in memory, load it first
+		if ptrIsMem {
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", ptrReg))
+			ptrReg = "%r11"
+		}
+		
+		if dstIsMem {
+			ce.output.WriteString(fmt.Sprintf("    movq (%s), %%rax\n", ptrReg))
+			ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    movq (%s), %s\n", ptrReg, dstStr))
+		}
 	case "label":
 		// String literal or global label - use leaq to load address
-		ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %s\n", src.Value, ce.formatOperand(dst)))
+		dstStr := ce.formatOperand(dst)
+		dstIsMem := strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")")
+		
+		if dstIsMem {
+			ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %%rax\n", src.Value))
+			ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %s\n", src.Value, dstStr))
+		}
 	default:
 		ce.emitMov(dst, src)
 	}
@@ -482,15 +598,23 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 func (ce *CodeEmitter) emitStore(dst, src *Operand) {
 	switch dst.Type {
 	case "var":
+		srcStr := ce.formatOperand(src)
+		srcIsMem := strings.Contains(srcStr, "(") && strings.Contains(srcStr, ")")
+		
 		if dst.IsGlobal {
-			if src.Type == "imm" {
-				ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", ce.formatOperand(src)))
+			if src.Type == "imm" || srcIsMem {
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", srcStr))
 				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s(%%rip)\n", dst.Value))
 			} else {
-				ce.output.WriteString(fmt.Sprintf("    movq %s, %s(%%rip)\n", ce.formatOperand(src), dst.Value))
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %s(%%rip)\n", srcStr, dst.Value))
 			}
 		} else {
-			ce.output.WriteString(fmt.Sprintf("    movq %s, %d(%%rbp)\n", ce.formatOperand(src), dst.Offset))
+			if srcIsMem {
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", srcStr))
+				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %d(%%rbp)\n", dst.Offset))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %d(%%rbp)\n", srcStr, dst.Offset))
+			}
 		}
 	case "array":
 		// Store to array[index]: base(%rbp) + index_temp
@@ -520,10 +644,25 @@ func (ce *CodeEmitter) emitStore(dst, src *Operand) {
 	case "ptr":
 		// Dereference store: store to address in IndexTemp
 		ptrReg := ce.formatOperand(dst.IndexTemp)
+		ptrIsMem := strings.Contains(ptrReg, "(") && strings.Contains(ptrReg, ")")
+		
 		srcReg := ce.formatOperand(src)
 		
-		if src.Type == "imm" {
-			ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", srcReg))
+		// Load pointer into register if it's in memory
+		if ptrIsMem {
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", ptrReg))
+			ptrReg = "%r11"
+		}
+		
+		srcIsMem := strings.Contains(srcReg, "(") && strings.Contains(srcReg, ")")
+		
+		if src.Type == "imm" || srcIsMem || src.Type == "label" {
+			// Need to load source into register first
+			if src.Type == "label" {
+				ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %%rax\n", srcReg))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", srcReg))
+			}
 			srcReg = "%rax"
 		}
 		
