@@ -883,6 +883,51 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		return result, nil
 		
 	case NodeUnaryOp:
+		// For increment/decrement, we need to modify the variable directly
+		if node.Operator == "++" || node.Operator == "--" || 
+		   node.Operator == "++_post" || node.Operator == "--_post" {
+			// Check if operand is a simple identifier
+			if node.Children[0].Type == NodeIdentifier {
+				varName := node.Children[0].VarName
+				var varOp *Operand
+				
+				if sym, ok := is.localVars[varName]; ok {
+					varOp = &Operand{Type: "var", Value: varName, Offset: sym.Offset}
+				} else if _, ok := is.globalVars[varName]; ok {
+					varOp = &Operand{Type: "var", Value: varName, IsGlobal: true}
+				} else {
+					return nil, fmt.Errorf("undefined variable: %s", varName)
+				}
+				
+				// Load current value
+				currentVal := is.newTemp()
+				is.emit(OpLoad, currentVal, varOp, nil)
+				
+				// Compute new value
+				one := &Operand{Type: "imm", Value: "1"}
+				newVal := is.newTemp()
+				
+				if node.Operator == "++" || node.Operator == "++_post" {
+					is.emit(OpAdd, newVal, currentVal, one)
+				} else {
+					is.emit(OpSub, newVal, currentVal, one)
+				}
+				
+				// Store new value back to variable
+				is.emit(OpStore, varOp, newVal, nil)
+				
+				// Return appropriate value
+				if node.Operator == "++_post" || node.Operator == "--_post" {
+					// Post-increment: return old value
+					return currentVal, nil
+				} else {
+					// Pre-increment: return new value
+					return newVal, nil
+				}
+			}
+			// Fallthrough for complex expressions
+		}
+		
 		operand, err := is.selectExpression(node.Children[0])
 		if err != nil {
 			return nil, err
@@ -900,22 +945,22 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			allOnes := &Operand{Type: "imm", Value: "-1"}
 			is.emit(OpXor, result, operand, allOnes)
 		case "++":
-			// Pre-increment
+			// Pre-increment (fallback for complex expressions)
 			one := &Operand{Type: "imm", Value: "1"}
 			is.emit(OpAdd, operand, operand, one)
 			is.emit(OpMov, result, operand, nil)
 		case "--":
-			// Pre-decrement
+			// Pre-decrement (fallback for complex expressions)
 			one := &Operand{Type: "imm", Value: "1"}
 			is.emit(OpSub, operand, operand, one)
 			is.emit(OpMov, result, operand, nil)
 		case "++_post":
-			// Post-increment
+			// Post-increment (fallback for complex expressions)
 			is.emit(OpMov, result, operand, nil)
 			one := &Operand{Type: "imm", Value: "1"}
 			is.emit(OpAdd, operand, operand, one)
 		case "--_post":
-			// Post-decrement
+			// Post-decrement (fallback for complex expressions)
 			is.emit(OpMov, result, operand, nil)
 			one := &Operand{Type: "imm", Value: "1"}
 			is.emit(OpSub, operand, operand, one)
