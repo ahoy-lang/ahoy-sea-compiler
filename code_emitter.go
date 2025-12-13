@@ -741,7 +741,28 @@ func (ce *CodeEmitter) emitStore(dst, src *Operand) {
 				if loadedStr != "%rax" {
 					ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", loadedStr))
 				}
-				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %d(%%rbp)\n", dst.Offset))
+				// Check if we have a specific size to store
+				if dst.Size > 0 && dst.Size < 8 {
+					// Use appropriately sized move instruction
+					if dst.Size == 4 {
+						ce.output.WriteString(fmt.Sprintf("    movl %%eax, %d(%%rbp)\n", dst.Offset))
+					} else if dst.Size == 2 {
+						ce.output.WriteString(fmt.Sprintf("    movw %%ax, %d(%%rbp)\n", dst.Offset))
+					} else if dst.Size == 1 {
+						ce.output.WriteString(fmt.Sprintf("    movb %%al, %d(%%rbp)\n", dst.Offset))
+					} else {
+						ce.output.WriteString(fmt.Sprintf("    movq %%rax, %d(%%rbp)\n", dst.Offset))
+					}
+				} else {
+					// For integer immediates, use movl to avoid garbage in upper bytes
+					if src.Type == "imm" && !strings.Contains(src.Value, ".") {
+						// Use 32-bit mov for integer immediates
+						ce.output.WriteString(fmt.Sprintf("    movl $%s, %%eax\n", src.Value))
+						ce.output.WriteString(fmt.Sprintf("    movq %%rax, %d(%%rbp)\n", dst.Offset))
+					} else {
+						ce.output.WriteString(fmt.Sprintf("    movq %%rax, %d(%%rbp)\n", dst.Offset))
+					}
+				}
 			} else {
 				ce.output.WriteString(fmt.Sprintf("    movq %s, %d(%%rbp)\n", srcStr, dst.Offset))
 			}
@@ -780,30 +801,35 @@ func (ce *CodeEmitter) emitStore(dst, src *Operand) {
 		ptrReg := ce.formatOperand(dst.IndexTemp)
 		ptrIsMem := strings.Contains(ptrReg, "(") && strings.Contains(ptrReg, ")")
 		
-		srcReg := ce.formatOperand(src)
-		
-		// Load pointer into register if it's in memory
+		// Load pointer into a dedicated register if it's in memory
 		if ptrIsMem {
 			ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", ptrReg))
 			ptrReg = "%r11"
 		}
 		
+		srcReg := ce.formatOperand(src)
 		srcIsMem := strings.Contains(srcReg, "(") && strings.Contains(srcReg, ")")
+		
+		// Choose a value register that won't clobber the pointer
+		valueReg := "%rax"
+		if ptrReg == "%rax" {
+			valueReg = "%r10"
+		}
 		
 		if src.Type == "imm" || srcIsMem || src.Type == "label" {
 			// Need to load source into register first
 			if src.Type == "label" {
-				ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %%rax\n", srcReg))
+				ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %s\n", srcReg, valueReg))
 			} else if src.Type == "imm" {
 				// Use helper for float immediates
-				loadedStr := ce.loadFloatIfNeeded(src, "%rax")
-				if loadedStr != "%rax" {
-					ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", loadedStr))
+				loadedStr := ce.loadFloatIfNeeded(src, valueReg)
+				if loadedStr != valueReg {
+					ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", loadedStr, valueReg))
 				}
 			} else {
-				ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", srcReg))
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", srcReg, valueReg))
 			}
-			srcReg = "%rax"
+			srcReg = valueReg
 		}
 		
 		ce.output.WriteString(fmt.Sprintf("    movq %s, (%s)\n", srcReg, ptrReg))

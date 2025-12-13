@@ -449,9 +449,10 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 			}
 		} else {
 			is.stackOffset -= varSize
+			varOffset := is.stackOffset  // Save the variable's offset
 			is.localVars[node.VarName] = &Symbol{
 				Name:      node.VarName,
-				Offset:    is.stackOffset,
+				Offset:    varOffset,
 				Size:      varSize,
 				ArraySize: node.ArraySize,
 				Type:      dataType,
@@ -459,13 +460,56 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 			
 			// Handle initialization (only for non-arrays for now)
 			if len(node.Children) > 0 && node.ArraySize == 0 {
-				result, err := is.selectExpression(node.Children[0])
-				if err != nil {
-					return err
-				}
+				initExpr := node.Children[0]
 				
-				varOp := &Operand{Type: "var", Value: node.VarName, Offset: is.stackOffset}
-				is.emit(OpStore, varOp, result, nil)
+				// Check if this is a compound literal initializing a struct
+				if initExpr.Type == NodeCompoundLiteral {
+					// For compound literals, we need to copy the struct
+					// The compound literal creates a temporary and returns its address
+					// We need to copy from that temp to our variable
+					
+					result, err := is.selectExpression(initExpr)
+					if err != nil {
+						return err
+					}
+					
+					// Get struct size
+					structSize := varSize
+					
+					// Copy struct data from compound literal temp to our variable
+					// result contains the address of the temporary
+					// We need to copy structSize bytes
+					for offset := 0; offset < structSize; offset += 8 {
+						// Load from compound literal temp
+						// result is a temp register containing the address
+						srcOp := &Operand{
+							Type:      "ptr",
+							IndexTemp: result,
+						}
+						if offset > 0 {
+							offsetOp := &Operand{Type: "imm", Value: fmt.Sprintf("%d", offset)}
+							addrTemp := is.newTemp()
+							is.emit(OpAdd, addrTemp, result, offsetOp)
+							srcOp.IndexTemp = addrTemp
+						}
+						
+						valueTemp := is.newTemp()
+						is.emit(OpLoad, valueTemp, srcOp, nil)
+						
+						// Store to our variable using the saved offset
+						dstOp := &Operand{Type: "var", Value: node.VarName, Offset: varOffset + offset}
+						is.emit(OpStore, dstOp, valueTemp, nil)
+					}
+				} else {
+					// Regular initialization
+					result, err := is.selectExpression(initExpr)
+					if err != nil {
+						return err
+					}
+					
+					varOp := &Operand{Type: "var", Value: node.VarName, Offset: varOffset}
+					is.emit(OpStore, varOp, result, nil)
+				}
 			}
 		}
 		
@@ -1216,6 +1260,256 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		return result, nil
 		
 	case NodeAssignment:
+		// Expand compound assignments to regular assignments
+		// e.g., x += 5 becomes x = x + 5
+		if node.Operator != "=" {
+			oldValue, err := is.selectExpression(node.Children[0])
+			if err != nil {
+				return nil, err
+			}
+			
+			rightValue, err := is.selectExpression(node.Children[1])
+			if err != nil {
+				return nil, err
+			}
+			
+			temp := is.newTemp()
+			switch node.Operator {
+			case "+=":
+				is.emit(OpAdd, temp, oldValue, rightValue)
+			case "-=":
+				is.emit(OpSub, temp, oldValue, rightValue)
+			case "*=":
+				is.emit(OpMul, temp, oldValue, rightValue)
+			case "/=":
+				is.emit(OpDiv, temp, oldValue, rightValue)
+			case "%=":
+				is.emit(OpMod, temp, oldValue, rightValue)
+			case "&=":
+				is.emit(OpAnd, temp, oldValue, rightValue)
+			case "|=":
+				is.emit(OpOr, temp, oldValue, rightValue)
+			case "^=":
+				is.emit(OpXor, temp, oldValue, rightValue)
+			case "<<=":
+				is.emit(OpShl, temp, oldValue, rightValue)
+			case ">>=":
+				is.emit(OpShr, temp, oldValue, rightValue)
+			default:
+				return nil, fmt.Errorf("unsupported compound assignment: %s", node.Operator)
+			}
+			
+			// Replace the right side with the computed value
+			node.Children[1] = &ASTNode{
+				Type: NodeIdentifier, // Placeholder - will use temp operand
+			}
+			// Update operator to simple assignment
+			node.Operator = "="
+			// Update right side value
+			node.Children[1] = &ASTNode{
+				Type: NodeNumber,
+				Value: "", // Will be replaced by temp below
+			}
+			// Store the temp as the value to assign
+			// Fall through to regular assignment handling with temp as the value
+			
+			// Continue with normal assignment, but using temp as value
+			var assignValue = temp
+			
+			// Now handle the assignment based on lvalue type
+			if node.Children[0].Type == NodeArrayAccess {
+				arrayNode := node.Children[0]
+				baseNode := arrayNode.Children[0]
+				
+				// Get index
+				index, err := is.selectExpression(arrayNode.Children[1])
+				if err != nil {
+					return nil, err
+				}
+				
+				// Calculate byte offset: index * 8
+				elementSize := &Operand{Type: "imm", Value: "8"}
+				byteOffset := is.newTemp()
+				is.emit(OpMul, byteOffset, index, elementSize)
+				
+				// Check if base is a simple identifier (local/global array)
+				if baseNode.Type == NodeIdentifier {
+					varName := baseNode.VarName
+					var baseOffset int
+					var isGlobal bool
+					
+					if sym, ok := is.localVars[varName]; ok {
+						baseOffset = sym.Offset
+						isGlobal = false
+					} else if _, ok := is.globalVars[varName]; ok {
+						baseOffset = 0
+						isGlobal = true
+					} else {
+						return nil, fmt.Errorf("undefined array: %s", varName)
+					}
+					
+					arrayOp := &Operand{
+						Type:      "array",
+						Value:     varName,
+						Offset:    baseOffset,
+						IsGlobal:  isGlobal,
+						IndexTemp: byteOffset,
+					}
+					is.emit(OpStore, arrayOp, assignValue, nil)
+				} else {
+					baseAddr, err := is.selectExpression(baseNode)
+					if err != nil {
+						return nil, err
+					}
+					
+					finalAddr := is.newTemp()
+					is.emit(OpAdd, finalAddr, baseAddr, byteOffset)
+					
+					ptrOp := &Operand{
+						Type:      "ptr",
+						IndexTemp: finalAddr,
+					}
+					is.emit(OpStore, ptrOp, assignValue, nil)
+				}
+				
+				return assignValue, nil
+			}
+			
+			// Handle member access compound assignment
+			if node.Children[0].Type == NodeMemberAccess {
+				memberNode := node.Children[0]
+				baseNode := memberNode.Children[0]
+				memberName := memberNode.MemberName
+				isPtr := memberNode.IsPointer
+				
+				var structType string
+				var baseTemp *Operand
+				
+				if baseNode.Type == NodeIdentifier {
+					varName := baseNode.VarName
+					var baseOffset int
+					var isGlobal bool
+					
+					if sym, ok := is.localVars[varName]; ok {
+						baseOffset = sym.Offset
+						isGlobal = false
+						structType = sym.Type
+					} else if sym, ok := is.globalVars[varName]; ok {
+						baseOffset = 0
+						isGlobal = true
+						structType = sym.Type
+					} else {
+						return nil, fmt.Errorf("undefined variable: %s", varName)
+					}
+					
+					baseTemp = &Operand{Type: "var", Value: varName, Offset: baseOffset, IsGlobal: isGlobal}
+				} else {
+					baseTempVal, err := is.selectExpression(baseNode)
+					if err != nil {
+						return nil, err
+					}
+					baseTemp = baseTempVal
+					structType = baseTemp.DataType
+					if structType == "" {
+						structType = baseNode.DataType
+					}
+				}
+				
+				structType = is.resolveType(structType)
+				structName := structType
+				for len(structName) > 0 && structName[len(structName)-1] == '*' {
+					structName = structName[:len(structName)-1]
+				}
+				structName = strings.TrimSpace(structName)
+				
+				if len(structName) > 7 && structName[:7] == "struct " {
+					structName = structName[7:]
+				} else if len(structName) > 6 && structName[:6] == "union " {
+					structName = structName[6:]
+				}
+				structName = strings.TrimSpace(structName)
+				
+				structDef, ok := is.structs[structName]
+				if !ok {
+					return nil, fmt.Errorf("undefined struct: %s", structName)
+				}
+				
+				memberOffset := -1
+				for _, member := range structDef.Members {
+					if member.Name == memberName {
+						memberOffset = member.Offset
+						break
+					}
+				}
+				
+				if memberOffset == -1 {
+					return nil, fmt.Errorf("struct %s has no member %s", structName, memberName)
+				}
+				
+				if isPtr {
+					var ptrTemp *Operand
+					
+					if baseTemp.Type == "var" {
+						ptrTempReg := is.newTemp()
+						is.emit(OpLoad, ptrTempReg, baseTemp, nil)
+						ptrTemp = ptrTempReg
+					} else {
+						ptrTemp = baseTemp
+					}
+					
+					if memberOffset != 0 {
+						offsetOp := &Operand{Type: "imm", Value: fmt.Sprintf("%d", memberOffset)}
+						ptrWithOffset := is.newTemp()
+						is.emit(OpAdd, ptrWithOffset, ptrTemp, offsetOp)
+						ptrTemp = ptrWithOffset
+					}
+					
+					memberOp := &Operand{Type: "ptr", IndexTemp: ptrTemp}
+					is.emit(OpStore, memberOp, assignValue, nil)
+				} else {
+					if baseTemp.Type == "var" {
+						finalOffset := baseTemp.Offset + memberOffset
+						memberOp := &Operand{Type: "var", Value: baseTemp.Value, Offset: finalOffset, IsGlobal: baseTemp.IsGlobal}
+						is.emit(OpStore, memberOp, assignValue, nil)
+						return assignValue, nil
+					} else {
+						return nil, fmt.Errorf("dot access on complex expression for assignment not yet supported")
+					}
+				}
+				
+				return assignValue, nil
+			}
+			
+			// Handle dereference compound assignment
+			if node.Children[0].Type == NodeUnaryOp && node.Children[0].Operator == "*" {
+				ptrExpr, err := is.selectExpression(node.Children[0].Children[0])
+				if err != nil {
+					return nil, err
+				}
+				
+				ptrOp := &Operand{Type: "ptr", IndexTemp: ptrExpr}
+				is.emit(OpStore, ptrOp, assignValue, nil)
+				return assignValue, nil
+			}
+			
+			// Handle regular variable compound assignment
+			if node.Children[0].Type == NodeIdentifier {
+				varName := node.Children[0].VarName
+				
+				if sym, ok := is.localVars[varName]; ok {
+					varOp := &Operand{Type: "var", Value: varName, Offset: sym.Offset}
+					is.emit(OpStore, varOp, assignValue, nil)
+				} else if _, ok := is.globalVars[varName]; ok {
+					varOp := &Operand{Type: "var", Value: varName, IsGlobal: true}
+					is.emit(OpStore, varOp, assignValue, nil)
+				}
+				
+				return assignValue, nil
+			}
+			
+			return nil, fmt.Errorf("invalid compound assignment target")
+		}
+		
 		// Handle array assignment: arr[i] = value or expr[i] = value
 		if node.Children[0].Type == NodeArrayAccess {
 			arrayNode := node.Children[0]
@@ -1451,27 +1745,6 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		
 		varName := node.Children[0].VarName
 		
-		if node.Operator != "=" {
-			// Compound assignment
-			oldValue, err := is.selectExpression(node.Children[0])
-			if err != nil {
-				return nil, err
-			}
-			
-			temp := is.newTemp()
-			switch node.Operator {
-			case "+=":
-				is.emit(OpAdd, temp, oldValue, value)
-			case "-=":
-				is.emit(OpSub, temp, oldValue, value)
-			case "*=":
-				is.emit(OpMul, temp, oldValue, value)
-			case "/=":
-				is.emit(OpDiv, temp, oldValue, value)
-			}
-			value = temp
-		}
-		
 		if sym, ok := is.localVars[varName]; ok {
 			varOp := &Operand{Type: "var", Value: varName, Offset: sym.Offset}
 			is.emit(OpStore, varOp, value, nil)
@@ -1654,12 +1927,14 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				return nil, err
 			}
 			
-			// Find field offset
+			// Find field offset and size
 			var fieldOffset int
+			var fieldSize int
 			if fieldName == "" {
 				// Positional - use index
 				if i < len(structDef.Members) {
 					fieldOffset = structDef.Members[i].Offset
+					fieldSize = structDef.Members[i].Size
 				} else {
 					return nil, fmt.Errorf("too many initializers for struct %s", structName)
 				}
@@ -1669,6 +1944,7 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				for _, member := range structDef.Members {
 					if member.Name == fieldName {
 						fieldOffset = member.Offset
+						fieldSize = member.Size
 						found = true
 						break
 					}
@@ -1678,9 +1954,9 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				}
 			}
 			
-			// Store value to field
+			// Store value to field with correct size
 			finalOffset := baseOffset + fieldOffset
-			fieldOp := &Operand{Type: "var", Value: tempName, Offset: finalOffset}
+			fieldOp := &Operand{Type: "var", Value: tempName, Offset: finalOffset, Size: fieldSize}
 			is.emit(OpStore, fieldOp, value, nil)
 		}
 		
