@@ -48,7 +48,6 @@ func (cp *CompilerPipeline) Compile() error {
 	
 	// Phase 0: Preprocessing (if not disabled)
 	preprocessedSource := cp.source
-	preprocessor := NewPreprocessor()
 	
 	if !cp.options.NoPreprocess {
 		if cp.options.Verbose {
@@ -56,46 +55,17 @@ func (cp *CompilerPipeline) Compile() error {
 		}
 		start := time.Now()
 		
-		// Extract types from common headers if they exist
-		commonHeaders := []string{
-			"/home/lee/Documents/clibs/raylib/src/raylib.h",
-			"/home/lee/Documents/clibs/raylib/src/raymath.h",
-			"/usr/include/stdint.h",
-			"/usr/include/x86_64-linux-gnu/sys/types.h",
-		}
-		
-		for _, header := range commonHeaders {
-			if _, err := os.Stat(header); err == nil {
-				preprocessor.ExtractTypesFromHeader(header)
-			}
-		}
-		
-		// Add common signal constants as defines
-		preprocessor.Define("SIGSEGV", "11")
-		preprocessor.Define("SIGILL", "4")
-		preprocessor.Define("SIGFPE", "8")
-		preprocessor.Define("SIGABRT", "6")
-		
-		// Add Raylib key constants (from raylib.h KeyboardKey enum)
-		preprocessor.Define("KEY_W", "87")
-		preprocessor.Define("KEY_A", "65")
-		preprocessor.Define("KEY_S", "83")
-		preprocessor.Define("KEY_D", "68")
-		preprocessor.Define("KEY_Q", "81")
-		preprocessor.Define("KEY_E", "69")
-		preprocessor.Define("KEY_F", "70")
-		preprocessor.Define("KEY_F1", "290")
-		preprocessor.Define("KEY_F2", "291")
-		preprocessor.Define("KEY_F3", "292")
-		
-		// Add Raylib mouse button constants
-		preprocessor.Define("MOUSE_BUTTON_LEFT", "0")
-		preprocessor.Define("MOUSE_BUTTON_RIGHT", "1")
-		preprocessor.Define("MOUSE_BUTTON_MIDDLE", "2")
-		
+		// Use our simple preprocessor to handle #include and #define
+		preprocessor := NewPreprocessor()
+		var err error
 		preprocessedSource, err = preprocessor.Process(cp.source)
 		if err != nil {
 			return fmt.Errorf("preprocessing error: %w", err)
+		}
+		
+		// Save preprocessed output for debugging
+		if cp.options.Verbose {
+			os.WriteFile("/tmp/preprocessed.c", []byte(preprocessedSource), 0644)
 		}
 		
 		if cp.options.Verbose {
@@ -109,18 +79,8 @@ func (cp *CompilerPipeline) Compile() error {
 	}
 	start := time.Now()
 	
+	// Parser will extract structs, typedefs, and functions from the preprocessed source
 	cp.parser = NewParser(preprocessedSource)
-	// Pass extracted struct types to parser
-	for name, structDef := range preprocessor.structMap {
-		cp.parser.structs[name] = structDef
-		// Also add typedef alias
-		cp.parser.typedefs[name] = name
-	}
-	// Pass typedef aliases to parser
-	for alias := range preprocessor.typedefMap {
-		// Register the alias as a known typedef
-		cp.parser.typedefs[alias] = alias
-	}
 	cp.ast, err = cp.parser.Parse()
 	if err != nil {
 		return fmt.Errorf("parse error: %w", err)
@@ -137,13 +97,18 @@ func (cp *CompilerPipeline) Compile() error {
 	start = time.Now()
 	
 	cp.selector = NewInstructionSelector()
-	cp.selector.structs = cp.parser.structs  // Pass struct definitions
-	cp.selector.typedefs = cp.parser.typedefs  // Pass typedef aliases
-	cp.selector.enums = cp.parser.enums  // Pass enum constants
+	cp.selector.structs = cp.parser.structs  // Pass struct definitions FROM PARSER
+	cp.selector.typedefs = cp.parser.typedefs  // Pass typedef aliases FROM PARSER
+	cp.selector.enums = cp.parser.enums  // Pass enum constants FROM PARSER
 	
-	// Pass function signatures from preprocessor
-	for funcName, funcSig := range preprocessor.functionSigs {
-		cp.selector.functions[funcName] = funcSig
+	// Extract function signatures from parsed AST
+	for _, child := range cp.ast.Children {
+		if child.Type == NodeFunction {
+			cp.selector.functions[child.Name] = &FunctionSignature{
+				ReturnType: child.ReturnType,
+				ParamTypes: child.ParamTypes,
+			}
+		}
 	}
 	
 	err = cp.selector.SelectInstructions(cp.ast)

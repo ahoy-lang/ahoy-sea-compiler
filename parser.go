@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 // AST Node types
@@ -99,6 +100,7 @@ type Parser struct {
 	structs  map[string]*StructDef // Track struct definitions
 	typedefs map[string]string     // Track typedef aliases: alias -> actual type
 	enums    map[string]int        // Track enum constants: name -> value
+	errors   []error               // Collect all parsing errors
 }
 
 func NewParser(source string) *Parser {
@@ -111,6 +113,7 @@ func NewParser(source string) *Parser {
 		structs:  make(map[string]*StructDef),
 		typedefs: make(map[string]string),
 		enums:    make(map[string]int),
+		errors:   []error{},
 	}
 }
 
@@ -156,6 +159,35 @@ func (p *Parser) match(types ...TokenType) bool {
 
 func (p *Parser) isAtEnd() bool {
 	return p.current().Type == EOF
+}
+
+// recordError adds an error to the error list
+func (p *Parser) recordError(err error) {
+	if err != nil {
+		p.errors = append(p.errors, err)
+	}
+}
+
+// synchronize attempts to recover from a parse error by advancing to the next safe point
+func (p *Parser) synchronize() {
+	// Advance past the error
+	p.advance()
+	
+	// Skip tokens until we find a statement boundary
+	for !p.isAtEnd() {
+		// Stop at semicolons (end of statement)
+		if p.peek(-1).Type == SEMICOLON {
+			return
+		}
+		
+		// Stop at statement keywords
+		switch p.current().Type {
+		case IF, WHILE, FOR, RETURN, INT, VOID, CHAR_KW, FLOAT, DOUBLE, STRUCT, TYPEDEF:
+			return
+		}
+		
+		p.advance()
+	}
 }
 
 // resolveTypedef resolves a type through typedef aliases
@@ -229,7 +261,17 @@ func (p *Parser) Parse() (*ASTNode, error) {
 		Children: []*ASTNode{},
 	}
 	
+	iterCount := 0
+	maxIter := 10000000  // 10 million - much higher limit
+	
 	for p.current().Type != EOF {
+		iterCount++
+		if iterCount > maxIter {
+			err := fmt.Errorf("parser appears to be stuck in infinite loop at position %d, token: %s (line %d)", p.pos, p.current().Lexeme, p.current().Line)
+			p.recordError(err)
+			break
+		}
+		
 		// Skip preprocessor
 		if p.match(HASH) {
 			p.skipPreprocessor()
@@ -238,12 +280,29 @@ func (p *Parser) Parse() (*ASTNode, error) {
 		
 		node, err := p.parseTopLevel()
 		if err != nil {
-			return nil, err
+			p.recordError(fmt.Errorf("line %d: %w", p.current().Line, err))
+			// Try to recover and continue parsing
+			p.synchronize()
+			continue
 		}
 		
 		if node != nil {
 			program.Children = append(program.Children, node)
 		}
+	}
+	
+	// If we collected any errors, report them all
+	if len(p.errors) > 0 {
+		var errMsg strings.Builder
+		errMsg.WriteString(fmt.Sprintf("encountered %d parsing error(s):\n", len(p.errors)))
+		for i, err := range p.errors {
+			errMsg.WriteString(fmt.Sprintf("  [%d] %v\n", i+1, err))
+			if i >= 9 {  // Limit to first 10 errors
+				errMsg.WriteString(fmt.Sprintf("  ... and %d more errors\n", len(p.errors)-10))
+				break
+			}
+		}
+		return program, fmt.Errorf("%s", errMsg.String())
 	}
 	
 	return program, nil
@@ -570,12 +629,12 @@ func (p *Parser) parseType() string {
 func (p *Parser) parseStructDef() error {
 	p.advance() // skip 'struct'
 	
-	// Get struct name
-	if !p.match(IDENTIFIER) {
-		return fmt.Errorf("expected struct name")
+	// Get struct name (optional for anonymous structs in typedefs)
+	var structName string
+	if p.match(IDENTIFIER) {
+		structName = p.current().Lexeme
+		p.advance()
 	}
-	structName := p.current().Lexeme
-	p.advance()
 	
 	// Check for just declaration (struct Foo;) or definition
 	if p.match(SEMICOLON) {
@@ -588,6 +647,12 @@ func (p *Parser) parseStructDef() error {
 		p.skipStructOrTypedef()
 		return nil
 	}
+	
+	// Anonymous struct - generate a name
+	if structName == "" {
+		structName = "__anon_struct_" + fmt.Sprintf("%d", p.pos)
+	}
+	
 	p.advance() // skip {
 	
 	members := []StructMember{}
@@ -607,15 +672,15 @@ func (p *Parser) parseStructDef() error {
 			memberName := p.current().Lexeme
 			p.advance()
 			
-			// For now, all types are 8 bytes
-			memberSize := 8
+			// Calculate actual member size based on type
+			memberSize := p.getTypeSize(memberType)
 			
 			// Handle arrays: int arr[10];
 			if p.match(LBRACKET) {
 				p.advance()
 				if p.match(NUMBER) {
 					sizeVal, _ := strconv.Atoi(p.current().Lexeme)
-					memberSize = sizeVal * 8
+					memberSize = sizeVal * memberSize
 					p.advance()
 				}
 				if !p.match(RBRACKET) {
@@ -814,6 +879,36 @@ func (p *Parser) parseFunction(name string, returnType string) (*ASTNode, error)
 		p.advance()
 	}
 	
+	// Skip GCC attributes like __THROW, __wur, __attribute__((...)...)
+	for p.match(IDENTIFIER) {
+		lexeme := p.current().Lexeme
+		
+		// Skip anything starting with __ (GCC attributes)
+		if len(lexeme) >= 2 && lexeme[0] == '_' && lexeme[1] == '_' {
+			p.advance()
+			
+			// If followed by (, skip the whole thing
+			if p.match(LPAREN) {
+				p.advance()
+				depth := 1
+				for depth > 0 && !p.match(EOF) {
+					if p.match(LPAREN) {
+						depth++
+					} else if p.match(RPAREN) {
+						depth--
+					}
+					p.advance()
+				}
+			}
+		} else if lexeme == "extern" || lexeme == "static" || lexeme == "inline" {
+			// These might appear here too - just skip
+			p.advance()
+		} else {
+			// Not an attribute - stop
+			break
+		}
+	}
+	
 	// Declaration only (external function)?
 	if p.match(SEMICOLON) {
 		p.advance()
@@ -832,7 +927,7 @@ func (p *Parser) parseFunction(name string, returnType string) (*ASTNode, error)
 	// Parse body
 	body, err := p.parseBlock()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error parsing function '%s' body: %w (at token '%s', line %d)", name, err, p.current().Lexeme, p.current().Line)
 	}
 	
 	return &ASTNode{
@@ -1884,11 +1979,11 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 		// Not a cast, parse as regular parenthesized expression
 		expr, err := p.parseExpression()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error in parenthesized expression: %w", err)
 		}
 		
 		if !p.match(RPAREN) {
-			return nil, fmt.Errorf("expected ) at line %d, got %s", p.current().Line, p.current().Lexeme)
+			return nil, fmt.Errorf("expected ) at line %d, got %s (after parsing expression starting at line %d)", p.current().Line, p.current().Lexeme, p.tokens[p.pos-10].Line)
 		}
 		p.advance()
 		

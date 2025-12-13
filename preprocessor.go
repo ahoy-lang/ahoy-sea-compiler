@@ -11,6 +11,7 @@ import (
 // Preprocessor handles C preprocessor directives
 type Preprocessor struct {
 	defines       map[string]string
+	funcMacros    map[string]*FunctionMacro // Function-like macros
 	includePaths  []string
 	processed     map[string]bool  // Track processed files to avoid cycles
 	mu            sync.RWMutex      // For thread-safe define access
@@ -19,9 +20,15 @@ type Preprocessor struct {
 	functionSigs  map[string]*FunctionSignature // Function signatures from headers
 }
 
+type FunctionMacro struct {
+	Params []string
+	Body   string
+}
+
 func NewPreprocessor() *Preprocessor {
 	p := &Preprocessor{
 		defines:      make(map[string]string),
+		funcMacros:   make(map[string]*FunctionMacro),
 		includePaths: []string{"/usr/include", "/usr/local/include", ".", "/home/lee/Documents/clibs/raylib/src"},
 		processed:    make(map[string]bool),
 		typedefMap:   make(map[string]*StructDef),
@@ -34,8 +41,11 @@ func NewPreprocessor() *Preprocessor {
 	p.defines["true"] = "1"
 	p.defines["false"] = "0"
 	
-	// Parse raylib.h to get actual constant values
-	p.parseRaylibHeader()
+	// Add common raylib macros
+	p.funcMacros["CLITERAL"] = &FunctionMacro{
+		Params: []string{"type"},
+		Body:   "(type)",
+	}
 	
 	return p
 }
@@ -254,12 +264,19 @@ func (p *Preprocessor) Process(source string) (string, error) {
 				}
 				
 				filename := strings.Join(directive[1:], " ")
+				originalFilename := filename
 				filename = strings.Trim(filename, `"<>`)
+				
+				// Skip system headers (those in angle brackets)
+				if strings.HasPrefix(originalFilename, "<") {
+					result.WriteString(fmt.Sprintf("// Skipped system header: %s\n", originalFilename))
+					continue
+				}
 				
 				// Read and process included file
 				content, err := p.processInclude(filename)
 				if err != nil {
-					// For now, just skip includes we can't find (libc headers)
+					// For now, just skip includes we can't find
 					result.WriteString(fmt.Sprintf("// Skipped: #include %s\n", filename))
 					continue
 				}
@@ -276,6 +293,46 @@ func (p *Preprocessor) Process(source string) (string, error) {
 					return "", fmt.Errorf("line %d: #define requires name", i+1)
 				}
 				
+				// Parse the full line to handle function-like macros
+				// Format: #define NAME(params) body
+				// or: #define NAME value
+				restOfLine := strings.TrimSpace(line[strings.Index(line, directive[1]):])
+				
+				// Check if it's a function-like macro
+				if len(restOfLine) > 0 && strings.Contains(restOfLine, "(") {
+					// Find the opening paren
+					parenIdx := strings.Index(restOfLine, "(")
+					name := restOfLine[:parenIdx]
+					
+					// Check if paren is immediately after name (no space = function macro)
+					if parenIdx == len(name) {
+						// Function-like macro
+						closeParenIdx := strings.Index(restOfLine, ")")
+						if closeParenIdx > parenIdx {
+							// Extract parameters
+							paramsStr := restOfLine[parenIdx+1 : closeParenIdx]
+							params := []string{}
+							if strings.TrimSpace(paramsStr) != "" {
+								for _, param := range strings.Split(paramsStr, ",") {
+									params = append(params, strings.TrimSpace(param))
+								}
+							}
+							
+							// Extract body (everything after closing paren)
+							body := strings.TrimSpace(restOfLine[closeParenIdx+1:])
+							
+							p.mu.Lock()
+							p.funcMacros[name] = &FunctionMacro{
+								Params: params,
+								Body:   body,
+							}
+							p.mu.Unlock()
+							continue
+						}
+					}
+				}
+				
+				// Simple object-like macro
 				name := directive[1]
 				value := ""
 				if len(directive) > 2 {
@@ -283,7 +340,7 @@ func (p *Preprocessor) Process(source string) (string, error) {
 				}
 				
 				p.Define(name, value)
-				result.WriteString(fmt.Sprintf("// #define %s %s\n", name, value))
+				// Don't output the #define itself
 				
 			case "#ifdef":
 				if len(directive) < 2 {
@@ -321,10 +378,9 @@ func (p *Preprocessor) Process(source string) (string, error) {
 				
 			case "#if", "#elif", "#undef", "#pragma":
 				// Not implemented yet - just skip
-				result.WriteString(fmt.Sprintf("// %s\n", trimmed))
 				
 			default:
-				result.WriteString(fmt.Sprintf("// %s\n", trimmed))
+				// Unknown directive - skip
 			}
 			
 			continue
@@ -332,7 +388,7 @@ func (p *Preprocessor) Process(source string) (string, error) {
 		
 		// Only include line if we're in an active block
 		if condStack[len(condStack)-1].active {
-			// Expand macros
+			// Expand macros in the line (proper text substitution)
 			expanded := p.expandMacros(line)
 			result.WriteString(expanded)
 			result.WriteString("\n")
@@ -385,8 +441,134 @@ func (p *Preprocessor) processInclude(filename string) (string, error) {
 	// Mark as processed
 	p.processed[fullPath] = true
 	
+	// For header files (.h), just copy the content without full preprocessing
+	// Only process #include directives, #define, #ifdef/#ifndef/#endif
+	if strings.HasSuffix(fullPath, ".h") {
+		return p.processHeaderSimple(string(content))
+	}
+	
 	// Recursively process
 	return p.Process(string(content))
+}
+
+func (p *Preprocessor) processHeaderSimple(source string) (string, error) {
+	lines := strings.Split(source, "\n")
+	var result strings.Builder
+	
+	type condState struct {
+		active bool
+		taken  bool
+	}
+	condStack := []condState{{active: true, taken: false}}
+	
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		
+		if strings.HasPrefix(trimmed, "#") {
+			directive := strings.Fields(trimmed)
+			if len(directive) == 0 {
+				continue
+			}
+			
+			cmd := directive[0]
+			
+			switch cmd {
+			case "#include":
+				if !condStack[len(condStack)-1].active {
+					continue
+				}
+				
+				if len(directive) < 2 {
+					continue
+				}
+				
+				filename := strings.Join(directive[1:], " ")
+				filename = strings.Trim(filename, `"<>`)
+				
+				// Recursively include
+				content, err := p.processInclude(filename)
+				if err != nil {
+					// Skip system headers we can't find
+					result.WriteString(fmt.Sprintf("// Skipped: #include %s\n", filename))
+					continue
+				}
+				
+				result.WriteString(content)
+				result.WriteString("\n")
+				
+			case "#define":
+				if !condStack[len(condStack)-1].active {
+					continue
+				}
+				
+				if len(directive) < 2 {
+					continue
+				}
+				
+				name := directive[1]
+				value := ""
+				if len(directive) > 2 {
+					value = strings.Join(directive[2:], " ")
+				}
+				
+				p.Define(name, value)
+				// Don't output the #define itself
+				
+			case "#ifdef":
+				if len(directive) < 2 {
+					continue
+				}
+				
+				name := directive[1]
+				active := condStack[len(condStack)-1].active && p.IsDefined(name)
+				condStack = append(condStack, condState{active: active, taken: active})
+				
+			case "#ifndef":
+				if len(directive) < 2 {
+					continue
+				}
+				
+				name := directive[1]
+				active := condStack[len(condStack)-1].active && !p.IsDefined(name)
+				condStack = append(condStack, condState{active: active, taken: active})
+				
+			case "#else":
+				if len(condStack) <= 1 {
+					continue
+				}
+				
+				parent := condStack[len(condStack)-2].active
+				current := &condStack[len(condStack)-1]
+				current.active = parent && !current.taken
+				
+			case "#endif":
+				if len(condStack) <= 1 {
+					continue
+				}
+				
+				condStack = condStack[:len(condStack)-1]
+				
+			default:
+				// Keep other directives as comments
+				if condStack[len(condStack)-1].active {
+					result.WriteString("// ")
+					result.WriteString(trimmed)
+					result.WriteString("\n")
+				}
+			}
+			
+			continue
+		}
+		
+		// Copy non-directive lines if active, with macro expansion
+		if condStack[len(condStack)-1].active {
+			expanded := p.expandMacros(line)
+			result.WriteString(expanded)
+			result.WriteString("\n")
+		}
+	}
+	
+	return result.String(), nil
 }
 
 func (p *Preprocessor) expandMacros(line string) string {
@@ -395,13 +577,88 @@ func (p *Preprocessor) expandMacros(line string) string {
 	
 	result := line
 	
-	// Replace macros in the line
+	// First expand function-like macros
+	for name, macro := range p.funcMacros {
+		result = p.expandFunctionMacro(result, name, macro)
+	}
+	
+	// Then expand object-like macros
 	for name, value := range p.defines {
 		// Use word boundary matching
 		result = replaceIdentifier(result, name, value)
 	}
 	
 	return result
+}
+
+func (p *Preprocessor) expandFunctionMacro(text string, name string, macro *FunctionMacro) string {
+	var result strings.Builder
+	i := 0
+	
+	for i < len(text) {
+		// Check if we found the macro name
+		if strings.HasPrefix(text[i:], name) {
+			// Check if it's a complete identifier followed by (
+			if (i == 0 || !isIdentifierChar(text[i-1])) {
+				// Check for opening paren
+				j := i + len(name)
+				// Skip whitespace
+				for j < len(text) && (text[j] == ' ' || text[j] == '\t') {
+					j++
+				}
+				
+				if j < len(text) && text[j] == '(' {
+					// This is a function macro invocation
+					// Extract arguments
+					j++ // skip (
+					depth := 1
+					var args []string
+					currentArg := ""
+					
+					for j < len(text) && depth > 0 {
+						if text[j] == '(' {
+							depth++
+							currentArg += string(text[j])
+						} else if text[j] == ')' {
+							depth--
+							if depth == 0 {
+								// End of macro invocation
+								if currentArg != "" || len(args) > 0 {
+									args = append(args, strings.TrimSpace(currentArg))
+								}
+								break
+							}
+							currentArg += string(text[j])
+						} else if text[j] == ',' && depth == 1 {
+							// Argument separator
+							args = append(args, strings.TrimSpace(currentArg))
+							currentArg = ""
+						} else {
+							currentArg += string(text[j])
+						}
+						j++
+					}
+					
+					// Substitute parameters in body
+					expansion := macro.Body
+					for idx, param := range macro.Params {
+						if idx < len(args) {
+							expansion = replaceIdentifier(expansion, param, args[idx])
+						}
+					}
+					
+					result.WriteString(expansion)
+					i = j + 1 // Skip past the closing )
+					continue
+				}
+			}
+		}
+		
+		result.WriteByte(text[i])
+		i++
+	}
+	
+	return result.String()
 }
 
 func replaceIdentifier(text, identifier, replacement string) string {

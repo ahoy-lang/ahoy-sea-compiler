@@ -433,10 +433,16 @@ func (l *Lexer) NextToken() Token {
 
 func (l *Lexer) AllTokens() []Token {
 	var tokens []Token
+	maxTokens := 1000000
 	for {
 		tok := l.NextToken()
 		tokens = append(tokens, tok)
 		if tok.Type == EOF {
+			break
+		}
+		if len(tokens) > maxTokens {
+			// Add EOF and break
+			tokens = append(tokens, Token{Type: EOF, Lexeme: "", Line: l.line})
 			break
 		}
 	}
