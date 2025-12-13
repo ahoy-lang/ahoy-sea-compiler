@@ -1187,11 +1187,13 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			return nil, fmt.Errorf("undefined struct: '%s' (from type: '%s')", structName, origStructType)
 		}
 		
-		// Find member offset
+		// Find member offset and size
 		memberOffset := -1
+		memberSize := 8  // Default
 		for _, member := range structDef.Members {
 			if member.Name == memberName {
 				memberOffset = member.Offset
+				memberSize = member.Size
 				break
 			}
 		}
@@ -1224,15 +1226,15 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				ptrTemp = ptrWithOffset
 			}
 			
-			// Load from pointer
-			memberOp := &Operand{Type: "ptr", IndexTemp: ptrTemp}
+			// Load from pointer with correct size
+			memberOp := &Operand{Type: "ptr", IndexTemp: ptrTemp, Size: memberSize}
 			is.emit(OpLoad, result, memberOp, nil)
 		} else {
 			// struct.member: direct access
 			// This only works for simple variable bases
 			if baseTemp.Type == "var" {
 				finalOffset := baseTemp.Offset + memberOffset
-				memberOp := &Operand{Type: "var", Value: baseTemp.Value, Offset: finalOffset, IsGlobal: baseTemp.IsGlobal}
+				memberOp := &Operand{Type: "var", Value: baseTemp.Value, Offset: finalOffset, IsGlobal: baseTemp.IsGlobal, Size: memberSize}
 				is.emit(OpLoad, result, memberOp, nil)
 			} else if baseTemp.Type == "temp" {
 				// Temp holds a struct value (from statement expression or function return)

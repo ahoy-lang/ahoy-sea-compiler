@@ -574,19 +574,65 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 		dstStr := ce.formatOperand(dst)
 		// Check if destination is also memory
 		if strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")") {
-			// Load through register
-			if src.IsGlobal {
-				ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %%rax\n", src.Value))
+			// Load through register - use appropriate size
+			if src.Size > 0 && src.Size < 8 {
+				if src.IsGlobal {
+					if src.Size == 4 {
+						ce.output.WriteString(fmt.Sprintf("    movl %s(%%rip), %%eax\n", src.Value))
+					} else if src.Size == 2 {
+						ce.output.WriteString(fmt.Sprintf("    movw %s(%%rip), %%ax\n", src.Value))
+					} else if src.Size == 1 {
+						ce.output.WriteString(fmt.Sprintf("    movb %s(%%rip), %%al\n", src.Value))
+					}
+					// Zero-extend or sign-extend as needed
+					ce.output.WriteString(fmt.Sprintf("    movq %%rax, %%rax\n"))  // Zero-extend
+				} else {
+					if src.Size == 4 {
+						ce.output.WriteString(fmt.Sprintf("    movl %d(%%rbp), %%eax\n", src.Offset))
+					} else if src.Size == 2 {
+						ce.output.WriteString(fmt.Sprintf("    movzwq %d(%%rbp), %%rax\n", src.Offset))
+					} else if src.Size == 1 {
+						ce.output.WriteString(fmt.Sprintf("    movzbq %d(%%rbp), %%rax\n", src.Offset))
+					}
+				}
 			} else {
-				ce.output.WriteString(fmt.Sprintf("    movq %d(%%rbp), %%rax\n", src.Offset))
+				// Default 8-byte load
+				if src.IsGlobal {
+					ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %%rax\n", src.Value))
+				} else {
+					ce.output.WriteString(fmt.Sprintf("    movq %d(%%rbp), %%rax\n", src.Offset))
+				}
 			}
 			ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
 		} else {
-			// Direct load to register
-			if src.IsGlobal {
-				ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %s\n", src.Value, dstStr))
+			// Direct load to register - use appropriate size
+			if src.Size > 0 && src.Size < 8 {
+				if src.IsGlobal {
+					if src.Size == 4 {
+						ce.output.WriteString(fmt.Sprintf("    movl %s(%%rip), %%eax\n", src.Value))
+						ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+					} else if src.Size == 2 {
+						ce.output.WriteString(fmt.Sprintf("    movzwq %s(%%rip), %s\n", src.Value, dstStr))
+					} else if src.Size == 1 {
+						ce.output.WriteString(fmt.Sprintf("    movzbq %s(%%rip), %s\n", src.Value, dstStr))
+					}
+				} else {
+					if src.Size == 4 {
+						ce.output.WriteString(fmt.Sprintf("    movl %d(%%rbp), %%eax\n", src.Offset))
+						ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+					} else if src.Size == 2 {
+						ce.output.WriteString(fmt.Sprintf("    movzwq %d(%%rbp), %s\n", src.Offset, dstStr))
+					} else if src.Size == 1 {
+						ce.output.WriteString(fmt.Sprintf("    movzbq %d(%%rbp), %s\n", src.Offset, dstStr))
+					}
+				}
 			} else {
-				ce.output.WriteString(fmt.Sprintf("    movq %d(%%rbp), %s\n", src.Offset, dstStr))
+				// Default 8-byte load
+				if src.IsGlobal {
+					ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %s\n", src.Value, dstStr))
+				} else {
+					ce.output.WriteString(fmt.Sprintf("    movq %d(%%rbp), %s\n", src.Offset, dstStr))
+				}
 			}
 		}
 	case "array":
