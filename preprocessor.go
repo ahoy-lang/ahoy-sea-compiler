@@ -41,12 +41,6 @@ func NewPreprocessor() *Preprocessor {
 	p.defines["true"] = "1"
 	p.defines["false"] = "0"
 	
-	// Add common raylib macros
-	p.funcMacros["CLITERAL"] = &FunctionMacro{
-		Params: []string{"type"},
-		Body:   "(type)",
-	}
-	
 	return p
 }
 
@@ -227,7 +221,65 @@ func (p *Preprocessor) IsDefined(name string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	_, ok := p.defines[name]
+	if ok {
+		return true
+	}
+	_, ok = p.funcMacros[name]
 	return ok
+}
+
+// evaluateIfCondition evaluates a #if condition
+func (p *Preprocessor) evaluateIfCondition(condition string) bool {
+	condition = strings.TrimSpace(condition)
+	
+	// Handle: defined(X) or defined X
+	if strings.HasPrefix(condition, "defined") {
+		rest := strings.TrimSpace(condition[7:])
+		
+		// Check for defined(X)
+		if strings.HasPrefix(rest, "(") {
+			closeIdx := strings.Index(rest, ")")
+			if closeIdx > 0 {
+				name := strings.TrimSpace(rest[1:closeIdx])
+				return p.IsDefined(name)
+			}
+		} else {
+			// Check for defined X
+			parts := strings.Fields(rest)
+			if len(parts) > 0 {
+				return p.IsDefined(parts[0])
+			}
+		}
+		return false
+	}
+	
+	// Handle: !defined(X) or !defined X
+	if strings.HasPrefix(condition, "!") {
+		rest := strings.TrimSpace(condition[1:])
+		if strings.HasPrefix(rest, "defined") {
+			return !p.evaluateIfCondition(rest)
+		}
+	}
+	
+	// Handle numeric comparisons: 0, 1, etc.
+	if condition == "0" {
+		return false
+	}
+	if condition == "1" {
+		return true
+	}
+	
+	// Try to evaluate as a macro reference
+	if p.IsDefined(condition) {
+		value := p.defines[condition]
+		if value == "0" {
+			return false
+		}
+		return true
+	}
+	
+	// Default: undefined macros are false
+	return false
 }
 
 func (p *Preprocessor) Process(source string) (string, error) {
@@ -376,8 +428,51 @@ func (p *Preprocessor) Process(source string) (string, error) {
 				
 				condStack = condStack[:len(condStack)-1]
 				
-			case "#if", "#elif", "#undef", "#pragma":
-				// Not implemented yet - just skip
+			case "#if":
+				// Parse #if expression
+				// For now, support: #if defined(X) and #if !defined(X)
+				restOfLine := strings.TrimSpace(line[strings.Index(line, "#if")+3:])
+				condition := p.evaluateIfCondition(restOfLine)
+				active := condStack[len(condStack)-1].active && condition
+				condStack = append(condStack, condState{active: active, taken: active})
+				
+			case "#elif":
+				if len(condStack) <= 1 {
+					return "", fmt.Errorf("line %d: #elif without #if", i+1)
+				}
+				
+				// Only evaluate if parent is active and no previous branch was taken
+				parent := condStack[len(condStack)-2].active
+				current := &condStack[len(condStack)-1]
+				
+				if parent && !current.taken {
+					restOfLine := strings.TrimSpace(line[strings.Index(line, "#elif")+5:])
+					condition := p.evaluateIfCondition(restOfLine)
+					current.active = condition
+					if condition {
+						current.taken = true
+					}
+				} else {
+					current.active = false
+				}
+				
+			case "#undef":
+				if !condStack[len(condStack)-1].active {
+					continue
+				}
+				
+				if len(directive) < 2 {
+					continue
+				}
+				
+				name := directive[1]
+				p.mu.Lock()
+				delete(p.defines, name)
+				delete(p.funcMacros, name)
+				p.mu.Unlock()
+				
+			case "#pragma":
+				// Ignore pragmas
 				
 			default:
 				// Unknown directive - skip
@@ -441,13 +536,7 @@ func (p *Preprocessor) processInclude(filename string) (string, error) {
 	// Mark as processed
 	p.processed[fullPath] = true
 	
-	// For header files (.h), just copy the content without full preprocessing
-	// Only process #include directives, #define, #ifdef/#ifndef/#endif
-	if strings.HasSuffix(fullPath, ".h") {
-		return p.processHeaderSimple(string(content))
-	}
-	
-	// Recursively process
+	// Process all files the same way
 	return p.Process(string(content))
 }
 

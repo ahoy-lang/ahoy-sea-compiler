@@ -107,12 +107,40 @@ func NewParser(source string) *Parser {
 	lexer := NewLexer(source)
 	tokens := lexer.AllTokens()
 	
+	// Initialize with common standard library typedefs
+	typedefs := make(map[string]string)
+	// stdint.h types
+	typedefs["int8_t"] = "char"
+	typedefs["int16_t"] = "short"
+	typedefs["int32_t"] = "int"
+	typedefs["int64_t"] = "long"
+	typedefs["uint8_t"] = "unsigned char"
+	typedefs["uint16_t"] = "unsigned short"
+	typedefs["uint32_t"] = "unsigned int"
+	typedefs["uint64_t"] = "unsigned long"
+	typedefs["intptr_t"] = "long"
+	typedefs["uintptr_t"] = "unsigned long"
+	typedefs["size_t"] = "unsigned long"
+	typedefs["ssize_t"] = "long"
+	// stdbool.h
+	typedefs["bool"] = "int"
+	
+	// Initialize with common standard library constants
+	enums := make(map[string]int)
+	// signal.h signals
+	enums["SIGSEGV"] = 11  // Segmentation fault
+	enums["SIGABRT"] = 6   // Abort signal
+	enums["SIGFPE"] = 8    // Floating point exception
+	enums["SIGILL"] = 4    // Illegal instruction
+	enums["SIGINT"] = 2    // Interrupt
+	enums["SIGTERM"] = 15  // Termination signal
+	
 	return &Parser{
 		tokens:   tokens,
 		pos:      0,
 		structs:  make(map[string]*StructDef),
-		typedefs: make(map[string]string),
-		enums:    make(map[string]int),
+		typedefs: typedefs,
+		enums:    enums,
 		errors:   []error{},
 	}
 }
@@ -595,14 +623,9 @@ func (p *Parser) parseType() string {
 			// No modifiers yet - treat as type name (typedef or unknown type)
 			p.advance()
 			typ = resolvedType
-		} else {
-			// Has modifiers like "static" - check if this looks like a type name
-			// If the identifier starts with uppercase or is known pattern, treat as type
-			// Otherwise it's the variable name
-			// For now, consume it as a type name if we haven't seen a base type yet
-			p.advance()
-			typ += typeName
 		}
+		// Note: If we have modifiers (typ != "") but this identifier is not a typedef,
+		// don't consume it - it's likely the variable name, not a type
 	}
 	
 	// Pointers
