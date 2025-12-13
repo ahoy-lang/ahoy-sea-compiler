@@ -61,14 +61,13 @@ func (ra *RegisterAllocator) computeLiveRanges() {
 		operands := []*Operand{instr.Dst, instr.Src1, instr.Src2}
 		
 		for _, op := range operands {
-			if op == nil || (op.Type != "temp" && op.Type != "var") {
+			// Only compute live ranges for temporaries, not variables
+			// Variables stay on the stack and don't need register allocation
+			if op == nil || op.Type != "temp" {
 				continue
 			}
 			
 			varName := op.Value
-			if op.Type == "var" {
-				varName = "var_" + op.Value
-			}
 			
 			if _, exists := ra.liveRanges[varName]; !exists {
 				ra.liveRanges[varName] = &LiveRange{
@@ -190,11 +189,8 @@ func (ra *RegisterAllocator) rewriteOperand(op **Operand) {
 			operand.Offset = -offset
 		}
 	} else if operand.Type == "var" {
-		varKey := "var_" + operand.Value
-		if reg, ok := ra.allocation[varKey]; ok {
-			operand.Type = "reg"
-			operand.Value = regNames[reg]
-		}
+		// Variables are always on the stack - don't allocate to registers
+		// Keep as "var" type for code emitter to handle
 	}
 }
 
@@ -285,14 +281,13 @@ func (lsa *LinearScanAllocator) computeIntervals() {
 		operands := []*Operand{instr.Dst, instr.Src1, instr.Src2}
 		
 		for _, op := range operands {
-			if op == nil || (op.Type != "temp" && op.Type != "var") {
+			// Only compute intervals for temporaries, not variables
+			// Variables stay on the stack
+			if op == nil || op.Type != "temp" {
 				continue
 			}
 			
 			varName := op.Value
-			if op.Type == "var" {
-				varName = "var_" + op.Value
-			}
 			
 			if _, exists := varIntervals[varName]; !exists {
 				varIntervals[varName] = &Interval{
@@ -364,19 +359,26 @@ func (lsa *LinearScanAllocator) rewriteOperand(op **Operand) {
 	
 	operand := *op
 	
-	if operand.Type == "temp" || operand.Type == "var" {
+	// Only allocate registers to temporaries, not to variables
+	// Variables should stay on the stack
+	if operand.Type == "temp" {
 		varName := operand.Value
-		if operand.Type == "var" {
-			varName = "var_" + operand.Value
-		}
 		
 		if reg, ok := lsa.allocation[varName]; ok {
+			oldDataType := operand.DataType  // Preserve DataType
 			operand.Type = "reg"
 			operand.Value = regNames[reg]
+			operand.DataType = oldDataType  // Restore DataType
 		} else if offset, ok := lsa.stackSlots[varName]; ok {
+			oldDataType := operand.DataType  // Preserve DataType
 			operand.Type = "mem"
 			operand.Offset = -offset
+			operand.DataType = oldDataType  // Restore DataType
 		}
+	} else if operand.Type == "var" {
+		// Variables are always on the stack - keep as "var" type
+		// The code emitter will handle loading/storing from stack
+		// Don't change to register
 	}
 }
 

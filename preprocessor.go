@@ -536,6 +536,10 @@ func (p *Preprocessor) processInclude(filename string) (string, error) {
 	// Mark as processed
 	p.processed[fullPath] = true
 	
+	// Extract types and function signatures from this header
+	// (Do this BEFORE processing to catch declarations before they're preprocessed away)
+	p.ExtractTypesFromHeader(fullPath)
+	
 	// Process all files the same way
 	return p.Process(string(content))
 }

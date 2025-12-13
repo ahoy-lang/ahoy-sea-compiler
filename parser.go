@@ -1886,11 +1886,41 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 	
 	// Character
 	if p.match(CHAR) {
-		value := p.current().Lexeme
+		lexeme := p.current().Lexeme
 		p.advance()
+		
+		// Convert character literal to numeric value
+		var charValue int
+		if len(lexeme) == 0 {
+			return nil, fmt.Errorf("empty character literal")
+		} else if lexeme[0] == '\\' && len(lexeme) > 1 {
+			// Escape sequence
+			switch lexeme[1] {
+			case '0':
+				charValue = 0
+			case 'n':
+				charValue = 10
+			case 't':
+				charValue = 9
+			case 'r':
+				charValue = 13
+			case '\\':
+				charValue = 92
+			case '\'':
+				charValue = 39
+			case '"':
+				charValue = 34
+			default:
+				charValue = int(lexeme[1])
+			}
+		} else {
+			// Regular character
+			charValue = int(lexeme[0])
+		}
+		
 		return &ASTNode{
 			Type:  NodeNumber,
-			Value: value,
+			Value: fmt.Sprintf("%d", charValue),
 		}, nil
 	}
 	

@@ -342,6 +342,31 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 		// Emit function label
 		is.emit(OpLabel, &Operand{Type: "label", Value: node.Name}, nil, nil)
 		
+		// Check if this function returns a large struct (>16 bytes)
+		// If so, the first parameter (RDI) is a hidden pointer to the return buffer
+		var hiddenRetPtr *Symbol
+		paramRegStartIdx := 0
+		
+		if node.ReturnType != "" && is.isLargeStruct(node.ReturnType) {
+			// Allocate space for hidden return pointer
+			is.stackOffset -= 8
+			hiddenRetPtr = &Symbol{
+				Name:   "__retptr",
+				Type:   node.ReturnType + "*",
+				Offset: is.stackOffset,
+				Size:   8,
+			}
+			is.localVars["__retptr"] = hiddenRetPtr
+			
+			// Save the hidden pointer from RDI directly to stack (use "mem" not "var" to avoid register allocation)
+			retPtrReg := &Operand{Type: "reg", Value: "rdi"}
+			retPtrMem := &Operand{Type: "mem", Offset: is.stackOffset}
+			is.emit(OpStore, retPtrMem, retPtrReg, nil)
+			
+			// Regular parameters start at RSI (index 1)
+			paramRegStartIdx = 1
+		}
+		
 		// Allocate parameters
 		argRegs := []string{"rdi", "rsi", "rdx", "rcx", "r8", "r9"}
 		for i, param := range node.Params {
@@ -358,9 +383,12 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 			}
 			
 			// Move from argument register to stack
-			if i < len(argRegs) {
-				argReg := &Operand{Type: "reg", Value: argRegs[i]}
-				paramOp := &Operand{Type: "var", Value: param, Offset: is.stackOffset}
+			// Account for hidden pointer if present  
+			// Use "mem" type to prevent register allocation
+			regIdx := i + paramRegStartIdx
+			if regIdx < len(argRegs) {
+				argReg := &Operand{Type: "reg", Value: argRegs[regIdx]}
+				paramOp := &Operand{Type: "mem", Offset: is.stackOffset}
 				is.emit(OpStore, paramOp, argReg, nil)
 			}
 		}
@@ -447,8 +475,58 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 			if err != nil {
 				return err
 			}
-			retReg := &Operand{Type: "reg", Value: "rax"}
-			is.emit(OpMov, retReg, result, nil)
+			
+			// Check if we're returning a large struct
+			funcSig := is.functions[is.currentFunc]
+			if funcSig != nil && funcSig.ReturnType != "" && is.isLargeStruct(funcSig.ReturnType) {
+				// Large struct return: copy to hidden pointer location
+				// The hidden pointer is saved in __retptr
+				if retPtr, ok := is.localVars["__retptr"]; ok {
+					// Load the hidden pointer
+					ptrTemp := is.newTemp()
+					ptrVar := &Operand{Type: "var", Value: "__retptr", Offset: retPtr.Offset}
+					is.emit(OpLoad, ptrTemp, ptrVar, nil)
+					
+					// Copy the struct from result to the hidden pointer location
+					// For now, we'll use a simple memcpy approach
+					structSize := is.getTypeSize(funcSig.ReturnType)
+					
+					// If result is already a memory location, copy from it
+					if result.Type == "mem" || result.Type == "var" {
+						// Generate copy loop - for simplicity, copy 8 bytes at a time
+						for offset := 0; offset < structSize; offset += 8 {
+							srcTemp := is.newTemp()
+							srcOp := &Operand{
+								Type:   "mem",
+								Offset: result.Offset + offset,
+							}
+							is.emit(OpLoad, srcTemp, srcOp, nil)
+							
+							// Store to hidden pointer + offset
+							dstOp := &Operand{
+								Type:      "ptr",
+								IndexTemp: ptrTemp,
+							}
+							// Add offset if needed
+							if offset > 0 {
+								offsetOp := &Operand{Type: "imm", Value: fmt.Sprintf("%d", offset)}
+								addrTemp := is.newTemp()
+								is.emit(OpAdd, addrTemp, ptrTemp, offsetOp)
+								dstOp.IndexTemp = addrTemp
+							}
+							is.emit(OpStore, dstOp, srcTemp, nil)
+						}
+					}
+					
+					// Return the hidden pointer in RAX
+					retReg := &Operand{Type: "reg", Value: "rax"}
+					is.emit(OpMov, retReg, ptrTemp, nil)
+				}
+			} else {
+				// Regular return: move result to RAX
+				retReg := &Operand{Type: "reg", Value: "rax"}
+				is.emit(OpMov, retReg, result, nil)
+			}
 		}
 		is.emit(OpRet, nil, nil, nil)
 		
@@ -847,28 +925,70 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			return nil, err
 		}
 		
-		// Calculate byte offset: index * 8
-		elementSize := &Operand{Type: "imm", Value: "8"}
-		byteOffset := is.newTemp()
-		is.emit(OpMul, byteOffset, index, elementSize)
-		
 		// Check if base is a simple identifier (local/global array)
 		if baseNode.Type == NodeIdentifier {
 			varName := baseNode.VarName
 			var baseOffset int
 			var isGlobal bool
+			var varType string
 			
 			if sym, ok := is.localVars[varName]; ok {
 				baseOffset = sym.Offset
 				isGlobal = false
-			} else if _, ok := is.globalVars[varName]; ok {
+				varType = sym.Type
+			} else if sym, ok := is.globalVars[varName]; ok {
 				baseOffset = 0
 				isGlobal = true
+				varType = sym.Type
 			} else {
 				return nil, fmt.Errorf("undefined array: %s", varName)
 			}
 			
-			// Use the optimized array access path
+			// Determine element type and size
+			var elementType string
+			var elementSize int
+			
+			if strings.Contains(varType, "*") {
+				// Pointer type - element is what it points to
+				elementType = strings.TrimSuffix(strings.TrimSpace(varType), "*")
+				elementSize = is.getTypeSize(elementType)
+			} else {
+				// Array type - for now assume 8-byte elements
+				elementType = varType
+				elementSize = 8
+			}
+			
+			// Calculate byte offset: index * elementSize
+			elementSizeOp := &Operand{Type: "imm", Value: fmt.Sprintf("%d", elementSize)}
+			byteOffset := is.newTemp()
+			is.emit(OpMul, byteOffset, index, elementSizeOp)
+			
+			// Check if the variable is a pointer type
+			// Pointers need to be dereferenced, not accessed as arrays
+			if strings.Contains(varType, "*") {
+				// It's a pointer - load the pointer value first, then index it
+				baseAddr, err := is.selectExpression(baseNode)
+				if err != nil {
+					return nil, err
+				}
+				
+				// Add base address + offset
+				finalAddr := is.newTemp()
+				is.emit(OpAdd, finalAddr, baseAddr, byteOffset)
+				
+				// Load from the computed address
+				result := is.newTemp()
+				result.DataType = elementType
+				ptrOp := &Operand{
+					Type:      "ptr",
+					IndexTemp: finalAddr,
+					DataType:  elementType,
+				}
+				is.emit(OpLoad, result, ptrOp, nil)
+				return result, nil
+			}
+			
+			// Use the optimized array access path for actual arrays
 			result := is.newTemp()
 			arrayOp := &Operand{
 				Type:      "array",
@@ -886,6 +1006,12 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			if err != nil {
 				return nil, err
 			}
+			
+			// For complex expressions, assume 8-byte elements for now
+			// TODO: Determine actual element size from baseAddr type
+			elementSizeOp := &Operand{Type: "imm", Value: "8"}
+			byteOffset := is.newTemp()
+			is.emit(OpMul, byteOffset, index, elementSizeOp)
 			
 			// Add base address + offset
 			finalAddr := is.newTemp()
@@ -1393,18 +1519,22 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				DataType: returnType,
 			}
 			
-			// Pass pointer to return slot as hidden first argument in rdi
-			is.emit(OpLoadAddr, &Operand{Type: "reg", Value: "rdi"}, retSlot, nil)
 			argStartIdx = 1 // Regular arguments start at rsi
 		}
 		
 		// Move arguments to calling convention registers
+		// Do this BEFORE OpLoadAddr to avoid register conflicts
 		for i, arg := range args {
 			regIdx := i + argStartIdx
 			if regIdx < len(argRegs) {
 				regOp := &Operand{Type: "reg", Value: argRegs[regIdx]}
 				is.emit(OpMov, regOp, arg, nil)
 			}
+		}
+		
+		// NOW emit the hidden pointer load (after args are in place)
+		if retSlot != nil {
+			is.emit(OpLoadAddr, &Operand{Type: "reg", Value: "rdi"}, retSlot, nil)
 		}
 		
 		// Call function
@@ -1417,6 +1547,32 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			result.DataType = returnType
 			result.Offset = retSlot.Offset
 			result.Type = "mem"
+		} else if returnType != "" {
+			// Check if this is a struct return that uses RAX+RDX (9-16 bytes)
+			structSize := is.getTypeSize(returnType)
+			if structSize > 8 && structSize <= 16 {
+				// Struct is returned in RAX (first 8 bytes) + RDX (next 8 bytes)
+				// We need to save both registers to memory
+				is.stackOffset -= 16  // Allocate space for full struct
+				if is.stackOffset%16 != 0 {
+					is.stackOffset -= is.stackOffset % 16
+				}
+				
+				// Save RAX (first 8 bytes)
+				raxOp := &Operand{Type: "reg", Value: "rax"}
+				firstPart := &Operand{Type: "mem", Offset: is.stackOffset}
+				is.emit(OpStore, firstPart, raxOp, nil)
+				
+				// Save RDX (second 8 bytes)
+				rdxOp := &Operand{Type: "reg", Value: "rdx"}
+				secondPart := &Operand{Type: "mem", Offset: is.stackOffset + 8}
+				is.emit(OpStore, secondPart, rdxOp, nil)
+				
+				// Result points to the combined struct on stack
+				result.Type = "mem"
+				result.Offset = is.stackOffset
+				result.DataType = returnType
+			}
 		}
 		
 		return result, nil

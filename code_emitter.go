@@ -403,7 +403,13 @@ func (ce *CodeEmitter) emitMov(dst, src *Operand) {
 	
 	// Handle label (string literals, addresses) - use leaq
 	if src.Type == "label" {
-		ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %s\n", src.Value, dstStr))
+		dstIsMem := strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")")
+		if dstIsMem {
+			ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %%rax\n", src.Value))
+			ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %s\n", src.Value, dstStr))
+		}
 		return
 	}
 	
@@ -635,11 +641,53 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 			ptrReg = "%r11"
 		}
 		
+		// Determine the appropriate mov instruction based on data type
+		// Strip qualifiers like const, volatile, etc.
+		dataType := strings.TrimSpace(src.DataType)
+		dataType = strings.TrimPrefix(dataType, "const ")
+		dataType = strings.TrimPrefix(dataType, "volatile ")
+		dataType = strings.TrimPrefix(dataType, "register ")
+		dataType = strings.TrimSpace(dataType)
+		
+		movInstr := "movq"
+		if dataType == "char" || dataType == "signed char" || dataType == "unsigned char" {
+			movInstr = "movb"
+		} else if dataType == "short" || dataType == "short int" || dataType == "signed short" || dataType == "unsigned short" {
+			movInstr = "movw"
+		} else if dataType == "int" || dataType == "signed int" || dataType == "unsigned int" {
+			movInstr = "movl"
+		}
+		
 		if dstIsMem {
-			ce.output.WriteString(fmt.Sprintf("    movq (%s), %%rax\n", ptrReg))
-			ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+			if movInstr == "movb" {
+				ce.output.WriteString(fmt.Sprintf("    movb (%s), %%al\n", ptrReg))
+				ce.output.WriteString("    movzbq %al, %rax\n")  // Zero-extend to 64-bit
+				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+			} else if movInstr == "movw" {
+				ce.output.WriteString(fmt.Sprintf("    movw (%s), %%ax\n", ptrReg))
+				ce.output.WriteString("    movzwq %ax, %rax\n")  // Zero-extend to 64-bit
+				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+			} else if movInstr == "movl" {
+				ce.output.WriteString(fmt.Sprintf("    movl (%s), %%eax\n", ptrReg))
+				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movq (%s), %%rax\n", ptrReg))
+				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+			}
 		} else {
-			ce.output.WriteString(fmt.Sprintf("    movq (%s), %s\n", ptrReg, dstStr))
+			if movInstr == "movb" {
+				ce.output.WriteString(fmt.Sprintf("    movb (%s), %%al\n", ptrReg))
+				ce.output.WriteString(fmt.Sprintf("    movzbq %%al, %s\n", dstStr))  // Zero-extend to 64-bit
+			} else if movInstr == "movw" {
+				ce.output.WriteString(fmt.Sprintf("    movw (%s), %%ax\n", ptrReg))
+				ce.output.WriteString(fmt.Sprintf("    movzwq %%ax, %s\n", dstStr))  // Zero-extend to 64-bit
+			} else if movInstr == "movl" {
+				ce.output.WriteString(fmt.Sprintf("    movl (%s), %%eax\n", ptrReg))
+				// movl to 32-bit reg automatically zero-extends to 64-bit
+				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movq (%s), %s\n", ptrReg, dstStr))
+			}
 		}
 	case "label":
 		// String literal or global label - use leaq to load address
@@ -660,6 +708,18 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 func (ce *CodeEmitter) emitStore(dst, src *Operand) {
 	switch dst.Type {
 	case "var":
+		// Special handling for label sources (string literals)
+		if src.Type == "label" {
+			if dst.IsGlobal {
+				ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %%rax\n", src.Value))
+				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s(%%rip)\n", dst.Value))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %%rax\n", src.Value))
+				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %d(%%rbp)\n", dst.Offset))
+			}
+			return
+		}
+		
 		srcStr := ce.formatOperand(src)
 		srcIsMem := strings.Contains(srcStr, "(") && strings.Contains(srcStr, ")")
 		
@@ -790,8 +850,24 @@ func (ce *CodeEmitter) formatOperand(op *Operand) string {
 	case "reg":
 		return "%" + op.Value
 	case "imm":
-		// Don't format float immediates - they should be handled specially
-		return "$" + op.Value
+		// Convert escape sequences to numeric values for assembly
+		val := op.Value
+		if val == "\\0" {
+			val = "0"
+		} else if val == "\\n" {
+			val = "10"
+		} else if val == "\\t" {
+			val = "9"
+		} else if val == "\\r" {
+			val = "13"
+		} else if val == "\\\\" {
+			val = "92"
+		} else if val == "\\'" {
+			val = "39"
+		} else if val == "\\\"" {
+			val = "34"
+		}
+		return "$" + val
 	case "label":
 		return op.Value
 	case "mem":

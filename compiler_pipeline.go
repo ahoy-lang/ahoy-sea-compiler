@@ -14,10 +14,11 @@ type CompilerPipeline struct {
 	ir       []*IRInstruction
 	assembly string
 	
-	parser     *Parser
-	selector   *InstructionSelector
-	allocator  *RegisterAllocator
-	emitter    *CodeEmitter
+	preprocessor *Preprocessor
+	parser       *Parser
+	selector     *InstructionSelector
+	allocator    *RegisterAllocator
+	emitter      *CodeEmitter
 	
 	options CompilerOptions
 }
@@ -56,9 +57,9 @@ func (cp *CompilerPipeline) Compile() error {
 		start := time.Now()
 		
 		// Use our simple preprocessor to handle #include and #define
-		preprocessor := NewPreprocessor()
+		cp.preprocessor = NewPreprocessor()
 		var err error
-		preprocessedSource, err = preprocessor.Process(cp.source)
+		preprocessedSource, err = cp.preprocessor.Process(cp.source)
 		if err != nil {
 			return fmt.Errorf("preprocessing error: %w", err)
 		}
@@ -101,12 +102,46 @@ func (cp *CompilerPipeline) Compile() error {
 	cp.selector.typedefs = cp.parser.typedefs  // Pass typedef aliases FROM PARSER
 	cp.selector.enums = cp.parser.enums  // Pass enum constants FROM PARSER
 	
+	// Also add structs from headers (preprocessor)
+	if cp.preprocessor != nil {
+		for structName, structDef := range cp.preprocessor.structMap {
+			// Only add if not already defined in source
+			if _, exists := cp.selector.structs[structName]; !exists {
+				// Convert from preprocessor StructDef to parser StructDef
+				members := []StructMember{}
+				for _, m := range structDef.Members {
+					members = append(members, StructMember{
+						Name:   m.Name,
+						Type:   m.Type,
+						Offset: m.Offset,
+						Size:   m.Size,
+					})
+				}
+				cp.selector.structs[structName] = &StructDef{
+					Name:    structDef.Name,
+					Members: members,
+					Size:    structDef.Size,
+				}
+			}
+		}
+	}
+	
 	// Extract function signatures from parsed AST
 	for _, child := range cp.ast.Children {
 		if child.Type == NodeFunction {
 			cp.selector.functions[child.Name] = &FunctionSignature{
 				ReturnType: child.ReturnType,
 				ParamTypes: child.ParamTypes,
+			}
+		}
+	}
+	
+	// Also add function signatures from headers (preprocessor)
+	if cp.preprocessor != nil {
+		for funcName, funcSig := range cp.preprocessor.functionSigs {
+			// Only add if not already defined in source
+			if _, exists := cp.selector.functions[funcName]; !exists {
+				cp.selector.functions[funcName] = funcSig
 			}
 		}
 	}
