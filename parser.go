@@ -1826,10 +1826,18 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 		value := p.current().Lexeme
 		p.advance()
 		intVal, _ := strconv.Atoi(value)
+		
+		// Determine if it's a float or int based on presence of decimal point
+		dataType := "int"
+		if strings.Contains(value, ".") || strings.Contains(value, "e") || strings.Contains(value, "E") {
+			dataType = "double"
+		}
+		
 		return &ASTNode{
 			Type:     NodeNumber,
 			Value:    value,
 			IntValue: intVal,
+			DataType: dataType,
 		}, nil
 	}
 	

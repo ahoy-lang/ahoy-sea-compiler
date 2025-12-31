@@ -29,6 +29,7 @@ const (
 	OpGt
 	OpGe
 	OpMov
+	OpMovFloat
 	OpLoad
 	OpStore
 	OpLoadAddr
@@ -71,9 +72,11 @@ type InstructionSelector struct {
 	currentFunc  string
 	labelCounter int
 	tempCounter  int
+	varCounter   int  // Counter to make variable names unique
 	
 	// Symbol tables
-	localVars    map[string]*Symbol
+	localVars    map[string]*Symbol  // Current active binding for each variable name
+	allLocalVars map[string]*Symbol  // All local variables (with unique keys)
 	globalVars   map[string]*Symbol
 	functions    map[string]*FunctionSignature // Track function signatures
 	stringLits   map[string]string
@@ -88,6 +91,7 @@ func NewInstructionSelector() *InstructionSelector {
 	is := &InstructionSelector{
 		instructions: []*IRInstruction{},
 		localVars:    make(map[string]*Symbol),
+		allLocalVars: make(map[string]*Symbol),
 		globalVars:   make(map[string]*Symbol),
 		functions:    make(map[string]*FunctionSignature),
 		stringLits:   make(map[string]string),
@@ -337,7 +341,9 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 		
 		is.currentFunc = node.Name
 		is.localVars = make(map[string]*Symbol)
+		is.allLocalVars = make(map[string]*Symbol)
 		is.stackOffset = 0
+		is.varCounter = 0  // Reset counter for each function
 		
 		// Emit function label
 		is.emit(OpLabel, &Operand{Type: "label", Value: node.Name}, nil, nil)
@@ -450,13 +456,24 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 		} else {
 			is.stackOffset -= varSize
 			varOffset := is.stackOffset  // Save the variable's offset
-			is.localVars[node.VarName] = &Symbol{
-				Name:      node.VarName,
+			
+			// Create a unique key for this variable instance
+			is.varCounter++
+			uniqueKey := fmt.Sprintf("%s#%d", node.VarName, is.varCounter)
+			
+			sym := &Symbol{
+				Name:      node.VarName,  // Keep original name
 				Offset:    varOffset,
 				Size:      varSize,
 				ArraySize: node.ArraySize,
 				Type:      dataType,
 			}
+			
+			// Store in both maps:
+			// - allLocalVars keeps ALL variable instances (prevents offset reuse)
+			// - localVars tracks current binding (for lookups)
+			is.allLocalVars[uniqueKey] = sym
+			is.localVars[node.VarName] = sym
 			
 			// Handle initialization (only for non-arrays for now)
 			if len(node.Children) > 0 && node.ArraySize == 0 {
@@ -786,7 +803,11 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 	
 	switch node.Type {
 	case NodeNumber:
-		return &Operand{Type: "imm", Value: node.Value}, nil
+		op := &Operand{Type: "imm", Value: node.Value}
+		if node.DataType != "" {
+			op.DataType = node.DataType
+		}
+		return op, nil
 		
 	case NodeString:
 		label := is.newLabel(".str")
@@ -830,6 +851,17 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		}
 		
 		result := is.newTemp()
+		
+		// Propagate type: if either operand is float/double, result is float/double
+		if left.DataType == "double" || right.DataType == "double" {
+			result.DataType = "double"
+		} else if left.DataType == "float" || right.DataType == "float" {
+			result.DataType = "float"
+		} else if left.DataType != "" {
+			result.DataType = left.DataType
+		} else if right.DataType != "" {
+			result.DataType = right.DataType
+		}
 		
 		switch node.Operator {
 		case "+":
@@ -1235,10 +1267,12 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		// Find member offset and size
 		memberOffset := -1
 		memberSize := 8  // Default
+		memberType := "" // NEW: track member type
 		for _, member := range structDef.Members {
 			if member.Name == memberName {
 				memberOffset = member.Offset
 				memberSize = member.Size
+				memberType = member.Type // NEW: get member type
 				break
 			}
 		}
@@ -1249,6 +1283,7 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		
 		// Load member value
 		result := is.newTemp()
+		result.DataType = memberType // NEW: set result DataType
 		if isPtr {
 			// ptr->member: load pointer value, then load from (ptr + memberOffset)
 			var ptrTemp *Operand
@@ -1272,14 +1307,14 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			}
 			
 			// Load from pointer with correct size
-			memberOp := &Operand{Type: "ptr", IndexTemp: ptrTemp, Size: memberSize}
+			memberOp := &Operand{Type: "ptr", IndexTemp: ptrTemp, Size: memberSize, DataType: memberType} // NEW: set DataType
 			is.emit(OpLoad, result, memberOp, nil)
 		} else {
 			// struct.member: direct access
 			// This only works for simple variable bases
 			if baseTemp.Type == "var" {
 				finalOffset := baseTemp.Offset + memberOffset
-				memberOp := &Operand{Type: "var", Value: baseTemp.Value, Offset: finalOffset, IsGlobal: baseTemp.IsGlobal, Size: memberSize}
+				memberOp := &Operand{Type: "var", Value: baseTemp.Value, Offset: finalOffset, IsGlobal: baseTemp.IsGlobal, Size: memberSize, DataType: memberType}
 				is.emit(OpLoad, result, memberOp, nil)
 			} else if baseTemp.Type == "temp" {
 				// Temp holds a struct value (from statement expression or function return)
@@ -1296,7 +1331,7 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				}
 				
 				// Load from pointer
-				memberOp := &Operand{Type: "ptr", IndexTemp: ptrTemp}
+				memberOp := &Operand{Type: "ptr", IndexTemp: ptrTemp, Size: memberSize, DataType: memberType}
 				is.emit(OpLoad, result, memberOp, nil)
 			} else {
 				return nil, fmt.Errorf("dot access on non-variable expression not yet supported (in function: %s, member: %s, baseType: %s)", 
@@ -1482,9 +1517,11 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				}
 				
 				memberOffset := -1
+				memberSize := 8  // Default
 				for _, member := range structDef.Members {
 					if member.Name == memberName {
 						memberOffset = member.Offset
+						memberSize = member.Size
 						break
 					}
 				}
@@ -1511,12 +1548,12 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 						ptrTemp = ptrWithOffset
 					}
 					
-					memberOp := &Operand{Type: "ptr", IndexTemp: ptrTemp}
+					memberOp := &Operand{Type: "ptr", IndexTemp: ptrTemp, Size: memberSize}
 					is.emit(OpStore, memberOp, assignValue, nil)
 				} else {
 					if baseTemp.Type == "var" {
 						finalOffset := baseTemp.Offset + memberOffset
-						memberOp := &Operand{Type: "var", Value: baseTemp.Value, Offset: finalOffset, IsGlobal: baseTemp.IsGlobal}
+						memberOp := &Operand{Type: "var", Value: baseTemp.Value, Offset: finalOffset, IsGlobal: baseTemp.IsGlobal, Size: memberSize}
 						is.emit(OpStore, memberOp, assignValue, nil)
 						return assignValue, nil
 					} else {
@@ -1694,11 +1731,13 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				return nil, fmt.Errorf("undefined struct: %s", structName)
 			}
 			
-			// Find member offset
+			// Find member offset and size
 			memberOffset := -1
+			memberSize := 8  // Default
 			for _, member := range structDef.Members {
 				if member.Name == memberName {
 					memberOffset = member.Offset
+					memberSize = member.Size
 					break
 				}
 			}
@@ -1737,7 +1776,7 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				}
 				
 				// Store to pointer
-				memberOp := &Operand{Type: "ptr", IndexTemp: ptrTemp}
+				memberOp := &Operand{Type: "ptr", IndexTemp: ptrTemp, Size: memberSize}
 				is.emit(OpStore, memberOp, value, nil)
 			} else {
 				// struct.member: direct access
@@ -1746,7 +1785,7 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				if baseTemp.Type == "var" {
 					// Simple variable
 					finalOffset := baseTemp.Offset + memberOffset
-					memberOp := &Operand{Type: "var", Value: baseTemp.Value, Offset: finalOffset, IsGlobal: baseTemp.IsGlobal}
+					memberOp := &Operand{Type: "var", Value: baseTemp.Value, Offset: finalOffset, IsGlobal: baseTemp.IsGlobal, Size: memberSize}
 					is.emit(OpStore, memberOp, value, nil)
 					return value, nil
 				} else {
@@ -1821,7 +1860,6 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		
 		// Check if we need to allocate space for a large struct return
 		var retSlot *Operand
-		argRegs := []string{"rdi", "rsi", "rdx", "rcx", "r8", "r9"}
 		argStartIdx := 0
 		
 		if returnType != "" && is.isLargeStruct(returnType) {
@@ -1842,13 +1880,67 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			argStartIdx = 1 // Regular arguments start at rsi
 		}
 		
-		// Move arguments to calling convention registers
-		// Do this BEFORE OpLoadAddr to avoid register conflicts
+		// To avoid register conflicts, save all arguments to stack temps first
+		savedArgs := make([]*Operand, len(args))
 		for i, arg := range args {
-			regIdx := i + argStartIdx
-			if regIdx < len(argRegs) {
-				regOp := &Operand{Type: "reg", Value: argRegs[regIdx]}
-				is.emit(OpMov, regOp, arg, nil)
+			// Only save if the arg might conflict (if it's already in a register)
+			if arg.Type == "temp" || arg.Type == "reg" {
+				// Save to stack
+				is.stackOffset -= 8
+				stackLoc := &Operand{Type: "mem", Offset: is.stackOffset}
+				is.emit(OpStore, stackLoc, arg, nil)
+				savedArgs[i] = stackLoc
+			} else {
+				savedArgs[i] = arg
+			}
+		}
+		
+		// Now load arguments into calling convention registers from saved locations
+		// Track separate counters for integer and float registers
+		intRegIdx := argStartIdx
+		floatRegIdx := 0
+		intRegs := []string{"rdi", "rsi", "rdx", "rcx", "r8", "r9"}
+		floatRegs := []string{"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"}
+		
+		for _, savedArg := range savedArgs {
+			// Determine if this argument is a float
+			isFloat := false
+			if savedArg.Type == "imm" && strings.Contains(savedArg.Value, ".") {
+				isFloat = true
+			}
+			// Also check if DataType indicates float/double
+			if savedArg.DataType == "float" || savedArg.DataType == "double" {
+				isFloat = true
+			}
+			
+			if isFloat {
+				// Use XMM register for floats
+				if floatRegIdx < len(floatRegs) {
+					regOp := &Operand{Type: "freg", Value: floatRegs[floatRegIdx]}
+					floatRegIdx++
+					// Load from saved location into XMM register
+					if savedArg.Type == "mem" {
+						tempArg := is.newTemp()
+						is.emit(OpLoad, tempArg, savedArg, nil)
+						is.emit(OpMovFloat, regOp, tempArg, nil)
+					} else {
+						is.emit(OpMovFloat, regOp, savedArg, nil)
+					}
+				}
+			} else {
+				// Use integer register
+				if intRegIdx < len(intRegs) {
+					regOp := &Operand{Type: "reg", Value: intRegs[intRegIdx]}
+					intRegIdx++
+					// Load from saved location
+					if savedArg.Type == "mem" {
+						tempArg := is.newTemp()
+						is.emit(OpLoad, tempArg, savedArg, nil)
+						is.emit(OpMov, regOp, tempArg, nil)
+					} else {
+						is.emit(OpMov, regOp, savedArg, nil)
+					}
+				}
 			}
 		}
 		

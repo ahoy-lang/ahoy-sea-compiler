@@ -15,7 +15,7 @@ type CodeEmitter struct {
 	instructions []*IRInstruction
 	stringLits   map[string]string
 	globalVars   map[string]*Symbol
-	floatLits    map[string]string  // float literal value -> label
+	floatLits    map[string]string  // label -> float literal value
 	
 	currentFunc   string
 	stackSize     int
@@ -230,6 +230,9 @@ func (ce *CodeEmitter) emitInstruction(instr *IRInstruction) {
 		
 	case OpMov:
 		ce.emitMov(instr.Dst, instr.Src1)
+	
+	case OpMovFloat:
+		ce.emitMovFloat(instr.Dst, instr.Src1)
 		
 	case OpAdd:
 		ce.emitBinaryOp("addq", instr.Dst, instr.Src1, instr.Src2)
@@ -413,6 +416,42 @@ func (ce *CodeEmitter) emitMov(dst, src *Operand) {
 		return
 	}
 	
+	// Determine if we need 32-bit mov based on DataType (only for integer types)
+	use32Bit := false
+	if (src.DataType == "int" || src.DataType == "unsigned int" || src.DataType == "unsigned" || 
+	    dst.DataType == "int" || dst.DataType == "unsigned int" || dst.DataType == "unsigned" ||
+	    strings.HasPrefix(src.DataType, "enum ") || strings.HasPrefix(dst.DataType, "enum ")) &&
+	   src.Type != "imm" && !strings.Contains(src.Value, ".") {
+		// Use 32-bit mov for integer types when loading from memory
+		// But not for immediate integer values (those should use movl anyway)
+		if src.Type == "mem" || src.Type == "var" || src.Type == "ptr" {
+			use32Bit = true
+		}
+	}
+	
+	if use32Bit {
+		// Use 32-bit load with sign extension
+		dstStr32 := ce.formatOperand32(dst)
+		srcStr32 := ce.formatOperand32(src)
+		
+		// Check for memory-to-memory
+		srcIsMem := strings.Contains(srcStr, "(") && strings.Contains(srcStr, ")")
+		dstIsMem := strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")")
+		
+		if srcIsMem && dstIsMem {
+			ce.output.WriteString(fmt.Sprintf("    movl %s, %%eax\n", srcStr32))
+			ce.output.WriteString(fmt.Sprintf("    movl %%eax, %s\n", dstStr32))
+		} else {
+			// Use movslq for sign-extending 32-bit to 64-bit when loading to register
+			if !dstIsMem && srcIsMem {
+				ce.output.WriteString(fmt.Sprintf("    movslq %s, %s\n", srcStr32, dstStr))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movl %s, %s\n", srcStr32, dstStr32))
+			}
+		}
+		return
+	}
+	
 	// Handle immediate to memory
 	if dst.Type == "mem" && src.Type == "imm" {
 		ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", srcStr))
@@ -434,7 +473,95 @@ func (ce *CodeEmitter) emitMov(dst, src *Operand) {
 	ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", srcStr, dstStr))
 }
 
+func (ce *CodeEmitter) emitMovFloat(dst, src *Operand) {
+	// Move floating point values using XMM registers and movsd
+	dstStr := ce.formatOperand(dst)
+	srcStr := ce.formatOperand(src)
+	
+	// Handle floating point immediate values
+	if src.Type == "imm" {
+		label := ce.getFloatLabel(src.Value)
+		
+		// Load the float constant using movsd
+		if dst.Type == "freg" {
+			ce.output.WriteString(fmt.Sprintf("    movsd %s(%%rip), %%%s\n", label, dst.Value))
+		} else {
+			// Load to temp XMM register first, then move to destination
+			ce.output.WriteString(fmt.Sprintf("    movsd %s(%%rip), %%xmm0\n", label))
+			ce.output.WriteString(fmt.Sprintf("    movsd %%xmm0, %s\n", dstStr))
+		}
+		return
+	}
+	
+	// Source is in memory or temp register, destination is XMM register
+	if dst.Type == "freg" {
+		if src.Type == "temp" || src.Type == "reg" {
+			// Move from GPR to XMM (use movq for bit pattern transfer)
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%%s\n", srcStr, dst.Value))
+		} else {
+			// Load from memory to XMM
+			ce.output.WriteString(fmt.Sprintf("    movsd %s, %%%s\n", srcStr, dst.Value))
+		}
+		return
+	}
+	
+	// If not a float register destination, fall back to regular mov
+	ce.emitMov(dst, src)
+}
 func (ce *CodeEmitter) emitBinaryOp(op string, dst, src1, src2 *Operand) {
+	// Check if this is a float operation
+	isFloat := (dst.DataType == "float" || dst.DataType == "double" ||
+	            src1.DataType == "float" || src1.DataType == "double" ||
+	            src2.DataType == "float" || src2.DataType == "double")
+	
+	if isFloat {
+		// Float operation using SSE instructions
+		floatOp := ""
+		switch op {
+		case "addq":
+			floatOp = "addsd"
+		case "subq":
+			floatOp = "subsd"
+		default:
+			// Fallback to integer operation for unsupported float ops
+			isFloat = false
+		}
+		
+		if isFloat {
+			// Move src1 to xmm0
+			if src1.Type == "imm" {
+				label := ce.getFloatLabel(src1.Value)
+				ce.output.WriteString(fmt.Sprintf("    movsd %s(%%rip), %%xmm0\n", label))
+			} else if src1.Type == "temp" || src1.Type == "reg" {
+				// For GPRs, move as bit pattern first
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %%xmm0\n", ce.formatOperand(src1)))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movsd %s, %%xmm0\n", ce.formatOperand(src1)))
+			}
+			
+			// Apply operation with src2
+			if src2.Type == "imm" {
+				label := ce.getFloatLabel(src2.Value)
+				ce.output.WriteString(fmt.Sprintf("    %s %s(%%rip), %%xmm0\n", floatOp, label))
+			} else if src2.Type == "temp" || src2.Type == "reg" {
+				// For GPRs, move to xmm1 first
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %%xmm1\n", ce.formatOperand(src2)))
+				ce.output.WriteString(fmt.Sprintf("    %s %%xmm1, %%xmm0\n", floatOp))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    %s %s, %%xmm0\n", floatOp, ce.formatOperand(src2)))
+			}
+			
+			// Store result
+			if dst.Type == "temp" || dst.Type == "reg" {
+				ce.output.WriteString(fmt.Sprintf("    movq %%xmm0, %s\n", ce.formatOperand(dst)))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movsd %%xmm0, %s\n", ce.formatOperand(dst)))
+			}
+			return
+		}
+	}
+	
+	// Integer operation
 	// Move src1 to dst
 	ce.emitMov(dst, src1)
 	
@@ -451,6 +578,46 @@ func (ce *CodeEmitter) emitBinaryOp(op string, dst, src1, src2 *Operand) {
 }
 
 func (ce *CodeEmitter) emitMul(dst, src1, src2 *Operand) {
+	// Check if this is a float operation
+	isFloat := (dst.DataType == "float" || dst.DataType == "double" ||
+	            src1.DataType == "float" || src1.DataType == "double" ||
+	            src2.DataType == "float" || src2.DataType == "double")
+	
+	if isFloat {
+		// Float multiplication using SSE instructions
+		// Move src1 to xmm0
+		if src1.Type == "imm" {
+			label := ce.getFloatLabel(src1.Value)
+			ce.output.WriteString(fmt.Sprintf("    movsd %s(%%rip), %%xmm0\n", label))
+		} else if src1.Type == "temp" || src1.Type == "reg" {
+			// For GPRs, move as bit pattern first
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%xmm0\n", ce.formatOperand(src1)))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    movsd %s, %%xmm0\n", ce.formatOperand(src1)))
+		}
+		
+		// Multiply by src2
+		if src2.Type == "imm" {
+			label := ce.getFloatLabel(src2.Value)
+			ce.output.WriteString(fmt.Sprintf("    mulsd %s(%%rip), %%xmm0\n", label))
+		} else if src2.Type == "temp" || src2.Type == "reg" {
+			// For GPRs, move to xmm1 first
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%xmm1\n", ce.formatOperand(src2)))
+			ce.output.WriteString(fmt.Sprintf("    mulsd %%xmm1, %%xmm0\n"))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    mulsd %s, %%xmm0\n", ce.formatOperand(src2)))
+		}
+		
+		// Store result
+		if dst.Type == "temp" || dst.Type == "reg" {
+			ce.output.WriteString(fmt.Sprintf("    movq %%xmm0, %s\n", ce.formatOperand(dst)))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    movsd %%xmm0, %s\n", ce.formatOperand(dst)))
+		}
+		return
+	}
+	
+	// Integer multiplication
 	ce.emitMov(dst, src1)
 	
 	src2Str := ce.loadFloatIfNeeded(src2, "%r10")
@@ -468,45 +635,122 @@ func (ce *CodeEmitter) emitMul(dst, src1, src2 *Operand) {
 }
 
 func (ce *CodeEmitter) emitDiv(dst, src1, src2 *Operand) {
-	// Division requires RAX and RDX
-	ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", ce.formatOperand(src1)))
-	ce.output.WriteString("    cqto\n")
+	// Check if this is a float operation
+	isFloat := (dst.DataType == "float" || dst.DataType == "double" ||
+	            src1.DataType == "float" || src1.DataType == "double" ||
+	            src2.DataType == "float" || src2.DataType == "double")
 	
-	// idivq cannot take immediate operands - load to register first
-	if src2.Type == "imm" {
-		src2Str := ce.loadFloatIfNeeded(src2, "%r11")
-		if src2Str == "%r11" {
-			ce.output.WriteString("    idivq %r11\n")
+	if isFloat {
+		// Float division using SSE instructions
+		// Move src1 to xmm0
+		if src1.Type == "imm" {
+			label := ce.getFloatLabel(src1.Value)
+			ce.output.WriteString(fmt.Sprintf("    movsd %s(%%rip), %%xmm0\n", label))
+		} else if src1.Type == "temp" || src1.Type == "reg" {
+			// For GPRs, move as bit pattern first
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%xmm0\n", ce.formatOperand(src1)))
 		} else {
-			ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", src2Str))
-			ce.output.WriteString("    idivq %r11\n")
+			ce.output.WriteString(fmt.Sprintf("    movsd %s, %%xmm0\n", ce.formatOperand(src1)))
 		}
-	} else {
-		ce.output.WriteString(fmt.Sprintf("    idivq %s\n", ce.formatOperand(src2)))
+		
+		// Divide by src2
+		if src2.Type == "imm" {
+			label := ce.getFloatLabel(src2.Value)
+			ce.output.WriteString(fmt.Sprintf("    divsd %s(%%rip), %%xmm0\n", label))
+		} else if src2.Type == "temp" || src2.Type == "reg" {
+			// For GPRs, move to xmm1 first
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%xmm1\n", ce.formatOperand(src2)))
+			ce.output.WriteString(fmt.Sprintf("    divsd %%xmm1, %%xmm0\n"))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    divsd %s, %%xmm0\n", ce.formatOperand(src2)))
+		}
+		
+		// Store result
+		if dst.Type == "temp" || dst.Type == "reg" {
+			ce.output.WriteString(fmt.Sprintf("    movq %%xmm0, %s\n", ce.formatOperand(dst)))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    movsd %%xmm0, %s\n", ce.formatOperand(dst)))
+		}
+		return
 	}
 	
-	ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", ce.formatOperand(dst)))
+	// Division requires RAX and RDX
+	// Check if we're working with 32-bit integers
+	use32Bit := (src2.DataType == "int" || src2.DataType == "unsigned int" || src2.DataType == "unsigned" || 
+	             strings.HasPrefix(src2.DataType, "enum "))
+	
+	if use32Bit {
+		// 32-bit division
+		ce.output.WriteString(fmt.Sprintf("    movl %s, %%eax\n", ce.formatOperand32(src1)))
+		ce.output.WriteString("    cdq\n") // sign-extend EAX to EDX:EAX
+		
+		if src2.Type == "imm" {
+			ce.output.WriteString(fmt.Sprintf("    movl %s, %%r11d\n", src2.Value))
+			ce.output.WriteString("    idivl %r11d\n")
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    idivl %s\n", ce.formatOperand32(src2)))
+		}
+		
+		ce.output.WriteString(fmt.Sprintf("    movl %%eax, %s\n", ce.formatOperand32(dst)))
+	} else {
+		// 64-bit division (original code)
+		ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", ce.formatOperand(src1)))
+		ce.output.WriteString("    cqto\n")
+		
+		if src2.Type == "imm" {
+			src2Str := ce.loadFloatIfNeeded(src2, "%r11")
+			if src2Str == "%r11" {
+				ce.output.WriteString("    idivq %r11\n")
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", src2Str))
+				ce.output.WriteString("    idivq %r11\n")
+			}
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    idivq %s\n", ce.formatOperand(src2)))
+		}
+		
+		ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", ce.formatOperand(dst)))
+	}
 }
 
 func (ce *CodeEmitter) emitMod(dst, src1, src2 *Operand) {
 	// Modulo - result in RDX
-	ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", ce.formatOperand(src1)))
-	ce.output.WriteString("    cqto\n")
+	// Check if we're working with 32-bit integers
+	use32Bit := (src2.DataType == "int" || src2.DataType == "unsigned int" || src2.DataType == "unsigned" || 
+	             strings.HasPrefix(src2.DataType, "enum "))
 	
-	// idivq cannot take immediate operands - load to register first
-	if src2.Type == "imm" {
-		src2Str := ce.loadFloatIfNeeded(src2, "%r11")
-		if src2Str == "%r11" {
-			ce.output.WriteString("    idivq %r11\n")
+	if use32Bit {
+		// 32-bit division
+		ce.output.WriteString(fmt.Sprintf("    movl %s, %%eax\n", ce.formatOperand32(src1)))
+		ce.output.WriteString("    cdq\n") // sign-extend EAX to EDX:EAX
+		
+		if src2.Type == "imm" {
+			ce.output.WriteString(fmt.Sprintf("    movl %s, %%r11d\n", src2.Value))
+			ce.output.WriteString("    idivl %r11d\n")
 		} else {
-			ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", src2Str))
-			ce.output.WriteString("    idivq %r11\n")
+			ce.output.WriteString(fmt.Sprintf("    idivl %s\n", ce.formatOperand32(src2)))
 		}
+		
+		ce.output.WriteString(fmt.Sprintf("    movl %%edx, %s\n", ce.formatOperand32(dst)))
 	} else {
-		ce.output.WriteString(fmt.Sprintf("    idivq %s\n", ce.formatOperand(src2)))
+		// 64-bit division (original code)
+		ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", ce.formatOperand(src1)))
+		ce.output.WriteString("    cqto\n")
+		
+		if src2.Type == "imm" {
+			src2Str := ce.loadFloatIfNeeded(src2, "%r11")
+			if src2Str == "%r11" {
+				ce.output.WriteString("    idivq %r11\n")
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", src2Str))
+				ce.output.WriteString("    idivq %r11\n")
+			}
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    idivq %s\n", ce.formatOperand(src2)))
+		}
+		
+		ce.output.WriteString(fmt.Sprintf("    movq %%rdx, %s\n", ce.formatOperand(dst)))
 	}
-	
-	ce.output.WriteString(fmt.Sprintf("    movq %%rdx, %s\n", ce.formatOperand(dst)))
 }
 
 func (ce *CodeEmitter) emitShift(op string, dst, src1, src2 *Operand) {
@@ -532,13 +776,8 @@ func (ce *CodeEmitter) emitComparison(setcc string, dst, src1, src2 *Operand) {
 	src2Str := ce.formatOperand(src2)
 	
 	// Handle float immediates - they need to be in .rodata
-	if src2.Type == "imm" && strings.Contains(src2.Value, ".") {
-		label, exists := ce.floatLits[src2.Value]
-		if !exists {
-			ce.floatCounter++
-			label = fmt.Sprintf(".FC%d", ce.floatCounter)
-			ce.floatLits[label] = src2.Value
-		}
+	if src2.Type == "imm" && (src2.DataType == "float" || src2.DataType == "double") {
+		label := ce.getFloatLabel(src2.Value)
 		// Load into a register for comparison
 		ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %%r10\n", label))
 		src2Str = "%r10"
@@ -878,22 +1117,56 @@ func (ce *CodeEmitter) emitStore(dst, src *Operand) {
 			srcReg = valueReg
 		}
 		
-		ce.output.WriteString(fmt.Sprintf("    movq %s, (%s)\n", srcReg, ptrReg))
+		// Use appropriate store size based on dst.Size
+		if dst.Size == 4 {
+			// 32-bit store - convert register to 32-bit version
+			srcReg32 := ce.get32BitReg(srcReg)
+			ce.output.WriteString(fmt.Sprintf("    movl %s, (%s)\n", srcReg32, ptrReg))
+		} else if dst.Size == 2 {
+			// 16-bit store
+			srcReg16 := ce.get16BitReg(srcReg)
+			ce.output.WriteString(fmt.Sprintf("    movw %s, (%s)\n", srcReg16, ptrReg))
+		} else if dst.Size == 1 {
+			// 8-bit store
+			srcReg8 := ce.get8BitReg(srcReg)
+			ce.output.WriteString(fmt.Sprintf("    movb %s, (%s)\n", srcReg8, ptrReg))
+		} else {
+			// 64-bit store (default)
+			ce.output.WriteString(fmt.Sprintf("    movq %s, (%s)\n", srcReg, ptrReg))
+		}
 	default:
 		ce.emitMov(dst, src)
 	}
 }
 
+// Helper to get or create a float literal label
+func (ce *CodeEmitter) getFloatLabel(value string) string {
+	// Convert integer immediates to float format
+	floatVal := value
+	if !strings.Contains(floatVal, ".") {
+		floatVal = floatVal + ".0"
+	}
+	
+	// Check if we already have this float value
+	for label, val := range ce.floatLits {
+		if val == floatVal {
+			return label
+		}
+	}
+	
+	// Create new label
+	ce.floatCounter++
+	label := fmt.Sprintf(".FC%d", ce.floatCounter)
+	ce.floatLits[label] = floatVal
+	return label
+}
+
 // Helper to load a float immediate into a register if needed
 func (ce *CodeEmitter) loadFloatIfNeeded(op *Operand, tempReg string) string {
-	if op.Type == "imm" && strings.Contains(op.Value, ".") {
+	// Only treat as float if it's explicitly a float type
+	if op.Type == "imm" && (op.DataType == "float" || op.DataType == "double") {
 		// Float immediate - load from .rodata
-		label, exists := ce.floatLits[op.Value]
-		if !exists {
-			ce.floatCounter++
-			label = fmt.Sprintf(".FC%d", ce.floatCounter)
-			ce.floatLits[label] = op.Value
-		}
+		label := ce.getFloatLabel(op.Value)
 		ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %s\n", label, tempReg))
 		return tempReg
 	}
@@ -913,6 +1186,82 @@ func (ce *CodeEmitter) emitCall(instr *IRInstruction) {
 	}
 }
 
+// Helper to convert 64-bit register name to 32-bit
+func (ce *CodeEmitter) get32BitReg(reg64 string) string {
+	// Remove % prefix if present
+	reg := strings.TrimPrefix(reg64, "%")
+	
+	switch reg {
+	case "rax": return "%eax"
+	case "rbx": return "%ebx"
+	case "rcx": return "%ecx"
+	case "rdx": return "%edx"
+	case "rsi": return "%esi"
+	case "rdi": return "%edi"
+	case "rbp": return "%ebp"
+	case "rsp": return "%esp"
+	case "r8": return "%r8d"
+	case "r9": return "%r9d"
+	case "r10": return "%r10d"
+	case "r11": return "%r11d"
+	case "r12": return "%r12d"
+	case "r13": return "%r13d"
+	case "r14": return "%r14d"
+	case "r15": return "%r15d"
+	default: return reg64  // Return as-is if not recognized
+	}
+}
+
+// Helper to convert 64-bit register name to 16-bit
+func (ce *CodeEmitter) get16BitReg(reg64 string) string {
+	reg := strings.TrimPrefix(reg64, "%")
+	
+	switch reg {
+	case "rax": return "%ax"
+	case "rbx": return "%bx"
+	case "rcx": return "%cx"
+	case "rdx": return "%dx"
+	case "rsi": return "%si"
+	case "rdi": return "%di"
+	case "rbp": return "%bp"
+	case "rsp": return "%sp"
+	case "r8": return "%r8w"
+	case "r9": return "%r9w"
+	case "r10": return "%r10w"
+	case "r11": return "%r11w"
+	case "r12": return "%r12w"
+	case "r13": return "%r13w"
+	case "r14": return "%r14w"
+	case "r15": return "%r15w"
+	default: return reg64
+	}
+}
+
+// Helper to convert 64-bit register name to 8-bit
+func (ce *CodeEmitter) get8BitReg(reg64 string) string {
+	reg := strings.TrimPrefix(reg64, "%")
+	
+	switch reg {
+	case "rax": return "%al"
+	case "rbx": return "%bl"
+	case "rcx": return "%cl"
+	case "rdx": return "%dl"
+	case "rsi": return "%sil"
+	case "rdi": return "%dil"
+	case "rbp": return "%bpl"
+	case "rsp": return "%spl"
+	case "r8": return "%r8b"
+	case "r9": return "%r9b"
+	case "r10": return "%r10b"
+	case "r11": return "%r11b"
+	case "r12": return "%r12b"
+	case "r13": return "%r13b"
+	case "r14": return "%r14b"
+	case "r15": return "%r15b"
+	default: return reg64
+	}
+}
+
 func (ce *CodeEmitter) formatOperand(op *Operand) string {
 	if op == nil {
 		return ""
@@ -920,6 +1269,8 @@ func (ce *CodeEmitter) formatOperand(op *Operand) string {
 	
 	switch op.Type {
 	case "reg":
+		return "%" + op.Value
+	case "freg":
 		return "%" + op.Value
 	case "imm":
 		// Convert escape sequences to numeric values for assembly
