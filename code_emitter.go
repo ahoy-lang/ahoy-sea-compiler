@@ -817,23 +817,24 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 			if src.Size > 0 && src.Size < 8 {
 				if src.IsGlobal {
 					if src.Size == 4 {
+						// Load 32-bit and zero-extend
 						ce.output.WriteString(fmt.Sprintf("    movl %s(%%rip), %%eax\n", src.Value))
 					} else if src.Size == 2 {
-						ce.output.WriteString(fmt.Sprintf("    movw %s(%%rip), %%ax\n", src.Value))
+						ce.output.WriteString(fmt.Sprintf("    movzwl %s(%%rip), %%eax\n", src.Value))
 					} else if src.Size == 1 {
-						ce.output.WriteString(fmt.Sprintf("    movb %s(%%rip), %%al\n", src.Value))
+						ce.output.WriteString(fmt.Sprintf("    movzbl %s(%%rip), %%eax\n", src.Value))
 					}
-					// Zero-extend or sign-extend as needed
-					ce.output.WriteString(fmt.Sprintf("    movq %%rax, %%rax\n"))  // Zero-extend
 				} else {
 					if src.Size == 4 {
 						ce.output.WriteString(fmt.Sprintf("    movl %d(%%rbp), %%eax\n", src.Offset))
 					} else if src.Size == 2 {
-						ce.output.WriteString(fmt.Sprintf("    movzwq %d(%%rbp), %%rax\n", src.Offset))
+						ce.output.WriteString(fmt.Sprintf("    movzwl %d(%%rbp), %%eax\n", src.Offset))
 					} else if src.Size == 1 {
-						ce.output.WriteString(fmt.Sprintf("    movzbq %d(%%rbp), %%rax\n", src.Offset))
+						ce.output.WriteString(fmt.Sprintf("    movzbl %d(%%rbp), %%eax\n", src.Offset))
 					}
 				}
+				// movl to %eax zeros upper 32 bits of %rax
+				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
 			} else {
 				// Default 8-byte load
 				if src.IsGlobal {
@@ -841,28 +842,30 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 				} else {
 					ce.output.WriteString(fmt.Sprintf("    movq %d(%%rbp), %%rax\n", src.Offset))
 				}
+				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
 			}
-			ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
 		} else {
 			// Direct load to register - use appropriate size
 			if src.Size > 0 && src.Size < 8 {
 				if src.IsGlobal {
+					// For direct register loads, we can use movl directly which zeros upper bits
+					dstStr32 := ce.formatOperand32(dst)
 					if src.Size == 4 {
-						ce.output.WriteString(fmt.Sprintf("    movl %s(%%rip), %%eax\n", src.Value))
-						ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+						ce.output.WriteString(fmt.Sprintf("    movl %s(%%rip), %s\n", src.Value, dstStr32))
 					} else if src.Size == 2 {
-						ce.output.WriteString(fmt.Sprintf("    movzwq %s(%%rip), %s\n", src.Value, dstStr))
+						ce.output.WriteString(fmt.Sprintf("    movzwl %s(%%rip), %s\n", src.Value, dstStr32))
 					} else if src.Size == 1 {
-						ce.output.WriteString(fmt.Sprintf("    movzbq %s(%%rip), %s\n", src.Value, dstStr))
+						ce.output.WriteString(fmt.Sprintf("    movzbl %s(%%rip), %s\n", src.Value, dstStr32))
 					}
 				} else {
+					// Local variable load
+					dstStr32 := ce.formatOperand32(dst)
 					if src.Size == 4 {
-						ce.output.WriteString(fmt.Sprintf("    movl %d(%%rbp), %%eax\n", src.Offset))
-						ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+						ce.output.WriteString(fmt.Sprintf("    movl %d(%%rbp), %s\n", src.Offset, dstStr32))
 					} else if src.Size == 2 {
-						ce.output.WriteString(fmt.Sprintf("    movzwq %d(%%rbp), %s\n", src.Offset, dstStr))
+						ce.output.WriteString(fmt.Sprintf("    movzwl %d(%%rbp), %s\n", src.Offset, dstStr32))
 					} else if src.Size == 1 {
-						ce.output.WriteString(fmt.Sprintf("    movzbq %d(%%rbp), %s\n", src.Offset, dstStr))
+						ce.output.WriteString(fmt.Sprintf("    movzbl %d(%%rbp), %s\n", src.Offset, dstStr32))
 					}
 				}
 			} else {
@@ -949,10 +952,10 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 				ce.output.WriteString("    movzbq %al, %rax\n")  // Zero-extend to 64-bit
 				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
 			} else if movInstr == "movw" {
-				ce.output.WriteString(fmt.Sprintf("    movw (%s), %%ax\n", ptrReg))
-				ce.output.WriteString("    movzwq %ax, %rax\n")  // Zero-extend to 64-bit
+				ce.output.WriteString(fmt.Sprintf("    movzwl (%s), %%eax\n", ptrReg))
 				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
 			} else if movInstr == "movl" {
+				// movl zeros upper 32 bits automatically
 				ce.output.WriteString(fmt.Sprintf("    movl (%s), %%eax\n", ptrReg))
 				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
 			} else {
@@ -961,15 +964,15 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 			}
 		} else {
 			if movInstr == "movb" {
-				ce.output.WriteString(fmt.Sprintf("    movb (%s), %%al\n", ptrReg))
-				ce.output.WriteString(fmt.Sprintf("    movzbq %%al, %s\n", dstStr))  // Zero-extend to 64-bit
-			} else if movInstr == "movw" {
-				ce.output.WriteString(fmt.Sprintf("    movw (%s), %%ax\n", ptrReg))
-				ce.output.WriteString(fmt.Sprintf("    movzwq %%ax, %s\n", dstStr))  // Zero-extend to 64-bit
-			} else if movInstr == "movl" {
-				ce.output.WriteString(fmt.Sprintf("    movl (%s), %%eax\n", ptrReg))
-				// movl to 32-bit reg automatically zero-extends to 64-bit
+				ce.output.WriteString(fmt.Sprintf("    movzbl (%s), %%eax\n", ptrReg))
 				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+			} else if movInstr == "movw" {
+				ce.output.WriteString(fmt.Sprintf("    movzwl (%s), %%eax\n", ptrReg))
+				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+			} else if movInstr == "movl" {
+				// movl to 32-bit register zeros upper 32 bits
+				dstStr32 := ce.formatOperand32(dst)
+				ce.output.WriteString(fmt.Sprintf("    movl (%s), %s\n", ptrReg, dstStr32))
 			} else {
 				ce.output.WriteString(fmt.Sprintf("    movq (%s), %s\n", ptrReg, dstStr))
 			}

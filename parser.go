@@ -484,8 +484,32 @@ func (p *Parser) parseTopLevel() (*ASTNode, error) {
 	}
 	
 	if p.match(TYPEDEF) {
-		p.skipStructOrTypedef()
-		return nil, nil
+		// Handle typedef - need to parse the type and then the alias name
+		p.advance() // skip 'typedef'
+		
+		// Check if it's a struct/union typedef
+		if p.match(STRUCT) {
+			// Parse the struct definition
+			err := p.parseStructDef()
+			if err != nil {
+				return nil, err
+			}
+			// After struct def, there should be the typedef name
+			if p.match(IDENTIFIER) {
+				_ = p.current().Lexeme // aliasName
+				p.advance()
+				// Map the alias to the struct (last struct defined)
+				// For now, just skip - proper typedef tracking would go here
+			}
+			if p.match(SEMICOLON) {
+				p.advance()
+			}
+			return nil, nil
+		} else {
+			// Other typedef - skip for now
+			p.skipStructOrTypedef()
+			return nil, nil
+		}
 	}
 	
 	if p.match(ENUM) {

@@ -524,7 +524,7 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 						return err
 					}
 					
-					varOp := &Operand{Type: "var", Value: node.VarName, Offset: varOffset}
+					varOp := &Operand{Type: "var", Value: node.VarName, Offset: varOffset, Size: varSize}
 					is.emit(OpStore, varOp, result, nil)
 				}
 			}
@@ -1810,6 +1810,91 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			value, err := is.selectExpression(node.Children[1])
 			if err != nil {
 				return nil, err
+			}
+			
+			// Check if we're assigning a struct
+			// This can happen when the RHS is a compound literal or returns a struct address
+			// We need to detect struct types and perform a memory copy instead of pointer assignment
+			isStructCopy := false
+			var structSize int
+			
+			// Check if RHS is a compound literal
+			if node.Children[1].Type == NodeCompoundLiteral {
+				isStructCopy = true
+				structType := node.Children[1].DataType
+				structSize = is.getTypeSize(structType)
+			}
+			
+			// Check if RHS is a statement expression containing a compound literal assignment
+			// Pattern: ({ Type* tmp = malloc(...); *tmp = (Type){...}; tmp; })
+			if node.Children[1].Type == NodeBlock && len(node.Children[1].Children) > 0 {
+				// Check if last statement assigns a compound literal
+				for _, stmt := range node.Children[1].Children {
+					if stmt.Type == NodeExprStmt && len(stmt.Children) > 0 {
+						if stmt.Children[0].Type == NodeAssignment {
+							assignNode := stmt.Children[0]
+							if len(assignNode.Children) > 1 && assignNode.Children[1].Type == NodeCompoundLiteral {
+								// This statement expression contains a compound literal assignment
+								// The result will be a pointer, but we're assigning through another pointer
+								// So this is actually *ptr1 = ptr2 (where ptr2 points to the compound literal)
+								// We need to copy the struct data
+								isStructCopy = true
+								structType := assignNode.Children[1].DataType
+								structSize = is.getTypeSize(structType)
+								break
+							}
+						}
+					}
+				}
+			}
+			
+			if isStructCopy && structSize > 0 {
+				// Generate a memory copy: copy structSize bytes from value (src addr) to ptrExpr (dst addr)
+				if structSize <= 32 {
+					// Small struct: copy field by field (8 bytes at a time)
+					for offset := 0; offset < structSize; offset += 8 {
+						remaining := structSize - offset
+						copySize := 8
+						if remaining < 8 {
+							copySize = remaining
+						}
+						
+						// Load from source: *(value + offset)
+						srcTemp := is.newTemp()
+						if offset > 0 {
+							offsetOp := &Operand{Type: "imm", Value: fmt.Sprintf("%d", offset)}
+							srcAddr := is.newTemp()
+							is.emit(OpAdd, srcAddr, value, offsetOp)
+							srcOp := &Operand{Type: "ptr", IndexTemp: srcAddr, Size: copySize}
+							is.emit(OpLoad, srcTemp, srcOp, nil)
+						} else {
+							srcOp := &Operand{Type: "ptr", IndexTemp: value, Size: copySize}
+							is.emit(OpLoad, srcTemp, srcOp, nil)
+						}
+						
+						// Store to dest: *(ptrExpr + offset)
+						if offset > 0 {
+							offsetOp := &Operand{Type: "imm", Value: fmt.Sprintf("%d", offset)}
+							dstAddr := is.newTemp()
+							is.emit(OpAdd, dstAddr, ptrExpr, offsetOp)
+							dstOp := &Operand{Type: "ptr", IndexTemp: dstAddr, Size: copySize}
+							is.emit(OpStore, dstOp, srcTemp, nil)
+						} else {
+							dstOp := &Operand{Type: "ptr", IndexTemp: ptrExpr, Size: copySize}
+							is.emit(OpStore, dstOp, srcTemp, nil)
+						}
+					}
+				} else {
+					// Large struct: call memcpy
+					// memcpy(ptrExpr, value, structSize)
+					sizeOp := &Operand{Type: "imm", Value: fmt.Sprintf("%d", structSize)}
+					is.emit(OpMov, &Operand{Type: "reg", Value: "rdi"}, ptrExpr, nil)
+					is.emit(OpMov, &Operand{Type: "reg", Value: "rsi"}, value, nil)
+					is.emit(OpMov, &Operand{Type: "reg", Value: "rdx"}, sizeOp, nil)
+					is.emit(OpCall, &Operand{Type: "label", Value: "memcpy"}, nil, nil)
+				}
+				
+				return value, nil
 			}
 			
 			// Store to pointer
