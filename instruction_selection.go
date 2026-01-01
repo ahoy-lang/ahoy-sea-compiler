@@ -42,6 +42,7 @@ const (
 	OpPush
 	OpPop
 	OpParam
+	OpSetArg  // Special opcode for setting up function arguments - bypasses register allocator
 )
 
 type Operand struct {
@@ -1813,8 +1814,7 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			}
 			
 			// Check if we're assigning a struct
-			// This can happen when the RHS is a compound literal or returns a struct address
-			// We need to detect struct types and perform a memory copy instead of pointer assignment
+			// Only if RHS is a direct compound literal (not inside a statement expression)
 			isStructCopy := false
 			var structSize int
 			
@@ -1823,29 +1823,6 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				isStructCopy = true
 				structType := node.Children[1].DataType
 				structSize = is.getTypeSize(structType)
-			}
-			
-			// Check if RHS is a statement expression containing a compound literal assignment
-			// Pattern: ({ Type* tmp = malloc(...); *tmp = (Type){...}; tmp; })
-			if node.Children[1].Type == NodeBlock && len(node.Children[1].Children) > 0 {
-				// Check if last statement assigns a compound literal
-				for _, stmt := range node.Children[1].Children {
-					if stmt.Type == NodeExprStmt && len(stmt.Children) > 0 {
-						if stmt.Children[0].Type == NodeAssignment {
-							assignNode := stmt.Children[0]
-							if len(assignNode.Children) > 1 && assignNode.Children[1].Type == NodeCompoundLiteral {
-								// This statement expression contains a compound literal assignment
-								// The result will be a pointer, but we're assigning through another pointer
-								// So this is actually *ptr1 = ptr2 (where ptr2 points to the compound literal)
-								// We need to copy the struct data
-								isStructCopy = true
-								structType := assignNode.Children[1].DataType
-								structSize = is.getTypeSize(structType)
-								break
-							}
-						}
-					}
-				}
 			}
 			
 			if isStructCopy && structSize > 0 {
@@ -1965,66 +1942,29 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			argStartIdx = 1 // Regular arguments start at rsi
 		}
 		
-		// To avoid register conflicts, save all arguments to stack temps first
-		savedArgs := make([]*Operand, len(args))
-		for i, arg := range args {
-			// Only save if the arg might conflict (if it's already in a register)
-			if arg.Type == "temp" || arg.Type == "reg" {
-				// Save to stack
-				is.stackOffset -= 8
-				stackLoc := &Operand{Type: "mem", Offset: is.stackOffset}
-				is.emit(OpStore, stackLoc, arg, nil)
-				savedArgs[i] = stackLoc
-			} else {
-				savedArgs[i] = arg
-			}
-		}
-		
-		// Now load arguments into calling convention registers from saved locations
-		// Track separate counters for integer and float registers
+		// Prepare arguments for call
+		// Use OpSetArg which bypasses register allocation
 		intRegIdx := argStartIdx
 		floatRegIdx := 0
 		intRegs := []string{"rdi", "rsi", "rdx", "rcx", "r8", "r9"}
 		floatRegs := []string{"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"}
 		
-		for _, savedArg := range savedArgs {
+		for _, arg := range args {
 			// Determine if this argument is a float
-			isFloat := false
-			if savedArg.Type == "imm" && strings.Contains(savedArg.Value, ".") {
-				isFloat = true
-			}
-			// Also check if DataType indicates float/double
-			if savedArg.DataType == "float" || savedArg.DataType == "double" {
-				isFloat = true
-			}
+			isFloat := arg.DataType == "float" || arg.DataType == "double" ||
+				(arg.Type == "imm" && strings.Contains(arg.Value, "."))
 			
 			if isFloat {
-				// Use XMM register for floats
 				if floatRegIdx < len(floatRegs) {
 					regOp := &Operand{Type: "freg", Value: floatRegs[floatRegIdx]}
 					floatRegIdx++
-					// Load from saved location into XMM register
-					if savedArg.Type == "mem" {
-						tempArg := is.newTemp()
-						is.emit(OpLoad, tempArg, savedArg, nil)
-						is.emit(OpMovFloat, regOp, tempArg, nil)
-					} else {
-						is.emit(OpMovFloat, regOp, savedArg, nil)
-					}
+					is.emit(OpSetArg, regOp, arg, nil)
 				}
 			} else {
-				// Use integer register
 				if intRegIdx < len(intRegs) {
 					regOp := &Operand{Type: "reg", Value: intRegs[intRegIdx]}
 					intRegIdx++
-					// Load from saved location
-					if savedArg.Type == "mem" {
-						tempArg := is.newTemp()
-						is.emit(OpLoad, tempArg, savedArg, nil)
-						is.emit(OpMov, regOp, tempArg, nil)
-					} else {
-						is.emit(OpMov, regOp, savedArg, nil)
-					}
+					is.emit(OpSetArg, regOp, arg, nil)
 				}
 			}
 		}

@@ -391,6 +391,17 @@ func (p *Parser) parseTopLevel() (*ASTNode, error) {
 						p.advance()
 						
 						memberSize := p.getTypeSize(memberType)
+					
+					// Calculate alignment for this member
+					alignment := memberSize
+					if alignment > 8 {
+						alignment = 8  // Max alignment is 8 bytes
+					}
+					
+					// Add padding to align offset
+					if offset%alignment != 0 {
+						offset += alignment - (offset % alignment)
+					}
 						
 						// Handle arrays: int arr[10];
 						if p.match(LBRACKET) {
@@ -434,6 +445,23 @@ func (p *Parser) parseTopLevel() (*ASTNode, error) {
 					return nil, fmt.Errorf("expected } at end of struct")
 				}
 				p.advance()
+				
+				// Calculate struct's alignment (max of all member alignments, capped at 8)
+				structAlignment := 1
+				for _, member := range members {
+					memberAlign := member.Size
+					if memberAlign > 8 {
+						memberAlign = 8
+					}
+					if memberAlign > structAlignment {
+						structAlignment = memberAlign
+					}
+				}
+				
+				// Add padding at end to make struct size a multiple of its alignment
+				if offset%structAlignment != 0 {
+					offset += structAlignment - (offset % structAlignment)
+				}
 				
 				// Store the struct definition
 				p.structs[structName] = &StructDef{
@@ -722,6 +750,17 @@ func (p *Parser) parseStructDef() error {
 			// Calculate actual member size based on type
 			memberSize := p.getTypeSize(memberType)
 			
+			// Calculate alignment for this member
+			alignment := memberSize
+			if alignment > 8 {
+				alignment = 8  // Max alignment is 8 bytes
+			}
+			
+			// Add padding to align currentOffset
+			if currentOffset%alignment != 0 {
+				currentOffset += alignment - (currentOffset % alignment)
+			}
+			
 			// Handle arrays: int arr[10];
 			if p.match(LBRACKET) {
 				p.advance()
@@ -769,6 +808,23 @@ func (p *Parser) parseStructDef() error {
 	}
 	if p.match(SEMICOLON) {
 		p.advance()
+	}
+	
+	// Calculate struct's alignment (max of all member alignments, capped at 8)
+	structAlignment := 1
+	for _, member := range members {
+		memberAlign := member.Size
+		if memberAlign > 8 {
+			memberAlign = 8
+		}
+		if memberAlign > structAlignment {
+			structAlignment = memberAlign
+		}
+	}
+	
+	// Add padding at end to make struct size a multiple of its alignment
+	if currentOffset%structAlignment != 0 {
+		currentOffset += structAlignment - (currentOffset % structAlignment)
 	}
 	
 	// Store struct definition

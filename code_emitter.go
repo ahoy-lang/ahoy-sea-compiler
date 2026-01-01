@@ -373,6 +373,11 @@ func (ce *CodeEmitter) emitInstruction(instr *IRInstruction) {
 		
 	case OpPop:
 		ce.output.WriteString(fmt.Sprintf("    popq %s\n", ce.formatOperand(instr.Dst)))
+		
+	case OpSetArg:
+		// Special handling for setting up function arguments
+		// This bypasses the register allocator to avoid conflicts
+		ce.emitSetArg(instr)
 	}
 }
 
@@ -988,6 +993,21 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 		} else {
 			ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %s\n", src.Value, dstStr))
 		}
+	case "mem":
+		// Load from stack location
+		dstStr := ce.formatOperand(dst)
+		srcStr := ce.formatOperand(src) // This will be offset(%rbp)
+		
+		dstIsMem := strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")")
+		
+		if dstIsMem {
+			// Mem to mem - use intermediate register
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", srcStr))
+			ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+		} else {
+			// Mem to register - direct move
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", srcStr, dstStr))
+		}
 	default:
 		ce.emitMov(dst, src)
 	}
@@ -1162,6 +1182,68 @@ func (ce *CodeEmitter) getFloatLabel(value string) string {
 	label := fmt.Sprintf(".FC%d", ce.floatCounter)
 	ce.floatLits[label] = floatVal
 	return label
+}
+
+func (ce *CodeEmitter) emitSetArg(instr *IRInstruction) {
+	// Set up function argument: move src into dst (argument register)
+	// dst is the argument register (rdi, rsi, etc. or xmm0, xmm1, etc.)
+	// src is the value to pass
+	
+	dstReg := instr.Dst.Value  // e.g., "rdi", "xmm0"
+	src := instr.Src1
+	
+	// Format the destination register
+	dstStr := "%" + dstReg
+	
+	// Check if destination is an XMM register (float)
+	isFloatReg := strings.HasPrefix(dstReg, "xmm")
+	
+	// Handle different source types
+	if isFloatReg {
+		// Moving to float register
+		switch src.Type {
+		case "imm":
+			// Float immediate - load from .rodata
+			label := ce.getFloatLabel(src.Value)
+			ce.output.WriteString(fmt.Sprintf("    movsd %s(%%rip), %s\n", label, dstStr))
+		case "temp", "reg":
+			srcStr := ce.formatOperand(src)
+			if strings.Contains(srcStr, "(") && strings.Contains(srcStr, ")") {
+				// Source is in memory
+				ce.output.WriteString(fmt.Sprintf("    movsd %s, %s\n", srcStr, dstStr))
+			} else {
+				// Source is in a GPR - use movq to move bitwise
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", srcStr, dstStr))
+			}
+		case "mem", "var":
+			srcStr := ce.formatOperand(src)
+			ce.output.WriteString(fmt.Sprintf("    movsd %s, %s\n", srcStr, dstStr))
+		default:
+			srcStr := ce.formatOperand(src)
+			ce.output.WriteString(fmt.Sprintf("    movsd %s, %s\n", srcStr, dstStr))
+		}
+	} else {
+		// Moving to integer register
+		switch src.Type {
+		case "imm":
+			ce.output.WriteString(fmt.Sprintf("    movq $%s, %s\n", src.Value, dstStr))
+		case "temp", "reg":
+			srcStr := ce.formatOperand(src)
+			if strings.Contains(srcStr, "(") && strings.Contains(srcStr, ")") {
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", srcStr, dstStr))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", srcStr, dstStr))
+			}
+		case "mem", "var":
+			srcStr := ce.formatOperand(src)
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", srcStr, dstStr))
+		case "label":
+			ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %s\n", src.Value, dstStr))
+		default:
+			srcStr := ce.formatOperand(src)
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", srcStr, dstStr))
+		}
+	}
 }
 
 // Helper to load a float immediate into a register if needed
