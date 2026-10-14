@@ -194,7 +194,7 @@ func (cp *CompilerPipeline) Compile() error {
 	}
 	start = time.Now()
 	
-	cp.emitter = NewCodeEmitter(cp.ir, cp.selector.stringLits, cp.selector.globalVars)
+	cp.emitter = NewCodeEmitter(cp.ir, cp.selector.stringLits, cp.selector.globalVars, cp.selector.structs, cp.selector.funcIsLocal)
 	cp.assembly = cp.emitter.Emit()
 	
 	if cp.options.Verbose {

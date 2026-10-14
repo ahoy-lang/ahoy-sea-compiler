@@ -24,6 +24,30 @@ type LiveRange struct {
 	Uses    []int
 }
 
+// instrTemps flattens an instruction's operands including nested IndexTemp
+// pointers (e.g. ptr->member address temps, array indices). A temp used only
+// inside a ptr/array operand is still live at this instruction — skipping it
+// let two live temps share one register (segfaults). No opts, just correct.
+func instrTemps(instr *IRInstruction) []*Operand {
+	var out []*Operand
+	var walk func(op *Operand)
+	walk = func(op *Operand) {
+		if op == nil {
+			return
+		}
+		if op.Type == "temp" {
+			out = append(out, op)
+		}
+		if op.IndexTemp != nil {
+			walk(op.IndexTemp)
+		}
+	}
+	walk(instr.Dst)
+	walk(instr.Src1)
+	walk(instr.Src2)
+	return out
+}
+
 func NewRegisterAllocator(instructions []*IRInstruction) *RegisterAllocator {
 	// Available general-purpose registers (excluding RSP, RBP)
 	availableRegs := []int{RAX, RBX, RCX, RDX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15}
@@ -57,15 +81,15 @@ func (ra *RegisterAllocator) Allocate() error {
 
 func (ra *RegisterAllocator) computeLiveRanges() {
 	for i, instr := range ra.instructions {
-		// Record use/def for each operand
-		operands := []*Operand{instr.Dst, instr.Src1, instr.Src2}
-		
+		// Record use/def for each operand (including nested pointer/index temps)
+		operands := instrTemps(instr)
+
 		for _, op := range operands {
 			// Only compute live ranges for temporaries, not variables
 			// Variables stay on the stack and don't need register allocation
-			if op == nil || op.Type != "temp" {
-				continue
-			}
+		if op == nil || op.Type != "temp" {
+			continue
+		}
 			
 			varName := op.Value
 			
@@ -278,13 +302,13 @@ func (lsa *LinearScanAllocator) computeIntervals() {
 	varIntervals := make(map[string]*Interval)
 	
 	for i, instr := range lsa.instructions {
-		operands := []*Operand{instr.Dst, instr.Src1, instr.Src2}
-		
+		operands := instrTemps(instr)
+
 		for _, op := range operands {
 			// Only compute intervals for temporaries, not variables
 			// Variables stay on the stack
 			if op == nil || op.Type != "temp" {
-				continue
+			continue
 			}
 			
 			varName := op.Value

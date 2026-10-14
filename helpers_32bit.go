@@ -42,6 +42,9 @@ func (ce *CodeEmitter) formatOperand32(op *Operand) string {
 		return fmt.Sprintf("%d(%%rbp)", op.Offset)
 	case "var":
 		if op.IsGlobal {
+			if op.Offset != 0 {
+				return fmt.Sprintf("%s+%d(%%rip)", op.Value, op.Offset)
+			}
 			return op.Value + "(%rip)"
 		}
 		return fmt.Sprintf("%d(%%rbp)", op.Offset)
@@ -60,6 +63,15 @@ func (ce *CodeEmitter) formatOperand32(op *Operand) string {
 		if op.IsGlobal {
 			return op.Value + "(%rip)"
 		}
+		return fmt.Sprintf("%d(%%rbp)", op.Offset)
+	case "sarg":
+		// Stack call argument: rsp-relative (valid between StackAlloc/Free).
+		if op.Offset == 0 {
+			return "(%rsp)"
+		}
+		return fmt.Sprintf("%d(%%rsp)", op.Offset)
+	case "prm":
+		// Incoming stack parameter: positive rbp offset (16+8k per SysV).
 		return fmt.Sprintf("%d(%%rbp)", op.Offset)
 	case "ptr":
 		// Dereference - load from address in IndexTemp

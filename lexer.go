@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"unicode"
 )
 
@@ -251,10 +252,28 @@ func (l *Lexer) NextToken() Token {
 	// Numbers
 	if unicode.IsDigit(rune(ch)) {
 		start := l.pos
-		for unicode.IsDigit(rune(l.current())) || l.current() == '.' || l.current() == 'x' || 
-			l.current() == 'X' || (l.current() >= 'a' && l.current() <= 'f') || 
+		for unicode.IsDigit(rune(l.current())) || l.current() == '.' || l.current() == 'x' ||
+			l.current() == 'X' || (l.current() >= 'a' && l.current() <= 'f') ||
 			(l.current() >= 'A' && l.current() <= 'F') {
 			l.advance()
+		}
+		// Decimal exponent: e/E [+-]? digits (e.g. 1e-5). Not for hex
+		// (0xE5's E is a digit) — and a bare trailing e/E stays as-is
+		// only if no digits follow (garbage in, error out downstream).
+		lex := l.source[start:l.pos]
+		isHex := strings.HasPrefix(lex, "0x") || strings.HasPrefix(lex, "0X")
+		if !isHex && len(lex) > 0 && (lex[len(lex)-1] == 'e' || lex[len(lex)-1] == 'E') {
+			// Peek: optional sign then required digit.
+			j := l.pos
+			if j < len(l.source) && (l.source[j] == '+' || l.source[j] == '-') {
+				j++
+			}
+			if j < len(l.source) && unicode.IsDigit(rune(l.source[j])) {
+				for j < len(l.source) && unicode.IsDigit(rune(l.source[j])) {
+					j++
+				}
+				l.pos = j
+			}
 		}
 		// Handle suffixes like L, U, UL, etc.
 		for l.current() == 'L' || l.current() == 'U' || l.current() == 'l' || l.current() == 'u' {

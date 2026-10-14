@@ -43,6 +43,10 @@ const (
 	OpPop
 	OpParam
 	OpSetArg  // Special opcode for setting up function arguments - bypasses register allocator
+	OpStackAlloc // Dst=imm byte count: subq from rsp for stack call args
+	OpStackFree  // Dst=imm byte count: addq back after call
+	OpCvt        // Numeric conversion: Src2=imm mode (f2d,d2f,i2f,i2d,f2i,d2i)
+	OpSetAl      // Dst=imm count: mov to %eax for varargs %al (before call)
 )
 
 type Operand struct {
@@ -80,11 +84,19 @@ type InstructionSelector struct {
 	allLocalVars map[string]*Symbol  // All local variables (with unique keys)
 	globalVars   map[string]*Symbol
 	functions    map[string]*FunctionSignature // Track function signatures
+	funcIsLocal  map[string]bool // static/inline-only functions: no .globl
 	stringLits   map[string]string
 	structs      map[string]*StructDef  // Struct definitions from parser
 	typedefs     map[string]string      // Typedef aliases from parser
 	enums        map[string]int         // Enum constants from parser
-	
+
+	// slotSizes maps frame offsets (negative rbp offsets) to their declared
+	// byte size for the CURRENT function. emit() stamps it onto var/mem
+	// operands so loads/stores use width-correct movs (movl for int).
+	// Without this, 8-byte movq on packed 4-byte locals read/wrote
+	// neighboring variables (infinite loops, corruption). Reset per function.
+	slotSizes    map[int]int
+
 	stackOffset  int
 }
 
@@ -95,10 +107,12 @@ func NewInstructionSelector() *InstructionSelector {
 		allLocalVars: make(map[string]*Symbol),
 		globalVars:   make(map[string]*Symbol),
 		functions:    make(map[string]*FunctionSignature),
+		funcIsLocal:  make(map[string]bool),
 		stringLits:   make(map[string]string),
 		structs:      make(map[string]*StructDef),
 		typedefs:     make(map[string]string),
 		enums:        make(map[string]int),
+		slotSizes:    make(map[int]int),
 	}
 	
 	// Add standard library external symbols
@@ -151,7 +165,426 @@ func (is *InstructionSelector) newLabel(prefix string) string {
 	return fmt.Sprintf("%s_%d", prefix, is.labelCounter)
 }
 
+// cSizeOf maps a basic C type spelling to its LP64 size.
+// ok=false when typ is not a basic type (struct/enum/typedef names).
+// Compile-time only; deliberately exhaustive over common spellings so
+// "long int" and "unsigned long" don't silently become 4.
+func cSizeOf(typ string) (size int, ok bool) {
+	t := strings.TrimSpace(typ)
+	for {
+		changed := false
+		for _, q := range []string{"const ", "static ", "extern ", "volatile ", "register ", "inline "} {
+			if strings.HasPrefix(t, q) {
+				t = strings.TrimSpace(t[len(q):])
+				changed = true
+				break
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	longs := 0
+	var core []string
+	for _, w := range strings.Fields(t) {
+		switch w {
+		case "signed", "unsigned":
+			// no size effect
+		case "long":
+			longs++
+		default:
+			core = append(core, w)
+		}
+	}
+	if longs > 0 {
+		return 8, true // long, long long, long int, unsigned long, ...
+	}
+	if len(core) == 0 {
+		return 4, true // bare "unsigned" / "signed" means int
+	}
+	switch core[0] {
+	case "char":
+		return 1, true
+	case "short":
+		return 2, true
+	case "int":
+		return 4, true
+	case "float":
+		return 4, true
+	case "double":
+		return 8, true
+	case "void":
+		return 0, true
+	case "bool":
+		return 4, true // raylib ABI: bool is a 4-byte enum; matches our mapping
+	}
+	return 0, false
+}
+
+// is64BitIntType reports whether an integer type is 64-bit wide (LP64).
+// Unknown spellings default to 64-bit, matching getTypeSize's default.
+func (is *InstructionSelector) is64BitIntType(t string) bool {
+	t = strings.TrimSpace(is.resolveType(t))
+	if strings.Contains(t, "*") {
+		return true
+	}
+	if s, ok := cSizeOf(t); ok {
+		return s == 8
+	}
+	return true
+}
+
+// isUnsignedIntType reports whether a type is unsigned (after typedef
+// resolution) AND at least int rank. Narrower unsigned types (char, short)
+// promote to signed int under C rules, so they don't trigger unsigned
+// arithmetic. Pointers never count.
+func (is *InstructionSelector) isUnsignedIntType(t string) bool {
+	rt := strings.TrimSpace(is.resolveType(t))
+	if strings.Contains(rt, "*") {
+		return false
+	}
+	hasUnsigned := false
+	for _, w := range strings.Fields(rt) {
+		if w == "unsigned" {
+			hasUnsigned = true
+			break
+		}
+	}
+	if !hasUnsigned {
+		return false
+	}
+	if s, ok := cSizeOf(rt); ok {
+		return s >= 4
+	}
+	return true
+}
+
+// Falls back to 8 for unknown/void (fast default, never 0).
+// cvtMode names the conversion between two types for OpCvt ("" = none).
+// Only float/double/signed-32-bit-int crossings convert; everything else
+// (pointers, same kinds, unknowns) passes through bitwise as before.
+func cvtMode(srcT, dstT string) string {
+	srcF, srcD, srcI := cvtClass(srcT)
+	dstF, dstD, dstI := cvtClass(dstT)
+	if srcF && dstD {
+		return "f2d"
+	}
+	if srcD && dstF {
+		return "d2f"
+	}
+	if srcI && dstF {
+		return "i2f"
+	}
+	if srcI && dstD {
+		return "i2d"
+	}
+	if srcF && dstI {
+		return "f2i"
+	}
+	if srcD && dstI {
+		return "d2i"
+	}
+	return ""
+}
+
+// cvtClass buckets a type for conversions.
+func cvtClass(t string) (isFloat, isDouble, isInt32 bool) {
+	t = strings.TrimSpace(t)
+	if strings.Contains(t, "*") || t == "" {
+		return false, false, false
+	}
+	base := t
+	for _, q := range []string{"const ", "volatile ", "register ", "static ", "extern "} {
+		base = strings.TrimSpace(strings.TrimPrefix(base, q))
+	}
+	if base == "float" {
+		return true, false, false
+	}
+	if base == "double" {
+		return false, true, false
+	}
+	if s, ok := cSizeOf(base); ok && s == 4 {
+		return false, false, true
+	}
+	return false, false, false
+}
+
+func (is *InstructionSelector) elemSizeForPtr(ptrType string) int {
+	t := is.resolveType(strings.TrimSpace(ptrType))
+	if strings.HasSuffix(t, "*") {
+		elem := strings.TrimSpace(strings.TrimSuffix(t, "*"))
+		if strings.HasSuffix(elem, "*") {
+			return 8 // pointer elements
+		}
+		if s := is.getTypeSize(elem); s > 0 {
+			return s
+		}
+	}
+	return 8
+}
+
+// structDefFor returns the struct definition for an ELEMENT type, or nil.
+// The argument must already be one level down (arrayElemSize element type,
+// or a pointer type with exactly one level trimmed): any remaining star
+// means pointer elements (value-load), a bare struct name means struct
+// elements (address-yielding).
+func (is *InstructionSelector) structDefFor(elemType string) *StructDef {
+	t := is.resolveType(strings.TrimSpace(elemType))
+	for _, q := range []string{"const ", "volatile ", "static ", "extern "} {
+		t = strings.TrimSpace(strings.TrimPrefix(t, q))
+	}
+	if strings.Contains(t, "*") {
+		return nil // pointer (or deeper) elements: load the value
+	}
+	t = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(t, "struct "), "union "))
+	t = strings.TrimSpace(t)
+	if t == "" {
+		return nil
+	}
+	if def, ok := is.structs[t]; ok {
+		return def
+	}
+	return nil
+}
+
+// funcHasWord reports whether a type string contains a storage word.
+func funcHasWord(typ, word string) bool {
+	for _, w := range strings.Fields(typ) {
+		if w == word {
+			return true
+		}
+	}
+	return false
+}
+
+// arrayElemSize returns the element size for indexing an array/pointer
+// variable: declared element type for true arrays, pointee type otherwise.
+func (is *InstructionSelector) arrayElemSize(sym *Symbol) (elemType string, elemSize int) {
+	if sym.ArraySize > 0 {
+		if s := is.getTypeSize(sym.Type); s > 0 {
+			return sym.Type, s
+		}
+		return sym.Type, 8
+	}
+	t := is.resolveType(strings.TrimSpace(sym.Type))
+	if strings.HasSuffix(t, "*") {
+		elem := strings.TrimSpace(strings.TrimSuffix(t, "*"))
+		if !strings.HasSuffix(elem, "*") {
+			if s := is.getTypeSize(elem); s > 0 {
+				return elem, s
+			}
+		}
+		return elem, 8
+	}
+	return sym.Type, 8
+}
+
+// lvalueAddrSize materializes the address of an assignable location
+// (struct member, dereference, array element) into a temp, plus the access
+// size. ok=false means "not an lvalue we address" (caller falls through).
+// Direct codegen, no optimization — mirrors the load paths.
+func (is *InstructionSelector) lvalueAddrSize(target *ASTNode) (addr *Operand, size int, ok bool, err error) {
+	switch target.Type {
+	case NodeMemberAccess:
+		if len(target.Children) < 1 {
+			return nil, 0, false, nil
+		}
+		baseNode := target.Children[0]
+		memberName := target.MemberName
+		isPtr := target.IsPointer
+		// Resolve struct + member via identifier base when possible.
+		var structType string
+		var baseTemp *Operand
+		var baseIsIdent bool
+		var baseVar string
+		var baseGlobal bool
+		var baseOff int
+		if baseNode.Type == NodeIdentifier {
+			baseIsIdent = true
+			baseVar = baseNode.VarName
+			if sym, found := is.localVars[baseVar]; found {
+				structType = sym.Type
+				baseOff = sym.Offset
+			} else if sym, found := is.globalVars[baseVar]; found {
+				structType = sym.Type
+				baseGlobal = true
+			} else {
+			return nil, 0, false, fmt.Errorf("undefined variable: %s", baseVar)
+			}
+		} else {
+			bt, berr := is.selectExpression(baseNode)
+			if berr != nil {
+				return nil, 0, false, berr
+			}
+			baseTemp = bt
+			structType = bt.DataType
+			if structType == "" {
+				structType = baseNode.DataType
+			}
+		}
+		structType = is.resolveType(structType)
+		structName := structType
+		for len(structName) > 0 && structName[len(structName)-1] == '*' {
+			structName = structName[:len(structName)-1]
+		}
+		structName = strings.TrimSpace(structName)
+		for _, q := range []string{"const ", "volatile ", "static ", "extern "} {
+			structName = strings.TrimSpace(strings.TrimPrefix(structName, q))
+		}
+		if len(structName) > 7 && structName[:7] == "struct " {
+			structName = structName[7:]
+		} else if len(structName) > 6 && structName[:6] == "union " {
+			structName = structName[6:]
+		}
+		structName = strings.TrimSpace(structName)
+		structDef, found := is.structs[structName]
+		if !found {
+			return nil, 0, false, nil
+		}
+		memberOffset := -1
+		memberSize := 8
+		for _, m := range structDef.Members {
+			if m.Name == memberName {
+				memberOffset = m.Offset
+				memberSize = m.Size
+				break
+			}
+		}
+		if memberOffset == -1 {
+			return nil, 0, false, nil
+		}
+		if !isPtr && baseIsIdent && !baseGlobal {
+			// Local struct member: address is a pure stack offset.
+			res := is.newTemp()
+			is.emit(OpLoadAddr, res, &Operand{Type: "var", Value: baseVar, Offset: baseOff + memberOffset}, nil)
+			return res, memberSize, true, nil
+		}
+		// Pointer/global/complex base: derive address then add member offset.
+		var ptrTemp *Operand
+		if baseIsIdent {
+			if isPtr {
+				// p->m: need the pointer VALUE.
+				ptrTemp = is.newTemp()
+				if baseGlobal {
+					is.emit(OpLoad, ptrTemp, &Operand{Type: "var", Value: baseVar, IsGlobal: true}, nil)
+				} else {
+					is.emit(OpLoad, ptrTemp, &Operand{Type: "var", Value: baseVar, Offset: baseOff}, nil)
+				}
+			} else if baseGlobal {
+				// g.m: address of the global struct.
+				ptrTemp = is.newTemp()
+				is.emit(OpLoadAddr, ptrTemp, &Operand{Type: "var", Value: baseVar, IsGlobal: true}, nil)
+			} else {
+				// Should have been handled by the local fast path above,
+				// but stay correct if reached.
+				ptrTemp = is.newTemp()
+				is.emit(OpLoadAddr, ptrTemp, &Operand{Type: "var", Value: baseVar, Offset: baseOff}, nil)
+			}
+		} else {
+			ptrTemp = baseTemp
+		}
+		if !isPtr && !baseIsIdent {
+			// dot on a complex base value (not addressable) — give up.
+			return nil, 0, false, nil
+		}
+		if memberOffset != 0 {
+			addRes := is.newTemp()
+			is.emit(OpAdd, addRes, ptrTemp, &Operand{Type: "imm", Value: fmt.Sprintf("%d", memberOffset)})
+			ptrTemp = addRes
+		}
+		return ptrTemp, memberSize, true, nil
+	case NodeUnaryOp:
+		if target.Operator != "*" || len(target.Children) < 1 {
+			return nil, 0, false, nil
+		}
+		ptr, perr := is.selectExpression(target.Children[0])
+		if perr != nil {
+			return nil, 0, false, perr
+		}
+		return ptr, 8, true, nil
+	case NodeArrayAccess:
+		if len(target.Children) < 2 {
+			return nil, 0, false, nil
+		}
+		baseNode := target.Children[0]
+		index, ierr := is.selectExpression(target.Children[1])
+		if ierr != nil {
+			return nil, 0, false, ierr
+		}
+		if baseNode.Type == NodeIdentifier {
+			var sym *Symbol
+			if s, found := is.localVars[baseNode.VarName]; found {
+				sym = s
+			} else if s, found := is.globalVars[baseNode.VarName]; found {
+				sym = s
+			} else {
+				return nil, 0, false, fmt.Errorf("undefined array: %s", baseNode.VarName)
+			}
+			_, elemSize := is.arrayElemSize(sym)
+			byteOff := is.newTemp()
+			is.emit(OpMul, byteOff, index, &Operand{Type: "imm", Value: fmt.Sprintf("%d", elemSize)})
+			if !strings.Contains(sym.Type, "*") && sym.ArraySize > 0 {
+				// True local/global array: address from its base.
+				var baseAddr *Operand
+				if sym.IsGlobal {
+					baseAddr = is.newTemp()
+					is.emit(OpLoadAddr, baseAddr, &Operand{Type: "var", Value: baseNode.VarName, IsGlobal: true}, nil)
+				} else {
+					baseAddr = is.newTemp()
+					is.emit(OpLoadAddr, baseAddr, &Operand{Type: "var", Value: baseNode.VarName, Offset: sym.Offset}, nil)
+				}
+				finalAddr := is.newTemp()
+				is.emit(OpAdd, finalAddr, baseAddr, byteOff)
+				return finalAddr, elemSize, true, nil
+			}
+			// Pointer variable: load value, add byte offset.
+			baseAddr, berr := is.selectExpression(baseNode)
+			if berr != nil {
+				return nil, 0, false, berr
+			}
+			finalAddr := is.newTemp()
+			is.emit(OpAdd, finalAddr, baseAddr, byteOff)
+			return finalAddr, elemSize, true, nil
+		}
+		// Complex base: evaluate, derive stride from pointer type.
+		baseAddr, berr := is.selectExpression(baseNode)
+		if berr != nil {
+			return nil, 0, false, berr
+		}
+		elemSize := is.elemSizeForPtr(baseAddr.DataType)
+		byteOff := is.newTemp()
+		is.emit(OpMul, byteOff, index, &Operand{Type: "imm", Value: fmt.Sprintf("%d", elemSize)})
+		finalAddr := is.newTemp()
+		is.emit(OpAdd, finalAddr, baseAddr, byteOff)
+		return finalAddr, elemSize, true, nil
+	}
+	return nil, 0, false, nil
+}
+
 func (is *InstructionSelector) emit(op OpCode, dst, src1, src2 *Operand) {
+	// Stamp declared widths onto frame operands: any var/mem operand with
+	// no explicit Size that addresses the current frame (negative offset)
+	// gets the declared slot size, so the emitter uses movl/movw/movb for
+	// sub-8-byte locals instead of 8-byte movq (which read/wrote neighbors).
+	for _, op := range []*Operand{dst, src1, src2} {
+		if op == nil || op.Size != 0 {
+			continue
+		}
+		if op.IsGlobal {
+			// Globals: size from the symbol table (skip zero-size junk).
+			if (op.Type == "var" || op.Type == "mem") && op.Value != "" {
+				if sym, ok := is.globalVars[op.Value]; ok && sym.Size > 0 && sym.Size < 8 {
+					op.Size = sym.Size
+				}
+			}
+			continue
+		}
+		if (op.Type == "var" || op.Type == "mem") && op.Offset < 0 {
+			if sz, ok := is.slotSizes[op.Offset]; ok && sz > 0 {
+				op.Size = sz
+			}
+		}
+	}
 	is.instructions = append(is.instructions, &IRInstruction{
 		Op:   op,
 		Dst:  dst,
@@ -209,24 +642,10 @@ func (is *InstructionSelector) getTypeSizeHelper(typ string, visited map[string]
 	}
 	
 	// Basic types
-	switch typ {
-	case "char", "signed char", "unsigned char":
-		return 1
-	case "short", "short int", "signed short", "unsigned short":
-		return 2
-	case "int", "signed int", "unsigned int", "long", "signed long", "unsigned long":
-		return 4
-	case "long long", "signed long long", "unsigned long long":
-		return 8
-	case "float":
-		return 4
-	case "double":
-		return 8
-	case "void":
-		return 0
-	default:
-		return 8
+	if s, ok := cSizeOf(typ); ok {
+		return s
 	}
+	return 8
 }
 
 // isLargeStruct returns true if the type is a struct larger than 16 bytes
@@ -285,6 +704,14 @@ func (is *InstructionSelector) isLargeStructHelper(typ string, visited map[strin
 // resolveType resolves typedef aliases to actual struct names
 // Handles pointers by stripping them before resolution and re-adding after
 func (is *InstructionSelector) resolveType(typ string) string {
+	// Leading qualifiers don't affect identity/size; strip them so
+	// "const struct Foo" resolves like "struct Foo".
+	typ = strings.TrimSpace(typ)
+	for _, q := range []string{"const ", "volatile ", "static ", "extern ", "register "} {
+		if strings.HasPrefix(typ, q) {
+			typ = strings.TrimSpace(strings.TrimPrefix(typ, q))
+		}
+	}
 	// Count and strip pointers
 	pointerCount := 0
 	for len(typ) > 0 && typ[len(typ)-1] == '*' {
@@ -333,6 +760,14 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 			ReturnType: node.ReturnType,
 			ParamTypes: node.ParamTypes,
 		}
+		// static and plain-inline definitions get internal linkage (no
+		// .globl): otherwise headers like raymath.h multiply-define them
+		// at link time against their library copies. extern (incl. extern
+		// inline, which requests an instance) stays global.
+		if funcHasWord(node.ReturnType, "static") ||
+			(funcHasWord(node.ReturnType, "inline") && !funcHasWord(node.ReturnType, "extern")) {
+			is.funcIsLocal[node.Name] = true
+		}
 		
 		// Skip external function declarations (no body)
 		if node.Children == nil || len(node.Children) == 0 {
@@ -345,6 +780,7 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 		is.allLocalVars = make(map[string]*Symbol)
 		is.stackOffset = 0
 		is.varCounter = 0  // Reset counter for each function
+		is.slotSizes = make(map[int]int)
 		
 		// Emit function label
 		is.emit(OpLabel, &Operand{Type: "label", Value: node.Name}, nil, nil)
@@ -382,6 +818,14 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 			if i < len(node.ParamTypes) {
 				paramType = node.ParamTypes[i]
 			}
+			// Width-correct slot: int params occupy 4 bytes (see slotSizes).
+			paramSize := 8
+			if paramType != "" {
+				if s := is.getTypeSize(paramType); s > 0 {
+					paramSize = s
+				}
+			}
+			is.slotSizes[is.stackOffset] = paramSize
 			is.localVars[param] = &Symbol{
 				Name:   param,
 				Type:   paramType,
@@ -397,6 +841,11 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 				argReg := &Operand{Type: "reg", Value: argRegs[regIdx]}
 				paramOp := &Operand{Type: "mem", Offset: is.stackOffset}
 				is.emit(OpStore, paramOp, argReg, nil)
+			} else {
+				// Stack parameter per SysV: 16(%rbp) + 8k (ret addr + saved rbp).
+				prmOp := &Operand{Type: "prm", Offset: 16 + (regIdx-len(argRegs))*8}
+				paramOp := &Operand{Type: "mem", Offset: is.stackOffset}
+				is.emit(OpLoad, paramOp, prmOp, nil)
 			}
 		}
 		
@@ -440,6 +889,11 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 			} else if structDef, ok := is.structs[structName]; ok {
 				varSize = structDef.Size
 			}
+		} else if s := is.getTypeSize(dataType); s > 0 {
+			// Scalar/typedef/pointer: real width (int -> 4, not 8).
+			// Packed 4-byte locals keep neighbors out of 8-byte movs
+			// now that accesses are width-correct (see slotSizes).
+			varSize = s
 		}
 		
 		if node.ArraySize > 0 {
@@ -447,12 +901,19 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 		}
 		
 		if node.IsGlobal {
+			isStatic := strings.HasPrefix(strings.TrimSpace(node.DataType), "static")
 			is.globalVars[node.VarName] = &Symbol{
 				Name:      node.VarName,
 				IsGlobal:  true,
+				IsStatic:  isStatic,
 				Size:      varSize,
 				ArraySize: node.ArraySize,
 				Type:      dataType,
+			}
+			// Keep constant initializers (e.g. = 5): the emitter places
+			// them in .data instead of zeroed .comm.
+			if len(node.Children) > 0 && node.ArraySize == 0 {
+				is.globalVars[node.VarName].Init = node.Children[0]
 			}
 		} else {
 			is.stackOffset -= varSize
@@ -475,6 +936,7 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 			// - localVars tracks current binding (for lookups)
 			is.allLocalVars[uniqueKey] = sym
 			is.localVars[node.VarName] = sym
+			is.slotSizes[varOffset] = varSize
 			
 			// Handle initialization (only for non-arrays for now)
 			if len(node.Children) > 0 && node.ArraySize == 0 {
@@ -524,9 +986,86 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 					if err != nil {
 						return err
 					}
-					
+
 					varOp := &Operand{Type: "var", Value: node.VarName, Offset: varOffset, Size: varSize}
 					is.emit(OpStore, varOp, result, nil)
+				}
+			}
+
+			// Array initialization: T arr[N] = {e0, e1, ...} where elements
+			// may be nested struct literals (raymath-style tables).
+			if len(node.Children) > 0 && node.ArraySize > 0 {
+				initExpr := node.Children[0]
+				if initExpr.Type == NodeCompoundLiteral {
+					elemSize := varSize / node.ArraySize
+					if elemSize <= 0 {
+						elemSize = 8
+					}
+					for i, elem := range initExpr.Children {
+						if i >= node.ArraySize {
+							break
+						}
+						// Value FIRST so no address temp spans its codegen
+						// (emitter scratch would clobber a shared register).
+						if elem.Type == NodeCompoundLiteral {
+							srcAddr, serr := is.selectExpression(elem)
+							if serr != nil {
+								return serr
+							}
+							// Recompute the element address AFTER the value:
+							// short-lived and consumed immediately.
+							baseAddr := is.newTemp()
+							is.emit(OpLoadAddr, baseAddr, &Operand{Type: "var", Value: node.VarName, Offset: varOffset}, nil)
+							elemAddr := is.newTemp()
+							if i > 0 {
+								offOp := &Operand{Type: "imm", Value: fmt.Sprintf("%d", i*elemSize)}
+								is.emit(OpAdd, elemAddr, baseAddr, offOp)
+							} else {
+								is.emit(OpMov, elemAddr, baseAddr, nil)
+							}
+							// Copy elemSize bytes, width-aware tail.
+							for off := 0; off < elemSize; {
+								chunk := 8
+								if elemSize-off < 8 {
+									chunk = elemSize - off
+								}
+								srcTemp := is.newTemp()
+								srcOp := &Operand{Type: "ptr", IndexTemp: srcAddr, Size: chunk}
+								dstOp := &Operand{Type: "ptr", IndexTemp: elemAddr, Size: chunk}
+								if off > 0 {
+									offOp := &Operand{Type: "imm", Value: fmt.Sprintf("%d", off)}
+									srcA := is.newTemp()
+									is.emit(OpAdd, srcA, srcAddr, offOp)
+									srcOp.IndexTemp = srcA
+									dstA := is.newTemp()
+									is.emit(OpAdd, dstA, elemAddr, offOp)
+									dstOp.IndexTemp = dstA
+								}
+								is.emit(OpLoad, srcTemp, srcOp, nil)
+								is.emit(OpStore, dstOp, srcTemp, nil)
+								off += chunk
+							}
+						} else {
+							v, verr := is.selectExpression(elem)
+							if verr != nil {
+								return verr
+							}
+							baseAddr := is.newTemp()
+							is.emit(OpLoadAddr, baseAddr, &Operand{Type: "var", Value: node.VarName, Offset: varOffset}, nil)
+							elemAddr := is.newTemp()
+							if i > 0 {
+								offOp := &Operand{Type: "imm", Value: fmt.Sprintf("%d", i*elemSize)}
+								is.emit(OpAdd, elemAddr, baseAddr, offOp)
+							} else {
+								is.emit(OpMov, elemAddr, baseAddr, nil)
+							}
+							storeOp := &Operand{Type: "ptr", IndexTemp: elemAddr, Size: elemSize}
+							if elemSize > 8 {
+								storeOp.Size = 0
+							}
+							is.emit(OpStore, storeOp, v, nil)
+						}
+					}
 				}
 			}
 		}
@@ -640,10 +1179,15 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 		is.emit(OpLabel, &Operand{Type: "label", Value: endLabel}, nil, nil)
 		
 	case NodeFor:
-		// Parse for loop structure
-		idx := 0
+		// Explicit slots from the parser (no positional guessing: omitted
+		// init/cond/incr used to shift children and misclassify, e.g. a bare
+		// `i = 0` init made the condition run as the body forever).
 		var init, cond, incr, body *ASTNode
-		
+		if node.ForBody != nil || node.ForInit != nil || node.ForCond != nil || node.ForIncr != nil {
+			init, cond, incr, body = node.ForInit, node.ForCond, node.ForIncr, node.ForBody
+		} else {
+		// Legacy positional shape (not produced by the current parser).
+		idx := 0
 		if idx < len(node.Children) {
 			// Determine what we have
 			if node.Children[idx].Type == NodeVarDecl || node.Children[idx].Type == NodeExprStmt {
@@ -667,7 +1211,8 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 		if idx < len(node.Children) {
 			body = node.Children[idx]
 		}
-		
+		}
+
 		// Generate code
 		if init != nil {
 			is.selectNode(init)
@@ -822,12 +1367,26 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		}
 		
 		if sym, ok := is.localVars[node.VarName]; ok {
+			if sym.ArraySize > 0 {
+				// Array decays to pointer-to-first-element (C semantics).
+				// Loading the "value" would read element bytes as an address.
+				addr := is.newTemp()
+				addr.DataType = sym.Type + "*"
+				is.emit(OpLoadAddr, addr, &Operand{Type: "var", Value: node.VarName, Offset: sym.Offset}, nil)
+				return addr, nil
+			}
 			temp := is.newTemp()
 			temp.DataType = sym.Type
 			varOp := &Operand{Type: "var", Value: node.VarName, Offset: sym.Offset}
 			is.emit(OpLoad, temp, varOp, nil)
 			return temp, nil
 		} else if sym, ok := is.globalVars[node.VarName]; ok {
+			if sym.ArraySize > 0 {
+				addr := is.newTemp()
+			addr.DataType = sym.Type + "*"
+			is.emit(OpLoadAddr, addr, &Operand{Type: "var", Value: node.VarName, IsGlobal: true}, nil)
+			return addr, nil
+			}
 			temp := is.newTemp()
 			temp.DataType = sym.Type
 			varOp := &Operand{Type: "var", Value: node.VarName, IsGlobal: true}
@@ -852,12 +1411,56 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		}
 		
 		result := is.newTemp()
-		
+
 		// Propagate type: if either operand is float/double, result is float/double
 		if left.DataType == "double" || right.DataType == "double" {
 			result.DataType = "double"
 		} else if left.DataType == "float" || right.DataType == "float" {
 			result.DataType = "float"
+		} else if (node.Operator == "/" || node.Operator == "%") &&
+			!strings.Contains(left.DataType, "*") && !strings.Contains(right.DataType, "*") {
+			// Integer division: full C usual conversions (LP64).
+			// Width AND signedness decide the instruction (div vs idiv,
+			// 32 vs 64 bit). Operands are rewritten to the canonical type
+			// so the emitter only needs spelling checks. Single-use temps
+			// make this safe (no other instruction reads them).
+			lU := is.isUnsignedIntType(left.DataType)
+			rU := is.isUnsignedIntType(right.DataType)
+			l64 := is.is64BitIntType(left.DataType)
+			r64 := is.is64BitIntType(right.DataType)
+			var divT string
+			if l64 || r64 {
+				if lU || rU {
+					divT = "unsigned long"
+				} else {
+					divT = "long"
+				}
+			} else if lU || rU {
+				if lU {
+					divT = left.DataType
+				} else {
+					divT = right.DataType
+				}
+			} else if left.DataType != "" {
+				divT = left.DataType
+			} else {
+				divT = right.DataType
+			}
+			result.DataType = divT
+			// Canonicalize sides for 64-bit ops (32-bit movl/divl would
+			// truncate). 32-bit sides are already spelled correctly.
+			if l64 || r64 {
+				left.DataType = divT
+				right.DataType = divT
+			}
+		} else if !strings.Contains(left.DataType, "*") && !strings.Contains(right.DataType, "*") &&
+			(is.isUnsignedIntType(left.DataType) || is.isUnsignedIntType(right.DataType)) {
+			// Other operators: unsigned wins for the result type only.
+			if is.isUnsignedIntType(left.DataType) {
+				result.DataType = left.DataType
+			} else {
+				result.DataType = right.DataType
+			}
 		} else if left.DataType != "" {
 			result.DataType = left.DataType
 		} else if right.DataType != "" {
@@ -923,22 +1526,27 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			if node.Children[0].Type == NodeIdentifier {
 				varName := node.Children[0].VarName
 				var varOp *Operand
-				
+				var varType string
+
 				if sym, ok := is.localVars[varName]; ok {
 					varOp = &Operand{Type: "var", Value: varName, Offset: sym.Offset}
-				} else if _, ok := is.globalVars[varName]; ok {
+					varType = sym.Type
+				} else if sym, ok := is.globalVars[varName]; ok {
 					varOp = &Operand{Type: "var", Value: varName, IsGlobal: true}
+					varType = sym.Type
 				} else {
 					return nil, fmt.Errorf("undefined variable: %s", varName)
 				}
-				
+
 				// Load current value
 				currentVal := is.newTemp()
+				currentVal.DataType = varType
 				is.emit(OpLoad, currentVal, varOp, nil)
-				
+
 				// Compute new value
 				one := &Operand{Type: "imm", Value: "1"}
 				newVal := is.newTemp()
+				newVal.DataType = varType
 				
 				if node.Operator == "++" || node.Operator == "++_post" {
 					is.emit(OpAdd, newVal, currentVal, one)
@@ -960,14 +1568,78 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			}
 			// Fallthrough for complex expressions
 		}
+
+		// Complex-lvalue ++/-- (ptr->m, s.m, *p, a[i]): address it, load,
+		// add/sub, store back. The old fallthrough incremented a temp and
+		// dropped it (e.g. arr->length++ was a no-op). Direct/fast, no pass.
+		if (node.Operator == "++" || node.Operator == "--" ||
+			node.Operator == "++_post" || node.Operator == "--_post") &&
+			len(node.Children) > 0 {
+			if addrOp, size, ok, lerr := is.lvalueAddrSize(node.Children[0]); lerr != nil {
+				return nil, lerr
+			} else if ok {
+				cur := is.newTemp()
+				is.emit(OpLoad, cur, &Operand{Type: "ptr", IndexTemp: addrOp, Size: size}, nil)
+				one := &Operand{Type: "imm", Value: "1"}
+				newV := is.newTemp()
+				if node.Operator == "++" || node.Operator == "++_post" {
+					is.emit(OpAdd, newV, cur, one)
+				} else {
+					is.emit(OpSub, newV, cur, one)
+				}
+				is.emit(OpStore, &Operand{Type: "ptr", IndexTemp: addrOp, Size: size}, newV, nil)
+				if node.Operator == "++" || node.Operator == "--" {
+					return newV, nil
+				}
+				return cur, nil
+			}
+		}
 		
+		// Fast path for & (address-of): materialize to a temp via leaq
+		// so downstream never sees symbolic "addr" operands. No opts, just direct.
+		if node.Operator == "&" {
+			child := node.Children[0]
+		// &*p == p
+			if child.Type == NodeUnaryOp && child.Operator == "*" && len(child.Children) > 0 {
+				return is.selectExpression(child.Children[0])
+		}
+			// &ident
+			if child.Type == NodeIdentifier {
+				varName := child.VarName
+				// &func == function address (for callbacks).
+				if _, isFunc := is.functions[varName]; isFunc {
+						return &Operand{Type: "label", Value: varName}, nil
+				}
+				addrResult := is.newTemp()
+				if sym, ok := is.localVars[varName]; ok {
+					is.emit(OpLoadAddr, addrResult, &Operand{Type: "var", Value: varName, Offset: sym.Offset}, nil)
+					addrResult.DataType = sym.Type + "*"
+					return addrResult, nil
+				} else if sym, ok := is.globalVars[varName]; ok {
+					is.emit(OpLoadAddr, addrResult, &Operand{Type: "var", Value: varName, IsGlobal: true}, nil)
+					addrResult.DataType = sym.Type + "*"
+					return addrResult, nil
+				}
+				return nil, fmt.Errorf("undefined variable: %s", varName)
+		}
+		// &member / &array-element: share the lvalue address helper.
+		if child.Type == NodeMemberAccess || child.Type == NodeArrayAccess {
+			if addrOp, _, ok, lerr := is.lvalueAddrSize(child); lerr != nil {
+				return nil, lerr
+			} else if ok {
+				return addrOp, nil
+			}
+		}
+			return nil, fmt.Errorf("& operator on complex expression not yet supported (type=%d)", child.Type)
+		}
+
 		operand, err := is.selectExpression(node.Children[0])
 		if err != nil {
 			return nil, err
 		}
-		
+
 		result := is.newTemp()
-		
+
 		switch node.Operator {
 		case "-":
 			is.emit(OpNeg, result, operand, nil)
@@ -998,28 +1670,21 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			one := &Operand{Type: "imm", Value: "1"}
 			is.emit(OpSub, operand, operand, one)
 		case "&":
-			// Address-of operator
-			if node.Children[0].Type != NodeIdentifier {
-				return nil, fmt.Errorf("& operator requires identifier")
-			}
-			varName := node.Children[0].VarName
-			if sym, ok := is.localVars[varName]; ok {
-				// Return address of local variable (rbp + offset)
-				result.Type = "addr"
-				result.Value = varName
-				result.Offset = sym.Offset
-			} else if _, ok := is.globalVars[varName]; ok {
-				result.Type = "addr"
-				result.Value = varName
-				result.IsGlobal = true
-			} else {
-				return nil, fmt.Errorf("undefined variable: %s", varName)
-			}
-			return result, nil
+			// Handled by fast path above; should never reach here.
+			return nil, fmt.Errorf("& operator should have been handled by fast path")
 		case "*":
-			// Dereference operator - load from pointer
-			// operand contains the address, load from it
-			is.emit(OpLoad, result, &Operand{Type: "ptr", Value: operand.Value, IndexTemp: operand}, nil)
+			// Dereference operator - load from pointer, width from pointee
+			// type (a char* deref must be movzbl, not 8-byte movq, or
+			// string loops read past NUL into garbage).
+			derefSize := 0
+			if operand.DataType != "" && strings.HasSuffix(operand.DataType, "*") {
+				derefSize = is.elemSizeForPtr(operand.DataType)
+			}
+			ptrOp := &Operand{Type: "ptr", Value: operand.Value, IndexTemp: operand}
+			if derefSize > 0 && derefSize < 8 {
+				ptrOp.Size = derefSize
+			}
+			is.emit(OpLoad, result, ptrOp, nil)
 			
 			// If operand has type info like "Type*", result should be "Type"
 			if operand.DataType != "" && strings.HasSuffix(operand.DataType, "*") {
@@ -1066,19 +1731,17 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				return nil, fmt.Errorf("undefined array: %s", varName)
 			}
 			
-			// Determine element type and size
-			var elementType string
-			var elementSize int
-			
-			if strings.Contains(varType, "*") {
-				// Pointer type - element is what it points to
-				elementType = strings.TrimSuffix(strings.TrimSpace(varType), "*")
-				elementSize = is.getTypeSize(elementType)
-			} else {
-				// Array type - for now assume 8-byte elements
-				elementType = varType
-				elementSize = 8
+			// Determine element type and size from the declaration
+			// (true array -> element type; pointer -> pointee type).
+			var arrSym *Symbol
+			if sym, ok := is.localVars[varName]; ok {
+				s := sym
+				arrSym = s
+			} else if sym, ok := is.globalVars[varName]; ok {
+				s := sym
+				arrSym = s
 			}
+			elementType, elementSize := is.arrayElemSize(arrSym)
 			
 			// Calculate byte offset: index * elementSize
 			elementSizeOp := &Operand{Type: "imm", Value: fmt.Sprintf("%d", elementSize)}
@@ -1104,20 +1767,40 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				ptrOp := &Operand{
 					Type:      "ptr",
 					IndexTemp: finalAddr,
+					Size:      elementSize,
 					DataType:  elementType,
 				}
 				is.emit(OpLoad, result, ptrOp, nil)
 				return result, nil
 			}
 			
+			// Struct elements are address-yielding lvalues (a value load
+			// would truncate to 8 bytes and member access would treat
+			// those bytes as a pointer).
+			if is.structDefFor(elementType) != nil {
+				baseAddr := is.newTemp()
+				if isGlobal {
+					is.emit(OpLoadAddr, baseAddr, &Operand{Type: "var", Value: varName, IsGlobal: true}, nil)
+				} else {
+					is.emit(OpLoadAddr, baseAddr, &Operand{Type: "var", Value: varName, Offset: baseOffset}, nil)
+				}
+				finalAddr := is.newTemp()
+				finalAddr.DataType = elementType + "*"
+				is.emit(OpAdd, finalAddr, baseAddr, byteOffset)
+				return finalAddr, nil
+			}
+
 			// Use the optimized array access path for actual arrays
 			result := is.newTemp()
+			result.DataType = elementType
 			arrayOp := &Operand{
 				Type:      "array",
 				Value:     varName,
 				Offset:    baseOffset,
 				IsGlobal:  isGlobal,
 				IndexTemp: byteOffset,
+				Size:      elementSize,
+				DataType:  elementType,
 			}
 			is.emit(OpLoad, result, arrayOp, nil)
 			return result, nil
@@ -1128,22 +1811,33 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			if err != nil {
 				return nil, err
 			}
-			
-			// For complex expressions, assume 8-byte elements for now
-			// TODO: Determine actual element size from baseAddr type
-			elementSizeOp := &Operand{Type: "imm", Value: "8"}
+
+			// Element size comes from the pointer type (e.g. enum* -> 4).
+			// Hardcoding 8 here overflowed realloc'd buffers (heap corruption).
+			elemSize := is.elemSizeForPtr(baseAddr.DataType)
+			elementSizeOp := &Operand{Type: "imm", Value: fmt.Sprintf("%d", elemSize)}
 			byteOffset := is.newTemp()
 			is.emit(OpMul, byteOffset, index, elementSizeOp)
-			
+
 			// Add base address + offset
 			finalAddr := is.newTemp()
 			is.emit(OpAdd, finalAddr, baseAddr, byteOffset)
-			
+
+			elemType := strings.TrimSuffix(strings.TrimSpace(is.resolveType(baseAddr.DataType)), "*")
+			if is.structDefFor(elemType) != nil {
+				// Struct elements yield their address (see true-array path).
+				finalAddr.DataType = elemType + "*"
+				return finalAddr, nil
+			}
+
 			// Load from the computed address
 			result := is.newTemp()
+			result.DataType = elemType
 			ptrOp := &Operand{
 				Type:      "ptr",
 				IndexTemp: finalAddr,
+				Size:      elemSize,
+				DataType:  result.DataType,
 			}
 			is.emit(OpLoad, result, ptrOp, nil)
 			return result, nil
@@ -1236,17 +1930,20 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		
 		// Resolve typedef aliases to actual struct types
 		structType = is.resolveType(structType)
-		
+
 		// Extract struct name from type (e.g., "struct Point*" -> "Point")
 		structName := structType
 		origStructType := structType  // Save for error reporting
-		
+
 		// Strip pointers
 		for len(structName) > 0 && structName[len(structName)-1] == '*' {
 			structName = structName[:len(structName)-1]
 		}
 		structName = strings.TrimSpace(structName)
-		
+		for _, q := range []string{"const ", "volatile ", "static ", "extern "} {
+			structName = strings.TrimSpace(strings.TrimPrefix(structName, q))
+		}
+
 		// Strip "struct " or "union " prefix
 		if len(structName) > 7 && structName[:7] == "struct " {
 			structName = structName[7:]
@@ -1611,35 +2308,74 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			if err != nil {
 				return nil, err
 			}
-			
-			// Calculate byte offset: index * 8
-			elementSize := &Operand{Type: "imm", Value: "8"}
-			byteOffset := is.newTemp()
-			is.emit(OpMul, byteOffset, index, elementSize)
+
+			// Stride comes from the declaration (see arrayElemSize).
+			// For complex bases the symbol is unknown here; that branch
+			// recomputes from the pointer type after evaluating base.
+			stElemSize := 8
+			if baseNode.Type == NodeIdentifier {
+				if sym, ok := is.localVars[baseNode.VarName]; ok {
+					_, stElemSize = is.arrayElemSize(sym)
+				} else if sym, ok := is.globalVars[baseNode.VarName]; ok {
+					_, stElemSize = is.arrayElemSize(sym)
+				}
+			}
+			// Calculate byte offset: index * elementSize (emitted per
+			// branch below, since complex bases need their own stride).
+			elementSize := &Operand{Type: "imm", Value: fmt.Sprintf("%d", stElemSize)}
 			
 			// Check if base is a simple identifier (local/global array)
 			if baseNode.Type == NodeIdentifier {
 				varName := baseNode.VarName
 				var baseOffset int
 				var isGlobal bool
-				
+				var stSym *Symbol
+
 				if sym, ok := is.localVars[varName]; ok {
 					baseOffset = sym.Offset
 					isGlobal = false
-				} else if _, ok := is.globalVars[varName]; ok {
+					stSym = sym
+				} else if sym, ok := is.globalVars[varName]; ok {
 					baseOffset = 0
 					isGlobal = true
+					stSym = sym
 				} else {
 					return nil, fmt.Errorf("undefined array: %s", varName)
 				}
-				
-				// Use the optimized array access path
+
+				stElemType, stElemSize2 := is.arrayElemSize(stSym)
+				stElemSize = stElemSize2
+				elementSize = &Operand{Type: "imm", Value: fmt.Sprintf("%d", stElemSize)}
+				if stSym.ArraySize == 0 {
+					// Pointer variable: store through its VALUE, not its slot.
+					baseAddr, err := is.selectExpression(baseNode)
+					if err != nil {
+						return nil, err
+					}
+					byteOffset := is.newTemp()
+					is.emit(OpMul, byteOffset, index, elementSize)
+					finalAddr := is.newTemp()
+					is.emit(OpAdd, finalAddr, baseAddr, byteOffset)
+					ptrOp := &Operand{
+						Type:      "ptr",
+						IndexTemp: finalAddr,
+						Size:      stElemSize,
+						DataType:  stElemType,
+					}
+					is.emit(OpStore, ptrOp, value, nil)
+					return value, nil
+				}
+
+				// True array: optimized array access path
+				byteOffset := is.newTemp()
+				is.emit(OpMul, byteOffset, index, elementSize)
 				arrayOp := &Operand{
 					Type:      "array",
 					Value:     varName,
 					Offset:    baseOffset,
 					IsGlobal:  isGlobal,
 					IndexTemp: byteOffset,
+					Size:      stElemSize,
 				}
 				is.emit(OpStore, arrayOp, value, nil)
 			} else {
@@ -1649,15 +2385,23 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				if err != nil {
 					return nil, err
 				}
-				
+
+				// Recompute stride from the pointer type (the shared
+				// byteOffset used the default 8; member pointers need
+				// real sizes, e.g. enum* -> 4).
+				stElemSize = is.elemSizeForPtr(baseAddr.DataType)
+				byteOffset := is.newTemp()
+				is.emit(OpMul, byteOffset, index, &Operand{Type: "imm", Value: fmt.Sprintf("%d", stElemSize)})
+
 				// Add base address + offset
 				finalAddr := is.newTemp()
 				is.emit(OpAdd, finalAddr, baseAddr, byteOffset)
-				
+
 				// Store to the computed address
 				ptrOp := &Operand{
 					Type:      "ptr",
 					IndexTemp: finalAddr,
+					Size:      stElemSize,
 				}
 				is.emit(OpStore, ptrOp, value, nil)
 			}
@@ -1801,14 +2545,16 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		
 		// Dereference assignment: *ptr = value
 		if node.Children[0].Type == NodeUnaryOp && node.Children[0].Operator == "*" {
-			// Get the pointer expression
-			ptrExpr, err := is.selectExpression(node.Children[0].Children[0])
+			// Evaluate RHS first, then the pointer: no live pointer temp spans
+			// the RHS codegen, whose emitter scratch regs (%rax/%r11) would
+			// clobber it. Deliberately dumb/fast ordering, no analysis pass.
+			value, err := is.selectExpression(node.Children[1])
 			if err != nil {
 				return nil, err
 			}
-			
-			// Get value to store
-			value, err := is.selectExpression(node.Children[1])
+
+			// Get the pointer expression (used immediately below)
+			ptrExpr, err := is.selectExpression(node.Children[0].Children[0])
 			if err != nil {
 				return nil, err
 			}
@@ -1909,16 +2655,31 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		if funcSig, ok := is.functions[node.Name]; ok {
 			returnType = funcSig.ReturnType
 		}
+		// Indirect calls (cb.fn(), (*fp)()) have no declared signature.
+		// Evaluated late (just before emission below) so the pointer temp
+		// never spans arg codegen. See below.
 		
-		// Evaluate arguments
-		args := []*Operand{}
+		// Evaluate arguments directly into stack slots (dumb but airtight):
+		// each arg temp dies at its store, so later arg evals (emitter scratch
+		// %rax/%r11) and the SetArg moves (fixed %rdi/%rsi/...) can never
+		// clobber an already-evaluated arg. No analysis pass needed.
+		argSlots := []*Operand{}
 		for _, argNode := range node.Children {
 			arg, err := is.selectExpression(argNode)
 			if err != nil {
 				return nil, err
 			}
-			args = append(args, arg)
+			is.stackOffset -= 8
+			slot := &Operand{Type: "mem", Offset: is.stackOffset, DataType: arg.DataType}
+			// Keep float-literal detection working: slots are mem, so record
+			// the original immediate spelling on the slot value (unused for mem).
+			if arg.Type == "imm" {
+				slot.Value = arg.Value
+			}
+			is.emit(OpStore, slot, arg, nil)
+			argSlots = append(argSlots, slot)
 		}
+		args := argSlots
 		
 		// Check if we need to allocate space for a large struct return
 		var retSlot *Operand
@@ -1949,23 +2710,45 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		intRegs := []string{"rdi", "rsi", "rdx", "rcx", "r8", "r9"}
 		floatRegs := []string{"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"}
 		
+		// Overflow args (past 6 int / 8 float regs) go on the stack per SysV.
+		// Collect them first so one aligned alloc covers all.
+		type stackArg struct {
+			slot *Operand
+			idx  int
+		}
+		var stackArgs []stackArg
 		for _, arg := range args {
-			// Determine if this argument is a float
+			// Determine if this argument is a float (slots carry the
+			// original immediate spelling in Value for this check)
 			isFloat := arg.DataType == "float" || arg.DataType == "double" ||
-				(arg.Type == "imm" && strings.Contains(arg.Value, "."))
-			
+				((arg.Type == "mem" || arg.Type == "imm") && strings.Contains(arg.Value, "."))
+
 			if isFloat {
 				if floatRegIdx < len(floatRegs) {
 					regOp := &Operand{Type: "freg", Value: floatRegs[floatRegIdx]}
 					floatRegIdx++
 					is.emit(OpSetArg, regOp, arg, nil)
+				} else {
+					stackArgs = append(stackArgs, stackArg{slot: arg, idx: len(stackArgs)})
 				}
 			} else {
 				if intRegIdx < len(intRegs) {
 					regOp := &Operand{Type: "reg", Value: intRegs[intRegIdx]}
 					intRegIdx++
 					is.emit(OpSetArg, regOp, arg, nil)
+				} else {
+					stackArgs = append(stackArgs, stackArg{slot: arg, idx: len(stackArgs)})
 				}
+			}
+		}
+		var stackBytes int
+		if len(stackArgs) > 0 {
+			// 16-aligned so the call below keeps rsp aligned. Dumb, fast.
+			stackBytes = (len(stackArgs)*8 + 15) &^ 15
+			is.emit(OpStackAlloc, &Operand{Type: "imm", Value: fmt.Sprintf("%d", stackBytes)}, nil, nil)
+			for _, sa := range stackArgs {
+				sarg := &Operand{Type: "sarg", Offset: sa.idx * 8, DataType: sa.slot.DataType}
+				is.emit(OpStore, sarg, sa.slot, nil)
 			}
 		}
 		
@@ -1974,10 +2757,30 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			is.emit(OpLoadAddr, &Operand{Type: "reg", Value: "rdi"}, retSlot, nil)
 		}
 		
-		// Call function
+		// SysV varargs need %al = number of vector regs used. Emit it here
+		// (before the indirect target is evaluated below): %rax is
+		// call-clobbered anyway, so writing it early is always safe,
+		// while writing it at call time would kill a target held in %rax.
+		is.emit(OpSetAl, &Operand{Type: "imm", Value: fmt.Sprintf("%d", floatRegIdx)}, nil, nil)
+
+		// Call function (direct by label, or indirect through a register).
+		// The indirect target is evaluated here — after all arg/setarg code —
+		// so its temp is live for exactly one instruction.
 		result := is.newTemp()
-		funcOp := &Operand{Type: "label", Value: node.Name}
+		var funcOp *Operand
+		if node.Target != nil {
+			top, terr := is.selectExpression(node.Target)
+			if terr != nil {
+				return nil, terr
+			}
+			funcOp = top
+		} else {
+			funcOp = &Operand{Type: "label", Value: node.Name}
+		}
 		is.emit(OpCall, result, funcOp, &Operand{Type: "imm", Value: fmt.Sprintf("%d", len(args))})
+		if stackBytes > 0 {
+			is.emit(OpStackFree, &Operand{Type: "imm", Value: fmt.Sprintf("%d", stackBytes)}, nil, nil)
+		}
 		
 		// If we used a return slot, the result is there, not in rax
 		if retSlot != nil {
@@ -2009,6 +2812,16 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				result.Type = "mem"
 				result.Offset = is.stackOffset
 				result.DataType = returnType
+			} else if returnType != "" {
+				// Ordinary typed return (e.g. unsigned int hash()): carry
+				// the type so conversions (unsigned div) apply at use sites.
+				// Struct returns keep legacy untyped behavior (their member
+				// access on register-held values is a separate feature).
+				rt := is.resolveType(returnType)
+				isStructRet := strings.Contains(rt, "struct") || strings.Contains(rt, "union")
+				if !isStructRet {
+					result.DataType = returnType
+				}
 			}
 		}
 		
@@ -2159,8 +2972,45 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		
 		return lastValue, nil
 		
+	case NodeOffsetof:
+		// __builtin_offsetof(Type, member[.sub]): fold to an integer constant.
+		structType := is.resolveType(node.DataType)
+		total := 0
+		for _, field := range strings.Split(node.Value, ".") {
+			structName := structType
+			for len(structName) > 0 && structName[len(structName)-1] == '*' {
+				structName = structName[:len(structName)-1]
+			}
+			structName = strings.TrimSpace(structName)
+			if len(structName) > 7 && structName[:7] == "struct " {
+				structName = structName[7:]
+			} else if len(structName) > 6 && structName[:6] == "union " {
+				structName = structName[6:]
+			}
+			structName = strings.TrimSpace(structName)
+			structDef, found := is.structs[structName]
+			if !found {
+				return nil, fmt.Errorf("__builtin_offsetof: undefined struct '%s'", structName)
+			}
+			matched := false
+			for _, m := range structDef.Members {
+				if m.Name == field {
+				total += m.Offset
+					structType = m.Type
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return nil, fmt.Errorf("__builtin_offsetof: struct %s has no member %s", structName, field)
+			}
+		}
+		op := &Operand{Type: "imm", Value: fmt.Sprintf("%d", total), DataType: "unsigned long"}
+		return op, nil
+
 	case NodeCast:
-		// Type cast: (Type)expr
+		// Type cast: (Type)expr, with real conversions across float/int.
+		// A bitwise passthrough is wrong (float bits != double/int values).
 		if len(node.Children) < 1 {
 			return nil, fmt.Errorf("cast needs operand")
 		}
@@ -2168,7 +3018,15 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		if err != nil {
 			return nil, err
 		}
-		// Preserve the cast type information
+		srcT := result.DataType
+		dstT := node.DataType
+		if mode := cvtMode(srcT, dstT); mode != "" {
+			conv := is.newTemp()
+			conv.DataType = dstT
+			is.emit(OpCvt, conv, result, &Operand{Type: "imm", Value: mode})
+			return conv, nil
+		}
+		// Same-kind cast (or unknown): pass through with new type.
 		result.DataType = node.DataType
 		return result, nil
 		

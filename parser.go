@@ -37,6 +37,7 @@ const (
 	NodeAddressOf
 	NodeDereference
 	NodeCompoundLiteral
+	NodeOffsetof
 )
 
 type ASTNode struct {
@@ -65,6 +66,17 @@ type ASTNode struct {
 	// For member access
 	MemberName   string // Name of the member being accessed
 	IsPointer    bool // true for -> operator, false for . operator (in member access context)
+
+	// For indirect calls (e.g. cb.fn()): the function-valued expression.
+	// Nil for direct calls, which use Name.
+	Target *ASTNode
+
+	// For loop slots (set by parseFor; explicit so omitted init/cond/incr
+	// can't shift positions and be misclassified).
+	ForInit *ASTNode
+	ForCond *ASTNode
+	ForIncr *ASTNode
+	ForBody *ASTNode
 	
 	// For arrays and pointers
 	ArraySize    int  // Size of array (0 if not an array)
@@ -254,19 +266,11 @@ func (p *Parser) getTypeSize(typ string) int {
 		return 8 // Default struct size
 	}
 	
-	// Basic types
-	switch typ {
-	case "int", "float":
-		return 4
-	case "long", "double":
-		return 8
-	case "char":
-		return 1
-	case "void":
-		return 0
-	default:
-		return 4 // Default
+	// Basic types (shared LP64 table; keeps parser and codegen in agreement)
+	if s, ok := cSizeOf(typ); ok {
+		return s
 	}
+	return 4 // Default
 }
 
 func stripQualifiers(typ string) string {
@@ -353,6 +357,18 @@ func (p *Parser) parseTopLevel() (*ASTNode, error) {
 	if p.match(TYPEDEF) {
 		p.advance()
 		
+		// typedef enum { ... } Name; — enums are 4 bytes, map alias to int.
+		if p.match(ENUM) {
+			alias, err := p.parseEnumDef()
+			if err != nil {
+				return nil, err
+			}
+			if alias != "" {
+				p.typedefs[alias] = "int"
+			}
+			return nil, nil
+		}
+
 		// typedef struct { ... } Name; or typedef struct Name Name;
 		if p.match(STRUCT, UNION) {
 			p.advance()
@@ -381,6 +397,20 @@ func (p *Parser) parseTopLevel() (*ASTNode, error) {
 				
 				for !p.match(RBRACE) && !p.match(EOF) {
 					memberType := p.parseType()
+
+					// Function pointer member: ret (*name)(params);
+					if p.match(LPAREN) {
+						m, ferr := p.parseFnPtrMember(memberType, &offset)
+						if ferr != nil {
+							return nil, ferr
+						}
+						members = append(members, m)
+						if !p.match(SEMICOLON) {
+							return nil, fmt.Errorf("expected ; after struct member")
+						}
+						p.advance()
+						continue
+					}
 					
 					// Parse member name(s) - can have multiple per line like: int r, g, b, a;
 					for {
@@ -541,7 +571,7 @@ func (p *Parser) parseTopLevel() (*ASTNode, error) {
 	}
 	
 	if p.match(ENUM) {
-		err := p.parseEnumDef()
+		_, err := p.parseEnumDef()
 		if err != nil {
 			return nil, err
 		}
@@ -570,11 +600,19 @@ func (p *Parser) parseTopLevel() (*ASTNode, error) {
 
 func (p *Parser) parseType() string {
 	typ := ""
-	
-	// Storage class
-	if p.match(STATIC, CONST) {
-		typ += p.current().Lexeme + " "
-		p.advance()
+
+	// Storage class (static/const/inline/extern — accepted, not optimized;
+	// inline/extern only affect linkage, which we don't do).
+	for {
+		if p.match(STATIC, CONST) {
+			typ += p.current().Lexeme + " "
+			p.advance()
+		} else if p.match(IDENTIFIER) && (p.current().Lexeme == "inline" || p.current().Lexeme == "extern") {
+			typ += p.current().Lexeme + " "
+			p.advance()
+		} else {
+			break
+		}
 	}
 	
 	// Type modifiers (unsigned, signed, long, short)
@@ -697,8 +735,58 @@ func (p *Parser) parseType() string {
 	if typ == "" {
 		typ = "int"
 	}
-	
+
 	return typ
+}
+
+// parseFnPtrMember parses a function-pointer struct member after the return
+// type: `(*name)(params)`. The current token must be '('. Records it as an
+// 8-byte pointer member. Fast path for a very common C idiom.
+func (p *Parser) parseFnPtrMember(retType string, offset *int) (StructMember, error) {
+	p.advance() // skip (
+	if !p.match(STAR) {
+		return StructMember{}, fmt.Errorf("expected * in function pointer member")
+	}
+	p.advance()
+	if !p.match(IDENTIFIER) {
+		return StructMember{}, fmt.Errorf("expected member name")
+	}
+	memberName := p.current().Lexeme
+	p.advance()
+	if !p.match(RPAREN) {
+		return StructMember{}, fmt.Errorf("expected ) in function pointer member")
+	}
+	p.advance()
+	// Skip the parameter list (balanced parens, may contain nested parens).
+	if !p.match(LPAREN) {
+		return StructMember{}, fmt.Errorf("expected (params) in function pointer member")
+	}
+	depth := 0
+	for !p.match(EOF) {
+		if p.match(LPAREN) {
+			depth++
+		} else if p.match(RPAREN) {
+			depth--
+			if depth == 0 {
+				p.advance()
+				break
+			}
+		}
+		p.advance()
+	}
+	memberSize := 8
+	alignment := 8
+	if *offset%alignment != 0 {
+		*offset += alignment - (*offset % alignment)
+	}
+	m := StructMember{
+		Name:   memberName,
+		Type:   retType + "*",
+		Offset: *offset,
+		Size:   memberSize,
+	}
+	*offset += memberSize
+	return m, nil
 }
 
 func (p *Parser) parseStructDef() error {
@@ -737,6 +825,20 @@ func (p *Parser) parseStructDef() error {
 	for !p.match(RBRACE) && !p.match(EOF) {
 		// Parse member type
 		memberType := p.parseType()
+
+		// Function pointer member: ret (*name)(params);
+		if p.match(LPAREN) {
+			m, ferr := p.parseFnPtrMember(memberType, &currentOffset)
+			if ferr != nil {
+				return ferr
+			}
+			members = append(members, m)
+			if !p.match(SEMICOLON) {
+				return fmt.Errorf("expected ; after struct member")
+			}
+			p.advance()
+			continue
+		}
 		
 		// Parse member name(s) - can have multiple per line
 		for {
@@ -837,23 +939,23 @@ func (p *Parser) parseStructDef() error {
 	return nil
 }
 
-func (p *Parser) parseEnumDef() error {
+func (p *Parser) parseEnumDef() (string, error) {
 	p.advance() // skip 'enum'
-	
+
 	// Optional enum name
 	if p.match(IDENTIFIER) {
 		_ = p.current().Lexeme // enumName not used yet
 		p.advance()
 	}
-	
+
 	// Check for just declaration (enum Foo;)
 	if p.match(SEMICOLON) {
 		p.advance()
-		return nil // Forward declaration, ignore
+		return "", nil // Forward declaration, ignore
 	}
-	
+
 	if !p.match(LBRACE) {
-		return fmt.Errorf("expected { or ; after enum name")
+		return "", fmt.Errorf("expected { or ; after enum name")
 	}
 	p.advance() // skip {
 	
@@ -898,19 +1000,22 @@ func (p *Parser) parseEnumDef() error {
 	}
 	
 	if !p.match(RBRACE) {
-		return fmt.Errorf("expected } at end of enum")
+		return "", fmt.Errorf("expected } at end of enum")
 	}
 	p.advance()
-	
-	// Optional variable name and semicolon
+
+	// Optional trailing name (typedef alias or variable) and semicolon.
+	// Returned so typedef sites can map the alias to int (enums are 4 bytes).
+	trailing := ""
 	if p.match(IDENTIFIER) {
+		trailing = p.current().Lexeme
 		p.advance()
 	}
 	if p.match(SEMICOLON) {
 		p.advance()
 	}
-	
-	return nil
+
+	return trailing, nil
 }
 
 func (p *Parser) skipStructOrTypedef() {
@@ -1044,20 +1149,46 @@ func (p *Parser) parseFunction(name string, returnType string) (*ASTNode, error)
 }
 
 func (p *Parser) parseGlobalVar(name string, dataType string) (*ASTNode, error) {
-	// Skip initializers and array dims for now
+	var children []*ASTNode
+	// Array dimensions (record size, skip contents).
+	if p.match(LBRACKET) {
+		// Leave dims to best effort: skip to = or ;.
+		for !p.match(ASSIGN) && !p.match(SEMICOLON) && !p.match(EOF) {
+			p.advance()
+		}
+	}
+	// Optional constant initializer.
+	if p.match(ASSIGN) {
+		p.advance()
+		if p.match(LBRACE) {
+			// Struct/array brace initializer (e.g. globals with designators).
+			init, err := p.parseCompoundLiteral(p.resolveTypedef(dataType))
+			if err != nil {
+				return nil, err
+			}
+			children = append(children, init)
+		} else {
+			init, err := p.parseAssignment()
+			if err != nil {
+				return nil, err
+			}
+			children = append(children, init)
+		}
+	}
 	for !p.match(SEMICOLON) && !p.match(EOF) {
 		p.advance()
 	}
-	
+
 	if p.match(SEMICOLON) {
 		p.advance()
 	}
-	
+
 	return &ASTNode{
 		Type:     NodeVarDecl,
 		VarName:  name,
 		DataType: dataType,
 		IsGlobal: true,
+		Children: children,
 	}, nil
 }
 
@@ -1091,7 +1222,7 @@ func (p *Parser) parseBlock() (*ASTNode, error) {
 
 func (p *Parser) parseStatement() (*ASTNode, error) {
 	// Variable declaration (with optional storage class and type modifiers)
-	if p.match(INT, CHAR_KW, FLOAT, DOUBLE, STATIC, CONST, STRUCT, UNION, UNSIGNED, SIGNED, LONG, SHORT) {
+	if p.match(INT, CHAR_KW, FLOAT, DOUBLE, VOID, STATIC, CONST, STRUCT, UNION, UNSIGNED, SIGNED, LONG, SHORT) {
 		return p.parseVarDecl()
 	}
 	
@@ -1179,72 +1310,89 @@ func (p *Parser) parseStatement() (*ASTNode, error) {
 
 func (p *Parser) parseVarDecl() (*ASTNode, error) {
 	dataType := p.parseType()
-	
-	if !p.match(IDENTIFIER) {
-		return nil, fmt.Errorf("expected identifier")
-	}
-	
-	varName := p.current().Lexeme
-	p.advance()
-	
-	node := &ASTNode{
-		Type:     NodeVarDecl,
-		VarName:  varName,
-		DataType: dataType,
-	}
-	
-	// Handle array declaration: int arr[10]
-	if p.match(LBRACKET) {
+
+	decls := []*ASTNode{}
+	for {
+		if !p.match(IDENTIFIER) {
+			return nil, fmt.Errorf("expected identifier")
+		}
+
+		varName := p.current().Lexeme
 		p.advance()
-		
-		if !p.match(RBRACKET) {
-			// Array size
-			sizeExpr, err := p.parseExpression()
-			if err != nil {
-				return nil, err
+
+		node := &ASTNode{
+			Type:     NodeVarDecl,
+			VarName:  varName,
+			DataType: dataType,
+		}
+
+		// Handle array declaration: int arr[10]
+		if p.match(LBRACKET) {
+			p.advance()
+
+			if !p.match(RBRACKET) {
+				// Array size
+				sizeExpr, err := p.parseExpression()
+				if err != nil {
+					return nil, err
+				}
+
+				// For now, only support constant sizes
+				if sizeExpr.Type == NodeNumber {
+					node.ArraySize = sizeExpr.IntValue
+				} else {
+					return nil, fmt.Errorf("array size must be a constant")
+				}
 			}
-			
-			// For now, only support constant sizes
-			if sizeExpr.Type == NodeNumber {
-				node.ArraySize = sizeExpr.IntValue
+
+			if !p.match(RBRACKET) {
+				return nil, fmt.Errorf("expected ']'")
+			}
+			p.advance()
+		}
+
+		// Handle initialization
+		if p.match(ASSIGN) {
+			p.advance()
+
+			// Check if this is a struct/typedef initialization with brace initializer
+			if p.match(LBRACE) {
+				// This is a compound literal initialization
+				resolvedType := p.resolveTypedef(dataType)
+				initExpr, err := p.parseCompoundLiteral(resolvedType)
+				if err != nil {
+					return nil, err
+				}
+				node.Children = []*ASTNode{initExpr}
 			} else {
-				return nil, fmt.Errorf("array size must be a constant")
+				initExpr, err := p.parseExpression()
+				if err != nil {
+					return nil, err
+				}
+				node.Children = []*ASTNode{initExpr}
 			}
 		}
-		
-		if !p.match(RBRACKET) {
-			return nil, fmt.Errorf("expected ']'")
+
+		decls = append(decls, node)
+
+		// Additional declarators with the same type: int a = 1, b = 2;
+		if !p.match(COMMA) {
+			break
 		}
 		p.advance()
 	}
-	
-	// Handle initialization
-	if p.match(ASSIGN) {
-		p.advance()
-		
-		// Check if this is a struct/typedef initialization with brace initializer
-		if p.match(LBRACE) {
-			// This is a compound literal initialization
-			resolvedType := p.resolveTypedef(dataType)
-			initExpr, err := p.parseCompoundLiteral(resolvedType)
-			if err != nil {
-				return nil, err
-			}
-			node.Children = []*ASTNode{initExpr}
-		} else {
-			initExpr, err := p.parseExpression()
-			if err != nil {
-				return nil, err
-			}
-			node.Children = []*ASTNode{initExpr}
-		}
-	}
-	
+
 	if p.match(SEMICOLON) {
 		p.advance()
 	}
-	
-	return node, nil
+
+	if len(decls) == 1 {
+		return decls[0], nil
+	}
+	return &ASTNode{
+		Type:     NodeBlock,
+		Children: decls,
+	}, nil
 }
 
 func (p *Parser) parseReturn() (*ASTNode, error) {
@@ -1399,10 +1547,14 @@ func (p *Parser) parseFor() (*ASTNode, error) {
 		children = append(children, incr)
 	}
 	children = append(children, body)
-	
+
 	return &ASTNode{
 		Type:     NodeFor,
 		Children: children,
+		ForInit:  init,
+		ForCond:  cond,
+		ForIncr:  incr,
+		ForBody:  body,
 	}, nil
 }
 
@@ -1892,6 +2044,28 @@ func (p *Parser) parsePostfix() (*ASTNode, error) {
 				IsPointer:  (op == "->"),
 				Children:   []*ASTNode{left},
 			}
+		} else if p.match(LPAREN) {
+			// Call through any postfix expression: fn(), cb.fn(), (*fp)().
+			p.advance()
+			args := []*ASTNode{}
+			for !p.match(RPAREN) && !p.match(EOF) {
+				arg, err := p.parseAssignment()
+				if err != nil {
+					return nil, err
+				}
+				args = append(args, arg)
+				if p.match(COMMA) {
+					p.advance()
+				}
+			}
+			if p.match(RPAREN) {
+				p.advance()
+			}
+			left = &ASTNode{
+				Type:     NodeCall,
+				Target:   left,
+				Children: args,
+			}
 		} else {
 			break
 		}
@@ -1905,14 +2079,9 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 	if p.match(NUMBER) {
 		value := p.current().Lexeme
 		p.advance()
+		value, dataType := typeNumberLiteral(value)
 		intVal, _ := strconv.Atoi(value)
-		
-		// Determine if it's a float or int based on presence of decimal point
-		dataType := "int"
-		if strings.Contains(value, ".") || strings.Contains(value, "e") || strings.Contains(value, "E") {
-			dataType = "double"
-		}
-		
+
 		return &ASTNode{
 			Type:     NodeNumber,
 			Value:    value,
@@ -1921,6 +2090,7 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 		}, nil
 	}
 	
+
 	// sizeof operator
 	if p.match(SIZEOF) {
 		p.advance()
@@ -2016,6 +2186,39 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 	if p.match(IDENTIFIER) {
 		name := p.current().Lexeme
 		p.advance()
+
+		// __builtin_offsetof(Type, member[.sub...]) — compile-time constant.
+		if name == "__builtin_offsetof" && p.match(LPAREN) {
+			p.advance()
+			typeName := p.parseType()
+			if !p.match(COMMA) {
+				return nil, fmt.Errorf("expected ',' in __builtin_offsetof")
+			}
+			p.advance()
+			memberPath := ""
+			for {
+				if !p.match(IDENTIFIER) {
+					return nil, fmt.Errorf("expected member name in __builtin_offsetof")
+				}
+				memberPath += p.current().Lexeme
+				p.advance()
+				if p.match(DOT) {
+					memberPath += "."
+					p.advance()
+					continue
+				}
+				break
+			}
+			if !p.match(RPAREN) {
+				return nil, fmt.Errorf("expected ')' in __builtin_offsetof")
+			}
+			p.advance()
+			return &ASTNode{
+				Type:     NodeOffsetof,
+				DataType: typeName,
+				Value:    memberPath,
+			}, nil
+		}
 		
 		// Function call
 		if p.match(LPAREN) {
@@ -2134,6 +2337,56 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 	return nil, fmt.Errorf("unexpected token: %s at line %d", p.current().Lexeme, p.current().Line)
 }
 
+// typeNumberLiteral splits a numeric lexeme (which may carry U/L suffixes)
+// into clean digits and its C type. Unsuffixed decimals get their type by
+// magnitude (int -> long -> unsigned long); suffixes force the type.
+// Clean digits matter: suffixes in immediates don't assemble, and huge
+// values are silently truncated to 32 bits without a 64-bit type.
+func typeNumberLiteral(lexeme string) (digits string, dataType string) {
+	// Floats (but not hex integers, whose E is a digit).
+	isHex := strings.HasPrefix(lexeme, "0x") || strings.HasPrefix(lexeme, "0X")
+	if strings.Contains(lexeme, ".") || (!isHex && (strings.Contains(lexeme, "e") || strings.Contains(lexeme, "E"))) {
+		// Strip a float suffix (1.0f); single precision is its own type —
+		// without this, float slots got truncated double bits (zeros).
+		if strings.HasSuffix(lexeme, "f") || strings.HasSuffix(lexeme, "F") {
+			return lexeme[:len(lexeme)-1], "float"
+		}
+		return lexeme, "double"
+	}
+	// Split trailing integer suffix [uUlL]+.
+	i := len(lexeme)
+	for i > 0 && strings.ContainsRune("uUlL", rune(lexeme[i-1])) {
+		i--
+	}
+	suffix := lexeme[i:]
+	digits = lexeme[:i]
+	hasU := strings.ContainsAny(suffix, "uU")
+	longs := strings.Count(strings.ToLower(suffix), "l")
+	switch {
+	case longs >= 2 && hasU:
+		return digits, "unsigned long long"
+	case longs >= 2:
+		return digits, "long long"
+	case longs == 1 && hasU:
+		return digits, "unsigned long"
+	case longs == 1:
+		return digits, "long"
+	case hasU:
+		return digits, "unsigned int"
+	}
+	// No suffix: type by magnitude (decimal rules; hex also fits below).
+	if v, err := strconv.ParseUint(digits, 0, 64); err == nil {
+		if v <= 2147483647 {
+			return digits, "int"
+		}
+		if v <= 9223372036854775807 {
+			return digits, "long"
+		}
+		return digits, "unsigned long"
+	}
+	return digits, "int"
+}
+
 func (p *Parser) parseCompoundLiteral(typeName string) (*ASTNode, error) {
 	// Parse compound literal: {.field1=val1, .field2=val2, ...}
 	// or positional: {val1, val2, ...}
@@ -2173,14 +2426,25 @@ func (p *Parser) parseCompoundLiteral(typeName string) (*ASTNode, error) {
 			initFields = append(initFields, fieldName)
 			initValues = append(initValues, value)
 		} else {
-			// Positional initializer
-			value, err := p.parseAssignment()
-			if err != nil {
-				return nil, err
+			// Positional initializer. A nested brace is an element struct
+			// literal (array-of-struct initializers); recurse with the
+			// same type — the element type in that context.
+			if p.match(LBRACE) {
+				nested, err := p.parseCompoundLiteral(typeName)
+				if err != nil {
+					return nil, err
+				}
+				initFields = append(initFields, "")
+				initValues = append(initValues, nested)
+			} else {
+				value, err := p.parseAssignment()
+				if err != nil {
+					return nil, err
+				}
+
+				initFields = append(initFields, "") // Empty string means positional
+				initValues = append(initValues, value)
 			}
-			
-			initFields = append(initFields, "") // Empty string means positional
-			initValues = append(initValues, value)
 		}
 		
 		if p.match(COMMA) {

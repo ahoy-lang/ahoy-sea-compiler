@@ -370,8 +370,10 @@ func (p *Preprocessor) Process(source string) (string, error) {
 								}
 							}
 							
-							// Extract body (everything after closing paren)
-							body := strings.TrimSpace(restOfLine[closeParenIdx+1:])
+							// Extract body (everything after closing paren).
+							// A trailing // comment is NOT part of the macro
+							// (it would comment out the invocation line).
+							body := stripDefineComment(strings.TrimSpace(restOfLine[closeParenIdx+1:]))
 							
 							p.mu.Lock()
 							p.funcMacros[name] = &FunctionMacro{
@@ -384,11 +386,11 @@ func (p *Preprocessor) Process(source string) (string, error) {
 					}
 				}
 				
-				// Simple object-like macro
+				// Simple object-like macro (comments stripped: see above).
 				name := directive[1]
 				value := ""
 				if len(directive) > 2 {
-					value = strings.Join(directive[2:], " ")
+					value = stripDefineComment(strings.Join(directive[2:], " "))
 				}
 				
 				p.Define(name, value)
@@ -662,6 +664,53 @@ func (p *Preprocessor) processHeaderSimple(source string) (string, error) {
 	}
 	
 	return result.String(), nil
+}
+
+// stripDefineComment removes // and /* */ comments from a #define body.
+// The comment is NOT part of the macro: keeping it would comment out the
+// rest of whichever line invokes the macro (e.g. RMAPI ... -> inline //...).
+// Quote-aware so "http://..." values survive.
+func stripDefineComment(s string) string {
+	var out strings.Builder
+	inStr := false
+	esc := false
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if inStr {
+			out.WriteByte(c)
+			if esc {
+				esc = false
+			} else if c == '\\' {
+				esc = true
+			} else if c == '"' {
+				inStr = false
+			}
+			i++
+			continue
+		}
+		if c == '"' {
+			inStr = true
+			out.WriteByte(c)
+			i++
+			continue
+		}
+		if c == '/' && i+1 < len(s) && s[i+1] == '/' {
+			break
+		}
+		if c == '/' && i+1 < len(s) && s[i+1] == '*' {
+			end := strings.Index(s[i+2:], "*/")
+			if end < 0 {
+				break
+			}
+			out.WriteByte(' ')
+			i += end + 4
+			continue
+		}
+		out.WriteByte(c)
+		i++
+	}
+	return strings.TrimSpace(out.String())
 }
 
 func (p *Preprocessor) expandMacros(line string) string {

@@ -71,9 +71,11 @@ type Symbol struct {
 	Offset     int  // Stack offset for locals
 	IsGlobal   bool
 	IsExternal bool // For libc symbols like stderr, stdout, stdin
+	IsStatic   bool // Internal linkage (no .globl in .data)
 	Size       int
 	Type       string
 	ArraySize  int  // For arrays, 0 if not an array
+	Init       *ASTNode // Global initializer (constant expressions only)
 }
 
 type Function struct {
