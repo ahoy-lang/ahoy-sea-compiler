@@ -5,6 +5,41 @@ import (
 	"sort"
 )
 
+// Scratch registers reserved for the emitter (never allocated to temps):
+// RAX (return value, universal scratch), RDX (array bases, div/mod high
+// half), R11 (index/pointer scratch). Letting temps live in these meant
+// every emitter scratch sequence could silently kill them (the a[0]-b[0]
+// bug: two live temps collapsed into one register). 10 GPRs remain, plus
+// (now working) spills.
+var scratchRegs = map[int]bool{RAX: true, RDX: true, R11: true}
+
+// frameExtent scans instructions for the deepest frame offset in use so
+// spilled temps can live below it (never overlapping locals). Without
+// this, spill slot 0 landed on the saved-rbp slot and corrupted frames.
+func frameExtent(instructions []*IRInstruction) int {
+	maxOff := 0
+	var walk func(op *Operand)
+	walk = func(op *Operand) {
+		if op == nil {
+			return
+		}
+		if (op.Type == "var" || op.Type == "mem" || op.Type == "array") && op.Offset < 0 && !op.IsGlobal {
+			if -op.Offset > maxOff {
+				maxOff = -op.Offset
+			}
+		}
+		if op.IndexTemp != nil {
+			walk(op.IndexTemp)
+		}
+	}
+	for _, instr := range instructions {
+		walk(instr.Dst)
+		walk(instr.Src1)
+		walk(instr.Src2)
+	}
+	return maxOff
+}
+
 // Register allocator using graph coloring
 type RegisterAllocator struct {
 	instructions  []*IRInstruction
@@ -12,6 +47,7 @@ type RegisterAllocator struct {
 	interferenceGraph map[string]map[string]bool
 	allocation    map[string]int
 	spilledVars   map[string]int
+	frameBase     int
 	
 	availableRegs []int
 	usedRegs      map[int]bool
@@ -50,8 +86,13 @@ func instrTemps(instr *IRInstruction) []*Operand {
 
 func NewRegisterAllocator(instructions []*IRInstruction) *RegisterAllocator {
 	// Available general-purpose registers (excluding RSP, RBP)
-	availableRegs := []int{RAX, RBX, RCX, RDX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15}
-	
+	availableRegs := []int{}
+	for _, r := range []int{RAX, RBX, RCX, RDX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15} {
+		if !scratchRegs[r] {
+			availableRegs = append(availableRegs, r)
+		}
+	}
+
 	return &RegisterAllocator{
 		instructions:      instructions,
 		liveRanges:        make(map[string]*LiveRange),
@@ -64,6 +105,8 @@ func NewRegisterAllocator(instructions []*IRInstruction) *RegisterAllocator {
 }
 
 func (ra *RegisterAllocator) Allocate() error {
+	// Spill space lives below the frame; measure the frame first.
+	ra.frameBase = frameExtent(ra.instructions)
 	// Step 1: Compute live ranges
 	ra.computeLiveRanges()
 	
@@ -183,8 +226,8 @@ func (ra *RegisterAllocator) allocateRegister(varName string) {
 		}
 	}
 	
-	// No register available - spill to stack
-	spillOffset := len(ra.spilledVars) * 8
+	// No register available - spill below the frame (never overlapping).
+	spillOffset := ra.frameBase + (len(ra.spilledVars)+1)*8
 	ra.spilledVars[varName] = spillOffset
 }
 
@@ -239,6 +282,7 @@ type LinearScanAllocator struct {
 	allocation   map[string]int
 	freeRegs     []int
 	stackSlots   map[string]int
+	frameBase    int
 }
 
 type Interval struct {
@@ -249,7 +293,12 @@ type Interval struct {
 }
 
 func NewLinearScanAllocator(instructions []*IRInstruction) *LinearScanAllocator {
-	freeRegs := []int{RAX, RBX, RCX, RDX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15}
+	freeRegs := []int{}
+	for _, r := range []int{RAX, RBX, RCX, RDX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15} {
+		if !scratchRegs[r] {
+			freeRegs = append(freeRegs, r)
+		}
+	}
 	
 	return &LinearScanAllocator{
 		instructions: instructions,
@@ -262,6 +311,7 @@ func NewLinearScanAllocator(instructions []*IRInstruction) *LinearScanAllocator 
 }
 
 func (lsa *LinearScanAllocator) Allocate() error {
+	lsa.frameBase = frameExtent(lsa.instructions)
 	// Compute intervals
 	lsa.computeIntervals()
 	
@@ -294,8 +344,23 @@ func (lsa *LinearScanAllocator) Allocate() error {
 	
 	// Rewrite instructions
 	lsa.rewriteInstructions()
-	
+
 	return nil
+}
+
+// GetUsedRegisters returns the distinct registers holding temps (for
+// callee-saved push/pop in the emitter).
+func (lsa *LinearScanAllocator) GetUsedRegisters() []int {
+	seen := make(map[int]bool)
+	var regs []int
+	for _, r := range lsa.allocation {
+		if !seen[r] {
+			seen[r] = true
+			regs = append(regs, r)
+		}
+	}
+	sort.Ints(regs)
+	return regs
 }
 
 func (lsa *LinearScanAllocator) computeIntervals() {
@@ -353,7 +418,7 @@ func (lsa *LinearScanAllocator) spillAtInterval(interval *Interval) {
 		interval.Reg = spill.Reg
 		lsa.allocation[interval.VarName] = spill.Reg
 		
-		offset := len(lsa.stackSlots) * 8
+		offset := lsa.frameBase + (len(lsa.stackSlots)+1)*8
 		lsa.stackSlots[spill.VarName] = offset
 		delete(lsa.allocation, spill.VarName)
 		
@@ -363,7 +428,7 @@ func (lsa *LinearScanAllocator) spillAtInterval(interval *Interval) {
 		})
 	} else {
 		// Spill current interval
-		offset := len(lsa.stackSlots) * 8
+		offset := lsa.frameBase + (len(lsa.stackSlots)+1)*8
 		lsa.stackSlots[interval.VarName] = offset
 	}
 }

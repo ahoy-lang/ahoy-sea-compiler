@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // formatOperand32 formats operands for 32-bit operations (int types)
 func (ce *CodeEmitter) formatOperand32(op *Operand) string {
@@ -88,6 +91,46 @@ func (ce *CodeEmitter) formatOperand32(op *Operand) string {
 	}
 	
 	return ""
+}
+
+// reg64to16 converts 64-bit register names to 16-bit equivalents.
+func (ce *CodeEmitter) reg64to16(reg64 string) string {
+	reg := strings.TrimPrefix(reg64, "%")
+	switch reg {
+	case "rax":
+		return "ax"
+	case "rbx":
+		return "bx"
+	case "rcx":
+		return "cx"
+	case "rdx":
+		return "dx"
+	case "rsi":
+		return "si"
+	case "rdi":
+		return "di"
+	case "rbp":
+		return "bp"
+	case "rsp":
+		return "sp"
+	case "r8":
+		return "r8w"
+	case "r9":
+		return "r9w"
+	case "r10":
+		return "r10w"
+	case "r11":
+		return "r11w"
+	case "r12":
+		return "r12w"
+	case "r13":
+		return "r13w"
+	case "r14":
+		return "r14w"
+	case "r15":
+		return "r15w"
+	}
+	return reg
 }
 
 // reg64to32 converts 64-bit register names to 32-bit equivalents

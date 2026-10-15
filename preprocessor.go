@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -14,6 +15,7 @@ type Preprocessor struct {
 	funcMacros    map[string]*FunctionMacro // Function-like macros
 	includePaths  []string
 	processed     map[string]bool  // Track processed files to avoid cycles
+	dirStack      []string       // Including-file directories (innermost last)
 	mu            sync.RWMutex      // For thread-safe define access
 	typedefMap    map[string]*StructDef // External typedefs from headers
 	structMap     map[string]*StructDef // External structs from headers
@@ -29,7 +31,13 @@ func NewPreprocessor() *Preprocessor {
 	p := &Preprocessor{
 		defines:      make(map[string]string),
 		funcMacros:   make(map[string]*FunctionMacro),
-		includePaths: []string{"/usr/include", "/usr/local/include", ".", "/home/lee/Documents/clibs/raylib/src"},
+		// NOTE: system dirs (/usr/include) are deliberately absent: glibc
+		// headers use extensions (attributes, asm labels, vector types)
+		// this compiler cannot parse, and inlining them breaks the TU
+		// (angle includes that miss every path are stubbed as before).
+		// Project headers resolve via -I, the main file's dir, or the
+		// includer's dir. The stale clibs path is kept harmlessly.
+		includePaths: []string{".", "/home/lee/Documents/clibs/raylib/src"},
 		processed:    make(map[string]bool),
 		typedefMap:   make(map[string]*StructDef),
 		structMap:    make(map[string]*StructDef),
@@ -40,6 +48,79 @@ func NewPreprocessor() *Preprocessor {
 	p.defines["NULL"] = "0"
 	p.defines["true"] = "1"
 	p.defines["false"] = "0"
+	// Standard macros from skipped system headers (exact libc values).
+	p.defines["EOF"] = "(-1)"
+	p.defines["SEEK_SET"] = "0"
+	p.defines["SEEK_CUR"] = "1"
+	p.defines["SEEK_END"] = "2"
+	// Integer limits (LP64) from skipped <stdint.h>/<limits.h>.
+	p.defines["CHAR_BIT"] = "8"
+	p.defines["INT_MAX"] = "2147483647"
+	p.defines["INT_MIN"] = "(-2147483647 - 1)"
+	p.defines["UINT_MAX"] = "4294967295U"
+	p.defines["LONG_MAX"] = "9223372036854775807L"
+	p.defines["LONG_MIN"] = "(-9223372036854775807L - 1)"
+	p.defines["ULONG_MAX"] = "18446744073709551615UL"
+	p.defines["LLONG_MAX"] = "9223372036854775807LL"
+	p.defines["LLONG_MIN"] = "(-9223372036854775807LL - 1)"
+	p.defines["ULLONG_MAX"] = "18446744073709551615ULL"
+	p.defines["INT8_MIN"] = "(-128)"
+	p.defines["INT8_MAX"] = "127"
+	p.defines["UINT8_MAX"] = "255"
+	p.defines["INT16_MIN"] = "(-32768)"
+	p.defines["INT16_MAX"] = "32767"
+	p.defines["UINT16_MAX"] = "65535"
+	p.defines["INT32_MIN"] = "(-2147483647 - 1)"
+	p.defines["INT32_MAX"] = "2147483647"
+	p.defines["UINT32_MAX"] = "4294967295U"
+	p.defines["INT64_MIN"] = "(-9223372036854775807L - 1)"
+	p.defines["INT64_MAX"] = "9223372036854775807L"
+	p.defines["UINT64_MAX"] = "18446744073709551615UL"
+	p.defines["SIZE_MAX"] = "18446744073709551615UL"
+	p.defines["PTRDIFF_MAX"] = "9223372036854775807L"
+	p.defines["SHRT_MIN"] = "(-32768)"
+	p.defines["SHRT_MAX"] = "32767"
+	p.defines["USHRT_MAX"] = "65535"
+	p.defines["CHAR_MIN"] = "(-128)"
+	p.defines["CHAR_MAX"] = "127"
+	p.defines["UCHAR_MAX"] = "255"
+	p.defines["SCHAR_MIN"] = "(-128)"
+	p.defines["SCHAR_MAX"] = "127"
+	// glibc <sys/stat.h> compat (header skipped): st_mtime et al are
+	// macros for the timespec members.
+	p.defines["st_atime"] = "st_atim.tv_sec"
+	p.defines["st_mtime"] = "st_mtim.tv_sec"
+	p.defines["st_ctime"] = "st_ctim.tv_sec"
+	// File-type test macros (glibc values; sys/stat.h skipped).
+	p.funcMacros["S_ISDIR"] = &FunctionMacro{Params: []string{"m"}, Body: "(((m) & 0170000) == 0040000)"}
+	p.funcMacros["S_ISREG"] = &FunctionMacro{Params: []string{"m"}, Body: "(((m) & 0170000) == 0100000)"}
+	p.funcMacros["S_ISLNK"] = &FunctionMacro{Params: []string{"m"}, Body: "(((m) & 0170000) == 0120000)"}
+	p.funcMacros["S_ISCHR"] = &FunctionMacro{Params: []string{"m"}, Body: "(((m) & 0170000) == 0020000)"}
+	p.funcMacros["S_ISBLK"] = &FunctionMacro{Params: []string{"m"}, Body: "(((m) & 0170000) == 0060000)"}
+	p.funcMacros["S_ISFIFO"] = &FunctionMacro{Params: []string{"m"}, Body: "(((m) & 0170000) == 0010000)"}
+	p.funcMacros["S_ISSOCK"] = &FunctionMacro{Params: []string{"m"}, Body: "(((m) & 0170000) == 0140000)"}
+	// assert from skipped <assert.h>: evaluate once, abort via libc.
+	p.funcMacros["assert"] = &FunctionMacro{Params: []string{"x"}, Body: "((void)((x) ? 0 : (__assert_fail(#x, \"sea\", 0, \"sea\"), 0)))"}
+	// pthread statics from skipped system headers (all-zeros on glibc,
+	// so `{0}` is exact and folds through global .comm/.data paths).
+	p.defines["PTHREAD_MUTEX_INITIALIZER"] = "{0}"
+	p.defines["PTHREAD_COND_INITIALIZER"] = "{0}"
+	p.defines["PTHREAD_ONCE_INIT"] = "0"
+	// Standard predefined macros (C17 hosted-ish): headers key bool,
+	// stdint and feature paths off these. Deliberately NOT defining
+	// __GNUC__/__clang__ (their branches need GNU extensions we lack).
+	p.defines["__STDC__"] = "1"
+	p.defines["__STDC_VERSION__"] = "201710L"
+	p.defines["__STDC_HOSTED__"] = "1"
+	// LP64 x86-64 (SDL/stdint constant + printf-format branches key off
+	// these; both spellings appear). Deliberately NOT __x86_64__ (would
+	// enable SIMD paths) or __GNUC__ (needs GNU extensions).
+	p.defines["__LP64__"] = "1"
+	p.defines["_LP64"] = "1"
+	// No SIMD intrinsics (we're a fast baseline compiler, not a vectorizer):
+	// stb_image/stb_truetype gate their _simd paths on this and always
+	// carry bit-identical scalar fallbacks.
+	p.defines["STBI_NO_SIMD"] = "1"
 	
 	return p
 }
@@ -231,7 +312,14 @@ func (p *Preprocessor) IsDefined(name string) bool {
 // evaluateIfCondition evaluates a #if condition
 func (p *Preprocessor) evaluateIfCondition(condition string) bool {
 	condition = strings.TrimSpace(condition)
-	
+
+	// General expression evaluator first (handles defined(), !, &&, ||,
+	// comparisons, parens). Legacy shortcuts below only fire when it
+	// declines (they're subsumed otherwise).
+	if v, ok := p.evalPPExpr(condition, 0); ok {
+		return v != 0
+	}
+
 	// Handle: defined(X) or defined X
 	if strings.HasPrefix(condition, "defined") {
 		rest := strings.TrimSpace(condition[7:])
@@ -261,14 +349,14 @@ func (p *Preprocessor) evaluateIfCondition(condition string) bool {
 		}
 	}
 	
-	// Handle numeric comparisons: 0, 1, etc.
+// Handle numeric comparisons: 0, 1, etc.
 	if condition == "0" {
 		return false
 	}
 	if condition == "1" {
 		return true
 	}
-	
+
 	// Try to evaluate as a macro reference
 	if p.IsDefined(condition) {
 		value := p.defines[condition]
@@ -277,13 +365,239 @@ func (p *Preprocessor) evaluateIfCondition(condition string) bool {
 		}
 		return true
 	}
-	
+
 	// Default: undefined macros are false
 	return false
 }
 
+// evalPPExpr evaluates an #if expression to an integer (0/1 for truth).
+// Supports defined(), !, &&, ||, ==, !=, <, <=, >, >=, parens, numbers
+// (hex/octal/U-L suffixes), and macro references (undefined = 0, per C).
+// depth guards recursive macro expansion.
+func (p *Preprocessor) evalPPExpr(s string, depth int) (int64, bool) {
+	if depth > 32 {
+		return 0, false
+	}
+	t := &ppTokens{src: s}
+	v, ok := t.parseOr(p, depth)
+	if !ok {
+		return 0, false
+	}
+	t.skipSpaces()
+	if t.pos != len(t.src) {
+		return 0, false
+	}
+	return v, true
+}
+
+type ppTokens struct {
+	src string
+	pos int
+}
+
+func (t *ppTokens) skipSpaces() {
+	for t.pos < len(t.src) && (t.src[t.pos] == ' ' || t.src[t.pos] == '\t') {
+		t.pos++
+	}
+}
+
+func (t *ppTokens) peekOp(ops ...string) string {
+	t.skipSpaces()
+	for _, op := range ops {
+		if strings.HasPrefix(t.src[t.pos:], op) {
+			return op
+		}
+	}
+	return ""
+}
+
+func (t *ppTokens) parseOr(p *Preprocessor, depth int) (int64, bool) {
+	left, ok := t.parseAnd(p, depth)
+	if !ok {
+		return 0, false
+	}
+	for {
+		if t.peekOp("||") == "" {
+			return left, true
+		}
+		t.pos += 2
+		right, ok := t.parseAnd(p, depth)
+		if !ok {
+			return 0, false
+		}
+		if left != 0 || right != 0 {
+			left = 1
+		} else {
+			left = 0
+		}
+	}
+}
+
+func (t *ppTokens) parseAnd(p *Preprocessor, depth int) (int64, bool) {
+	left, ok := t.parseCmp(p, depth)
+	if !ok {
+		return 0, false
+	}
+	for {
+		if t.peekOp("&&") == "" {
+			return left, true
+		}
+		t.pos += 2
+		right, ok := t.parseCmp(p, depth)
+		if !ok {
+			return 0, false
+		}
+		if left != 0 && right != 0 {
+			left = 1
+		} else {
+			left = 0
+		}
+	}
+}
+
+func (t *ppTokens) parseCmp(p *Preprocessor, depth int) (int64, bool) {
+	left, ok := t.parseUnary(p, depth)
+	if !ok {
+		return 0, false
+	}
+	for {
+		op := t.peekOp("==", "!=", ">=", "<=", ">", "<")
+		if op == "" {
+			return left, true
+		}
+		t.pos += len(op)
+		right, ok := t.parseUnary(p, depth)
+		if !ok {
+			return 0, false
+		}
+		switch op {
+		case "==":
+			if left == right {
+				left = 1
+			} else {
+				left = 0
+			}
+		case "!=":
+			if left != right {
+				left = 1
+			} else {
+				left = 0
+			}
+		case ">=":
+			if left >= right {
+				left = 1
+			} else {
+				left = 0
+			}
+		case "<=":
+			if left <= right {
+				left = 1
+			} else {
+				left = 0
+			}
+		case ">":
+			if left > right {
+				left = 1
+			} else {
+				left = 0
+			}
+		case "<":
+			if left < right {
+				left = 1
+			} else {
+				left = 0
+			}
+		}
+	}
+}
+
+func (t *ppTokens) parseUnary(p *Preprocessor, depth int) (int64, bool) {
+	t.skipSpaces()
+	if t.pos < len(t.src) && t.src[t.pos] == '!' {
+		t.pos++
+		v, ok := t.parseUnary(p, depth)
+		if !ok {
+			return 0, false
+		}
+		if v == 0 {
+			return 1, true
+		}
+		return 0, true
+	}
+	if strings.HasPrefix(t.src[t.pos:], "defined") {
+		rest := t.src[t.pos+len("defined"):]
+		if len(rest) > 0 && !isIdentifierChar(rest[0]) {
+			t.pos += len("defined")
+			t.skipSpaces()
+			name := ""
+			if t.pos < len(t.src) && t.src[t.pos] == '(' {
+				t.pos++
+				t.skipSpaces()
+				start := t.pos
+				for t.pos < len(t.src) && isIdentifierChar(t.src[t.pos]) {
+					t.pos++
+				}
+				name = t.src[start:t.pos]
+				t.skipSpaces()
+				if t.pos < len(t.src) && t.src[t.pos] == ')' {
+					t.pos++
+				} else {
+					return 0, false
+				}
+			} else {
+				start := t.pos
+				for t.pos < len(t.src) && isIdentifierChar(t.src[t.pos]) {
+					t.pos++
+				}
+				name = t.src[start:t.pos]
+			}
+			if p.IsDefined(name) {
+				return 1, true
+			}
+			return 0, true
+		}
+	}
+	if t.pos < len(t.src) && t.src[t.pos] == '(' {
+		t.pos++
+		v, ok := t.parseOr(p, depth)
+		if !ok {
+			return 0, false
+		}
+		t.skipSpaces()
+		if t.pos >= len(t.src) || t.src[t.pos] != ')' {
+			return 0, false
+		}
+		t.pos++
+		return v, true
+	}
+	start := t.pos
+	for t.pos < len(t.src) && (isIdentifierChar(t.src[t.pos])) {
+		t.pos++
+	}
+	if t.pos == start {
+		return 0, false
+	}
+	tok := t.src[start:t.pos]
+	stripped := tok
+	for len(stripped) > 0 && (stripped[len(stripped)-1] == 'u' || stripped[len(stripped)-1] == 'U' ||
+		stripped[len(stripped)-1] == 'l' || stripped[len(stripped)-1] == 'L') {
+		stripped = stripped[:len(stripped)-1]
+	}
+	if v, err := strconv.ParseUint(stripped, 0, 64); err == nil {
+		return int64(v), true
+	}
+	if val, defined := p.defines[tok]; defined {
+		if val == "" {
+			return 1, true
+		}
+		return p.evalPPExpr(val, depth+1)
+	}
+	return 0, true
+}
+
+
 func (p *Preprocessor) Process(source string) (string, error) {
-	lines := strings.Split(source, "\n")
+	lines := strings.Split(joinLogicalLines(stripComments(joinContinuedLines(source))), "\n")
 	var result strings.Builder
 	
 	// Stack for conditional compilation
@@ -298,7 +612,9 @@ func (p *Preprocessor) Process(source string) (string, error) {
 		
 		// Handle preprocessor directives
 		if strings.HasPrefix(trimmed, "#") {
-			directive := strings.Fields(trimmed)
+			// Whitespace may appear between # and the directive
+			// (`# define X` is valid C and SDL uses it).
+			directive := strings.Fields("#" + strings.TrimSpace(trimmed[1:]))
 			if len(directive) == 0 {
 				continue
 			}
@@ -315,12 +631,21 @@ func (p *Preprocessor) Process(source string) (string, error) {
 					return "", fmt.Errorf("line %d: #include requires filename", i+1)
 				}
 				
-				filename := strings.Join(directive[1:], " ")
-				originalFilename := filename
-				filename = strings.Trim(filename, `"<>`)
+				filename := includePathToken(directive)
+				originalFilename := ""
+				if len(directive) > 1 {
+					originalFilename = directive[1]
+				}
 				
-				// Skip system headers (those in angle brackets)
+				// Angle-bracket headers: try include paths first (project
+				// headers like <SDL3/SDL_gpu.h> resolve via -I); only skip
+				// when truly unfindable (real system headers).
 				if strings.HasPrefix(originalFilename, "<") {
+					if content, err := p.processInclude(filename); err == nil {
+						result.WriteString(content)
+						result.WriteString("\n")
+						continue
+					}
 					result.WriteString(fmt.Sprintf("// Skipped system header: %s\n", originalFilename))
 					continue
 				}
@@ -352,9 +677,16 @@ func (p *Preprocessor) Process(source string) (string, error) {
 				
 				// Check if it's a function-like macro
 				if len(restOfLine) > 0 && strings.Contains(restOfLine, "(") {
-					// Find the opening paren
+					// C rule: the `(` must IMMEDIATELY follow the name.
+					// `NAME (body)` (space) and `NAME OTHER(...)` (parens
+					// later in the body, e.g. SDL_WINDOW_HIDDEN) are
+					// OBJECT macros. Take the first token, then check.
+					tokEnd := 0
+					for tokEnd < len(restOfLine) && isIdentifierChar(restOfLine[tokEnd]) {
+						tokEnd++
+					}
+					name := restOfLine[:tokEnd]
 					parenIdx := strings.Index(restOfLine, "(")
-					name := restOfLine[:parenIdx]
 					
 					// Check if paren is immediately after name (no space = function macro)
 					if parenIdx == len(name) {
@@ -375,6 +707,9 @@ func (p *Preprocessor) Process(source string) (string, error) {
 							// (it would comment out the invocation line).
 							body := stripDefineComment(strings.TrimSpace(restOfLine[closeParenIdx+1:]))
 							
+							if os.Getenv("SEAPP") != "" {
+								fmt.Fprintf(os.Stderr, "MACRO %s(%v) = %q\n", name, params, body)
+							}
 							p.mu.Lock()
 							p.funcMacros[name] = &FunctionMacro{
 								Params: params,
@@ -524,9 +859,30 @@ func (p *Preprocessor) processInclude(filename string) (string, error) {
 			}
 		}
 	}
+
+	// Quoted includes also resolve relative to the including file first
+	// (proper C behavior); do it here via the directory stack.
+	if !found && len(p.dirStack) > 0 {
+		testPath := filepath.Join(p.dirStack[len(p.dirStack)-1], filename)
+		if _, err := os.Stat(testPath); err == nil {
+			fullPath = testPath
+			found = true
+		}
+	}
 	
 	if !found {
 		return "", fmt.Errorf("include file not found: %s", filename)
+	}
+
+	// Canonicalize for the cycle guard: the same file requested under
+	// different spellings ("x.h" vs "./x.h" vs absolute) must still
+	// hit the guard, or two headers including each other recurse forever
+	// (this OOMed the machine on bell's headers).
+	if abs, err := filepath.Abs(fullPath); err == nil {
+		fullPath = abs
+	}
+	if p.processed[fullPath] {
+		return "", nil
 	}
 	
 	// Read file
@@ -537,6 +893,10 @@ func (p *Preprocessor) processInclude(filename string) (string, error) {
 	
 	// Mark as processed
 	p.processed[fullPath] = true
+
+	// Push this file's directory for relative nested includes.
+	p.dirStack = append(p.dirStack, filepath.Dir(fullPath))
+	defer func() { p.dirStack = p.dirStack[:len(p.dirStack)-1] }()
 	
 	// Extract types and function signatures from this header
 	// (Do this BEFORE processing to catch declarations before they're preprocessed away)
@@ -546,8 +906,172 @@ func (p *Preprocessor) processInclude(filename string) (string, error) {
 	return p.Process(string(content))
 }
 
-func (p *Preprocessor) processHeaderSimple(source string) (string, error) {
+// joinLogicalLines merges code lines with unbalanced open parens (multiline
+// macro invocations and calls) so textual expansion sees whole invocations.
+// Consumed newlines are re-emitted as blank lines, preserving line numbers.
+// Directive lines never merge. Comments can't unbalance: strings are masked
+// and // comments stripped for counting (matching C, where // ends at its
+// own newline... which we preserve by stripping only joined-away ones).
+func joinLogicalLines(source string) string {
 	lines := strings.Split(source, "\n")
+	var out []string
+	i := 0
+	for i < len(lines) {
+		if strings.HasPrefix(strings.TrimSpace(lines[i]), "#") {
+			out = append(out, lines[i])
+			i++
+			continue
+		}
+		merged := stripLineComment(lines[i])
+		consumed := 0
+		for parenDepth(analysisMask(merged)) > 0 && i+consumed+1 < len(lines) {
+			nxt := lines[i+consumed+1]
+			if strings.HasPrefix(strings.TrimSpace(nxt), "#") {
+				break
+			}
+			if consumed > 500 {
+				break
+			}
+			consumed++
+			merged += " " + stripLineComment(nxt)
+		}
+		out = append(out, merged)
+		for k := 0; k < consumed; k++ {
+			out = append(out, "")
+		}
+		i += 1 + consumed
+	}
+	return strings.Join(out, "\n")
+}
+
+// stripLineComment removes a // comment honoring string literals.
+func stripLineComment(s string) string {
+	m := maskStrings(s)
+	if idx := strings.Index(m, "//"); idx >= 0 {
+		return s[:idx]
+	}
+	return s
+}
+
+// analysisMask blanks string/char contents and /* */ comments for
+// structural scanning (paren counting).
+func analysisMask(s string) string {
+	m := maskStrings(s)
+	// Blank /* ... */ spans (may be unterminated on one line).
+	for {
+		start := strings.Index(m, "/*")
+		if start < 0 {
+			break
+		}
+		end := strings.Index(m[start+2:], "*/")
+		if end < 0 {
+			// Unterminated: blank to end of this analysis unit.
+			b := []byte(m)
+			for k := start; k < len(b); k++ {
+				b[k] = ' '
+			}
+		m = string(b)
+			break
+		}
+		b := []byte(m)
+		for k := start; k < start+2+end+2 && k < len(b); k++ {
+			b[k] = ' '
+		}
+		m = string(b)
+	}
+	return m
+}
+
+// parenDepth counts unbalanced open parens.
+func parenDepth(s string) int {
+	d := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '(' {
+			d++
+		} else if s[i] == ')' {
+			d--
+		}
+	}
+	return d
+}
+
+// stripComments removes /* */ and // comments (phase 3, before macro
+// expansion in phase 4 — matching C). Newlines are preserved exactly so
+// line numbers survive. Contents of strings/chars are untouched, so
+// apostrophes in comments can no longer corrupt string-aware matching
+// (e.g. `bell's` masking everything to the next quote).
+func stripComments(source string) string {
+	var out strings.Builder
+	out.Grow(len(source))
+	i := 0
+	n := len(source)
+	for i < n {
+		c := source[i]
+		if c == '"' || c == '\'' {
+			q := c
+			out.WriteByte(c)
+			i++
+			for i < n {
+				out.WriteByte(source[i])
+				if source[i] == '\\' {
+					i++
+					if i < n {
+						out.WriteByte(source[i])
+						i++
+					}
+					continue
+				}
+				if source[i] == q {
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		if c == '/' && i+1 < n && source[i+1] == '/' {
+			// Line comment: skip to newline (keep the newline).
+			for i < n && source[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if c == '/' && i+1 < n && source[i+1] == '*' {
+			// Block comment: blank it, preserving newlines.
+			i += 2
+			for i < n {
+				if source[i] == '*' && i+1 < n && source[i+1] == '/' {
+					i += 2
+					break
+				}
+				if source[i] == '\n' {
+					out.WriteByte('\n')
+				} else {
+					out.WriteByte(' ')
+				}
+				i++
+			}
+			continue
+		}
+		out.WriteByte(c)
+		i++
+	}
+	return out.String()
+}
+
+// joinContinuedLines folds backslash-newline continuations (C phase 2).
+// Without this, multi-line #if conditions evaluate truncated (dropping
+// whole blocks) and the stray backslashes leak into code and kill the
+// lexer (which used to return EOF on unknown bytes, silently ending the
+// entire translation unit).
+func joinContinuedLines(source string) string {
+	// Handle \r\n and \n continuations.
+	source = strings.ReplaceAll(source, "\\\r\n", "")
+	return strings.ReplaceAll(source, "\\\n", "")
+}
+
+func (p *Preprocessor) processHeaderSimple(source string) (string, error) {
+	lines := strings.Split(joinLogicalLines(stripComments(joinContinuedLines(source))), "\n")
 	var result strings.Builder
 	
 	type condState struct {
@@ -560,7 +1084,9 @@ func (p *Preprocessor) processHeaderSimple(source string) (string, error) {
 		trimmed := strings.TrimSpace(line)
 		
 		if strings.HasPrefix(trimmed, "#") {
-			directive := strings.Fields(trimmed)
+			// Whitespace may appear between # and the directive
+			// (`# define X` is valid C and SDL uses it).
+			directive := strings.Fields("#" + strings.TrimSpace(trimmed[1:]))
 			if len(directive) == 0 {
 				continue
 			}
@@ -577,8 +1103,7 @@ func (p *Preprocessor) processHeaderSimple(source string) (string, error) {
 					continue
 				}
 				
-				filename := strings.Join(directive[1:], " ")
-				filename = strings.Trim(filename, `"<>`)
+				filename := includePathToken(directive)
 				
 				// Recursively include
 				content, err := p.processInclude(filename)
@@ -603,7 +1128,7 @@ func (p *Preprocessor) processHeaderSimple(source string) (string, error) {
 				name := directive[1]
 				value := ""
 				if len(directive) > 2 {
-					value = strings.Join(directive[2:], " ")
+					value = stripDefineComment(strings.Join(directive[2:], " "))
 				}
 				
 				p.Define(name, value)
@@ -713,55 +1238,111 @@ func stripDefineComment(s string) string {
 	return strings.TrimSpace(out.String())
 }
 
+
+// includePathToken extracts the file path from a split #include directive.
+// Only the first token is the path (trailing // or /* */ comments belong
+// to the line, not the filename); surrounding quotes/angles are stripped.
+func includePathToken(directive []string) string {
+	if len(directive) < 2 {
+		return ""
+	}
+	return strings.Trim(directive[1], `"<>`)
+}
+
 func (p *Preprocessor) expandMacros(line string) string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	
+
 	result := line
-	
-	// First expand function-like macros
-	for name, macro := range p.funcMacros {
-		result = p.expandFunctionMacro(result, name, macro)
-	}
-	
-	// Then expand object-like macros
-	for name, value := range p.defines {
-		// Use word boundary matching
-		result = replaceIdentifier(result, name, value)
+
+	// Expand to fixpoint: macro bodies routinely contain other macro
+	// calls (e.g. SDL_COMPILE_TIME_ASSERT wrapping SDL_static_cast) that
+	// only become visible after the outer expansion. Cap iterations to
+	// stay total (self-recursive macros stabilize or hit the cap).
+	for iter := 0; iter < 50; iter++ {
+		prev := result
+		// First expand function-like macros
+		for name, macro := range p.funcMacros {
+			result = p.expandFunctionMacro(result, name, macro)
+		}
+
+		// Then expand object-like macros
+		for name, value := range p.defines {
+			// Use word boundary matching
+			result = replaceIdentifier(result, name, value)
+		}
+		if result == prev {
+			break
+		}
 	}
 	
 	return result
 }
 
+// maskStrings blanks the contents of "..." and '...' literals (length
+// preserved) so textual macro processing never matches identifiers,
+// parens, commas, # or ## inside them (e.g. "#?RADIANCE\n" or a
+// single-letter param inside a message string).
+func maskStrings(s string) string {
+	b := []byte(s)
+	i := 0
+	for i < len(b) {
+		if b[i] == '"' || b[i] == '\'' {
+			q := b[i]
+			j := i + 1
+			for j < len(b) {
+				if b[j] == '\\' {
+					j += 2
+					continue
+				}
+				if b[j] == q {
+					break
+				}
+				j++
+			}
+			for k := i + 1; k < j && k < len(b); k++ {
+				b[k] = ' '
+			}
+			i = j + 1
+			} else {
+			i++
+		}
+	}
+	return string(b)
+}
+
 func (p *Preprocessor) expandFunctionMacro(text string, name string, macro *FunctionMacro) string {
 	var result strings.Builder
+	masked := maskStrings(text)
 	i := 0
-	
+
 	for i < len(text) {
-		// Check if we found the macro name
-		if strings.HasPrefix(text[i:], name) {
+		// Check if we found the macro name (outside strings)
+		if strings.HasPrefix(masked[i:], name) {
 			// Check if it's a complete identifier followed by (
-			if (i == 0 || !isIdentifierChar(text[i-1])) {
+			// (masked: strings/chars can't start or split an invocation)
+			if (i == 0 || !isIdentifierChar(masked[i-1])) {
 				// Check for opening paren
 				j := i + len(name)
 				// Skip whitespace
-				for j < len(text) && (text[j] == ' ' || text[j] == '\t') {
+				for j < len(masked) && (masked[j] == ' ' || masked[j] == '\t') {
 					j++
 				}
-				
-				if j < len(text) && text[j] == '(' {
+
+				if j < len(masked) && masked[j] == '(' {
 					// This is a function macro invocation
-					// Extract arguments
+					// Extract arguments (structure from masked text,
+					// content from original to preserve strings)
 					j++ // skip (
 					depth := 1
 					var args []string
 					currentArg := ""
-					
-					for j < len(text) && depth > 0 {
-						if text[j] == '(' {
+
+					for j < len(masked) && depth > 0 {
+						if masked[j] == '(' {
 							depth++
 							currentArg += string(text[j])
-						} else if text[j] == ')' {
+						} else if masked[j] == ')' {
 							depth--
 							if depth == 0 {
 								// End of macro invocation
@@ -771,7 +1352,7 @@ func (p *Preprocessor) expandFunctionMacro(text string, name string, macro *Func
 								break
 							}
 							currentArg += string(text[j])
-						} else if text[j] == ',' && depth == 1 {
+						} else if masked[j] == ',' && depth == 1 {
 							// Argument separator
 							args = append(args, strings.TrimSpace(currentArg))
 							currentArg = ""
@@ -781,14 +1362,25 @@ func (p *Preprocessor) expandFunctionMacro(text string, name string, macro *Func
 						j++
 					}
 					
-					// Substitute parameters in body
+					// Substitute parameters in body (#param stringifies
+					// first, so the # doesn't survive into the output).
 					expansion := macro.Body
+					for idx, param := range macro.Params {
+						if idx < len(args) {
+							expansion = stringifyParam(expansion, param, args[idx])
+						}
+					}
 					for idx, param := range macro.Params {
 						if idx < len(args) {
 							expansion = replaceIdentifier(expansion, param, args[idx])
 						}
 					}
+					// Token pasting (SDL compile-time asserts rely on it).
+					expansion = pasteTokens(expansion)
 					
+					if os.Getenv("SEAPP") != "" {
+						fmt.Fprintf(os.Stderr, "EXPAND %s args=%q -> %q\n", name, args, expansion)
+					}
 					result.WriteString(expansion)
 					i = j + 1 // Skip past the closing )
 					continue
@@ -803,26 +1395,76 @@ func (p *Preprocessor) expandFunctionMacro(text string, name string, macro *Func
 	return result.String()
 }
 
+// stringifyParam replaces #param with the quoted argument text (C #
+// operator). Skips ## (handled separately by pasteTokens).
+func stringifyParam(body, param, arg string) string {
+	// Match on masked text (strings blanked), splice from original.
+	masked := maskStrings(body)
+	var out strings.Builder
+	i := 0
+	for i < len(body) {
+		if masked[i] == '#' {
+			if i+1 < len(masked) && masked[i+1] == '#' {
+				out.WriteString("##")
+				i += 2
+				continue
+			}
+			j := i + 1
+			for j < len(masked) && (masked[j] == ' ' || masked[j] == '\t') {
+				j++
+			}
+			if strings.HasPrefix(masked[j:], param) {
+				k := j + len(param)
+				if (j == 0 || !isIdentifierChar(masked[j-1])) && (k >= len(masked) || !isIdentifierChar(masked[k])) {
+					out.WriteString(strconv.Quote(arg))
+					i = k
+					continue
+				}
+			}
+		}
+		out.WriteByte(body[i])
+		i++
+	}
+	return out.String()
+}
+
+func pasteTokens(s string) string {
+	for {
+		masked := maskStrings(s)
+		idx := strings.Index(masked, "##")
+		if idx < 0 {
+			return s
+		}
+		left := strings.TrimRight(s[:idx], " \t")
+		right := strings.TrimLeft(s[idx+2:], " \t")
+		if left == "" || right == "" {
+			return s
+		}
+		s = left + right
+	}
+}
+
 func replaceIdentifier(text, identifier, replacement string) string {
+	masked := maskStrings(text)
 	var result strings.Builder
 	i := 0
-	
+
 	for i < len(text) {
-		// Check if we found the identifier
-		if strings.HasPrefix(text[i:], identifier) {
+		// Check if we found the identifier (outside strings)
+		if strings.HasPrefix(masked[i:], identifier) {
 			// Check if it's a complete identifier (not part of another word)
-			if (i == 0 || !isIdentifierChar(text[i-1])) &&
-			   (i+len(identifier) >= len(text) || !isIdentifierChar(text[i+len(identifier)])) {
+			if (i == 0 || !isIdentifierChar(masked[i-1])) &&
+				(i+len(identifier) >= len(masked) || !isIdentifierChar(masked[i+len(identifier)])) {
 				result.WriteString(replacement)
 				i += len(identifier)
 				continue
 			}
 		}
-		
+
 		result.WriteByte(text[i])
 		i++
 	}
-	
+
 	return result.String()
 }
 

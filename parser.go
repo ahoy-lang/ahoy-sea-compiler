@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -16,6 +17,7 @@ const (
 	NodeReturn
 	NodeIf
 	NodeWhile
+	NodeDoWhile
 	NodeFor
 	NodeBlock
 	NodeExprStmt
@@ -38,6 +40,10 @@ const (
 	NodeDereference
 	NodeCompoundLiteral
 	NodeOffsetof
+	NodeComma
+	NodeGoto
+	NodeLabel
+	NodeSizeof
 )
 
 type ASTNode struct {
@@ -79,8 +85,9 @@ type ASTNode struct {
 	ForBody *ASTNode
 	
 	// For arrays and pointers
-	ArraySize    int  // Size of array (0 if not an array)
-	PointerLevel int  // Level of pointer indirection
+	ArraySize    int   // Size of array (0 if not an array)
+	Dims         []int // Per-dimension sizes for multi-dim arrays
+	PointerLevel int   // Level of pointer indirection
 	StructType   string // For struct variables, the struct name
 	
 	// For compound literals
@@ -92,10 +99,13 @@ type ASTNode struct {
 
 // StructMember represents a member of a struct
 type StructMember struct {
-	Name   string
-	Type   string
-	Offset int
-	Size   int
+	Name     string
+	Type     string
+	Offset   int
+	Size     int
+	ArrayLen int      // element count for array members (0 = not an array)
+	Dims     []int    // per-dimension sizes (multi-dim support)
+	Align    int      // element alignment (arrays align like elements)
 }
 
 // StructDef represents a struct definition
@@ -136,6 +146,25 @@ func NewParser(source string) *Parser {
 	typedefs["ssize_t"] = "long"
 	// stdbool.h
 	typedefs["bool"] = "int"
+	// Opaque libc types from skipped system headers (used only via
+	// pointers; sizes below match glibc x86-64 for .comm allocation).
+	typedefs["FILE"] = "struct FILE"
+	typedefs["DIR"] = "struct DIR"
+	typedefs["pthread_t"] = "unsigned long"
+	typedefs["pthread_mutex_t"] = "struct __pthread_mutex"
+	typedefs["pthread_cond_t"] = "struct __pthread_cond"
+	typedefs["pthread_attr_t"] = "struct __pthread_attr"
+	typedefs["pthread_key_t"] = "unsigned int"
+	// SDL3 stdint aliases (SDL headers use angle includes the parser
+	// cannot follow, so these never get declared; same widths as stdint).
+	typedefs["Uint8"] = "unsigned char"
+	typedefs["Uint16"] = "unsigned short"
+	typedefs["Uint32"] = "unsigned int"
+	typedefs["Uint64"] = "unsigned long"
+	typedefs["Sint8"] = "signed char"
+	typedefs["Sint16"] = "short"
+	typedefs["Sint32"] = "int"
+	typedefs["Sint64"] = "long"
 	
 	// Initialize with common standard library constants
 	enums := make(map[string]int)
@@ -146,8 +175,18 @@ func NewParser(source string) *Parser {
 	enums["SIGILL"] = 4    // Illegal instruction
 	enums["SIGINT"] = 2    // Interrupt
 	enums["SIGTERM"] = 15  // Termination signal
+	// dirent.h DT_* file types
+	enums["DT_UNKNOWN"] = 0
+	enums["DT_FIFO"] = 1
+	enums["DT_CHR"] = 2
+	enums["DT_DIR"] = 4
+	enums["DT_BLK"] = 6
+	enums["DT_REG"] = 8
+	enums["DT_LNK"] = 10
+	enums["DT_SOCK"] = 12
+	enums["DT_WHT"] = 14
 	
-	return &Parser{
+	p := &Parser{
 		tokens:   tokens,
 		pos:      0,
 		structs:  make(map[string]*StructDef),
@@ -155,6 +194,51 @@ func NewParser(source string) *Parser {
 		enums:    enums,
 		errors:   []error{},
 	}
+
+	// struct timespec + struct stat from skipped <sys/stat.h> (exact
+	// glibc x86-64 layout; bell uses st.st_mtime/st_size via glue.h).
+	p.structs["timespec"] = &StructDef{
+		Name: "timespec",
+		Members: []StructMember{
+			{Name: "tv_sec", Type: "long", Offset: 0, Size: 8, Align: 8},
+			{Name: "tv_nsec", Type: "long", Offset: 8, Size: 8, Align: 8},
+		},
+		Size: 16,
+	}
+	p.structs["stat"] = &StructDef{
+		Name: "stat",
+		Members: []StructMember{
+			{Name: "st_dev", Type: "unsigned long", Offset: 0, Size: 8, Align: 8},
+			{Name: "st_ino", Type: "unsigned long", Offset: 8, Size: 8, Align: 8},
+			{Name: "st_nlink", Type: "unsigned long", Offset: 16, Size: 8, Align: 8},
+			{Name: "st_mode", Type: "unsigned int", Offset: 24, Size: 4, Align: 4},
+			{Name: "st_uid", Type: "unsigned int", Offset: 28, Size: 4, Align: 4},
+			{Name: "st_gid", Type: "unsigned int", Offset: 32, Size: 4, Align: 4},
+			{Name: "__pad0", Type: "int", Offset: 36, Size: 4, Align: 4},
+			{Name: "st_rdev", Type: "unsigned long", Offset: 40, Size: 8, Align: 8},
+			{Name: "st_size", Type: "long", Offset: 48, Size: 8, Align: 8},
+			{Name: "st_blksize", Type: "long", Offset: 56, Size: 8, Align: 8},
+			{Name: "st_blocks", Type: "long", Offset: 64, Size: 8, Align: 8},
+			{Name: "st_atim", Type: "struct timespec", Offset: 72, Size: 16, Align: 8},
+			{Name: "st_mtim", Type: "struct timespec", Offset: 88, Size: 16, Align: 8},
+			{Name: "st_ctim", Type: "struct timespec", Offset: 104, Size: 16, Align: 8},
+		},
+		Size: 144,
+	}
+	// struct dirent from skipped <dirent.h> (exact glibc x86-64 layout;
+	// bell reads entry->d_name via glue.h).
+	p.structs["dirent"] = &StructDef{
+		Name: "dirent",
+		Members: []StructMember{
+			{Name: "d_ino", Type: "unsigned long", Offset: 0, Size: 8, Align: 8},
+			{Name: "d_off", Type: "long", Offset: 8, Size: 8, Align: 8},
+			{Name: "d_reclen", Type: "unsigned short", Offset: 16, Size: 2, Align: 2},
+			{Name: "d_type", Type: "unsigned char", Offset: 18, Size: 1, Align: 1},
+			{Name: "d_name", Type: "char", Offset: 19, Size: 256, Align: 1, ArrayLen: 256, Dims: []int{256}},
+		},
+		Size: 280,
+	}
+	return p
 }
 
 func (p *Parser) current() Token {
@@ -352,6 +436,11 @@ func (p *Parser) parseTopLevel() (*ASTNode, error) {
 		p.skipPreprocessor()
 		return nil, nil
 	}
+
+	// Static assertions at file scope.
+	if p.match(IDENTIFIER) && p.current().Lexeme == "_Static_assert" {
+		return p.parseStaticAssert()
+	}
 	
 	// Handle typedef
 	if p.match(TYPEDEF) {
@@ -413,7 +502,14 @@ func (p *Parser) parseTopLevel() (*ASTNode, error) {
 					}
 					
 					// Parse member name(s) - can have multiple per line like: int r, g, b, a;
+					// Each declarator may add its own stars: int *a, b;
+					baseMemberType := memberType
 					for {
+						memberType = baseMemberType
+						for p.match(STAR) {
+							memberType += "*"
+							p.advance()
+						}
 						if !p.match(IDENTIFIER) {
 							return nil, fmt.Errorf("expected member name")
 						}
@@ -421,37 +517,60 @@ func (p *Parser) parseTopLevel() (*ASTNode, error) {
 						p.advance()
 						
 						memberSize := p.getTypeSize(memberType)
-					
-					// Calculate alignment for this member
-					alignment := memberSize
-					if alignment > 8 {
-						alignment = 8  // Max alignment is 8 bytes
-					}
-					
-					// Add padding to align offset
-					if offset%alignment != 0 {
-						offset += alignment - (offset % alignment)
-					}
+						elemAlign := memberSize
 						
-						// Handle arrays: int arr[10];
-						if p.match(LBRACKET) {
+						// Handle arrays (multi-dim supported): int arr[10][20];
+						var memberDims []int
+						for p.match(LBRACKET) {
 							p.advance()
-							if p.match(NUMBER) {
-								sizeVal, _ := strconv.Atoi(p.current().Lexeme)
-								memberSize = sizeVal * memberSize
-								p.advance()
+							dim := 0
+							if !p.match(RBRACKET) {
+								dimExpr, derr := p.parseExpression()
+								if derr != nil {
+									return nil, derr
+								}
+								if folded, ok := p.evalConstInt(dimExpr); ok {
+									dim = folded
+								}
 							}
 							if !p.match(RBRACKET) {
 								return nil, fmt.Errorf("expected ]")
 							}
 							p.advance()
+							if dim <= 0 {
+								return nil, fmt.Errorf("array size must be a positive constant")
+							}
+							memberDims = append(memberDims, dim)
+							memberSize = dim * memberSize
 						}
 						
+						arrayLen := 0
+						for _, d := range memberDims {
+							if arrayLen == 0 { arrayLen = d } else { arrayLen *= d }
+						}
+						// Align by ELEMENT size (arrays align like their elements).
+						alignment := elemAlign
+						if alignment > 8 {
+							alignment = 8  // Max alignment is 8 bytes
+						}
+						if alignment > 0 && offset%alignment != 0 {
+							offset += alignment - (offset % alignment)
+						}
+						mAlign := elemAlign
+						if mAlign <= 0 {
+							mAlign = 1
+						}
+						if mAlign > 8 {
+							mAlign = 8
+						}
 						members = append(members, StructMember{
-							Name:   memberName,
-							Type:   memberType,
-							Offset: offset,
-							Size:   memberSize,
+							Name:     memberName,
+							Type:     memberType,
+							Offset:   offset,
+							Size:     memberSize,
+							ArrayLen: arrayLen,
+							Dims:     memberDims,
+							Align:    mAlign,
 						})
 						offset += memberSize
 						
@@ -479,7 +598,10 @@ func (p *Parser) parseTopLevel() (*ASTNode, error) {
 				// Calculate struct's alignment (max of all member alignments, capped at 8)
 				structAlignment := 1
 				for _, member := range members {
-					memberAlign := member.Size
+					memberAlign := member.Align
+					if memberAlign <= 0 {
+						memberAlign = member.Size
+					}
 					if memberAlign > 8 {
 						memberAlign = 8
 					}
@@ -520,25 +642,114 @@ func (p *Parser) parseTopLevel() (*ASTNode, error) {
 		
 		// typedef existing_type new_name;
 		existingType := p.parseType()
+		if p.match(LPAREN) {
+			// Function-pointer typedef: ret [(conv)] (*name)(params).
+			// A calling-convention macro (SDLCALL) may sit where the
+			// star goes. Unknown shapes skip the whole declaration
+			// (always terminates: consumes to ; or EOF).
+			isFnPtr := false
+			var aliasName string
+			// Tentative scan with rewind.
+			save := p.pos
+			p.advance() // (
+			for p.match(IDENTIFIER) {
+				p.advance()
+			}
+			if p.match(STAR) {
+				p.advance()
+				if p.match(IDENTIFIER) {
+					aliasName = p.current().Lexeme
+					p.advance()
+					if p.match(RPAREN) {
+						p.advance()
+						// Skip the parameter list (balanced parens).
+						if p.match(LPAREN) {
+							depth := 0
+							for !p.match(EOF) {
+								if p.match(LPAREN) {
+									depth++
+								} else if p.match(RPAREN) {
+									depth--
+									if depth == 0 {
+										p.advance()
+										break
+									}
+								}
+								p.advance()
+							}
+						}
+						isFnPtr = true
+					}
+				}
+			}
+			if !isFnPtr {
+				// Not the shape we handle: rewind and skip to ; .
+				p.pos = save
+				for !p.match(SEMICOLON) && !p.match(EOF) {
+					p.advance()
+				}
+				if p.match(SEMICOLON) {
+					p.advance()
+				}
+				return nil, nil
+			}
+			p.typedefs[aliasName] = "void*"
+			if p.match(SEMICOLON) {
+				p.advance()
+			}
+			return nil, nil
+		}
 		if p.match(IDENTIFIER) {
 			aliasName := p.current().Lexeme
 			p.advance()
-			p.typedefs[aliasName] = existingType
+			if p.match(LPAREN) {
+				// Plain function typedef: `typedef RET name(params);`.
+				// Skip the parameter list; functions only occur via
+				// pointers, so model as void* (like fn-ptr typedefs).
+				depth := 0
+				for !p.match(EOF) {
+					if p.match(LPAREN) {
+						depth++
+					} else if p.match(RPAREN) {
+						depth--
+						if depth == 0 {
+							p.advance()
+							break
+						}
+					}
+					p.advance()
+				}
+				p.typedefs[aliasName] = "void*"
+			} else {
+				p.typedefs[aliasName] = existingType
+			}
 		}
-		
+
 		if p.match(SEMICOLON) {
 			p.advance()
 		}
 		return nil, nil
 	}
 	
-	// Skip struct/union/typedef/enum - parse struct/union definitions
+	// Struct/union DEFINITIONS only (`struct {` or `struct Name {`). Any
+	// other `struct S ...` is a declaration using the type (variable,
+	// function returning struct) and falls through to normal parsing.
+	// Without this, `struct Big make_big(...)` was swallowed as a
+	// definition and the whole file silently vanished.
 	if p.match(STRUCT, UNION) {
+		isDef := false
+		if p.peek(1).Type == LBRACE {
+			isDef = true
+		} else if p.peek(1).Type == IDENTIFIER && p.peek(2).Type == LBRACE {
+			isDef = true
+		}
+		if isDef {
 		err := p.parseStructDef()
 		if err != nil {
 			return nil, err
 		}
 		return nil, nil
+		}
 	}
 	
 	if p.match(TYPEDEF) {
@@ -607,7 +818,11 @@ func (p *Parser) parseType() string {
 		if p.match(STATIC, CONST) {
 			typ += p.current().Lexeme + " "
 			p.advance()
-		} else if p.match(IDENTIFIER) && (p.current().Lexeme == "inline" || p.current().Lexeme == "extern") {
+		} else if p.match(IDENTIFIER) && (p.current().Lexeme == "inline" || p.current().Lexeme == "extern" ||
+			p.current().Lexeme == "_Thread_local" || p.current().Lexeme == "__thread") {
+			// _Thread_local/__thread accepted but not implemented
+			// (single-threaded codegen; bell/stb only use it for
+			// failure strings).
 			typ += p.current().Lexeme + " "
 			p.advance()
 		} else {
@@ -632,72 +847,31 @@ func (p *Parser) parseType() string {
 			typ = structOrUnion + " " + p.current().Lexeme
 			p.advance()
 		} else if p.match(LBRACE) {
-			// Anonymous struct/union definition
-			// Generate a unique name for it
+			// Anonymous struct/union definition: parse with the shared
+			// full body parser (correct sizes, multi-declarators, nested
+			// anonymous members, unions).
 			anonName := fmt.Sprintf("__anon_%s_%d", structOrUnion, p.pos)
 			typ = structOrUnion + " " + anonName
-			
-			// Parse the struct/union definition properly
-			p.advance() // skip {
-			
-			var members []StructMember
-			offset := 0
-			for !p.match(RBRACE) && !p.match(EOF) {
-				// Parse field type
-				fieldType := p.parseType()
-				
-				// Parse field name
-				if !p.match(IDENTIFIER) {
-					// Skip this - might be an error but continue parsing
-					p.advance()
-					continue
-				}
-				fieldName := p.current().Lexeme
-				p.advance()
-				
-				// Calculate size (simplified - just use 8 bytes for everything)
-				fieldSize := 8
-				
-				members = append(members, StructMember{
-					Name:   fieldName,
-					Type:   fieldType,
-					Offset: offset,
-					Size:   fieldSize,
-				})
-				
-				// For unions, all members are at offset 0
-				if structOrUnion == "union" {
-					offset = 0
-				} else {
-					offset += fieldSize
-				}
-				
-				// Expect semicolon
-				if !p.match(SEMICOLON) {
-					// Skip if no semicolon - just continue to next iteration
-					continue
-				}
-				p.advance() // Skip the semicolon
-			}
-			
-			// We're now at } - advance past it
-			if p.match(RBRACE) {
-				p.advance()
-			} else {
-				// Shouldn't happen but skip to closing brace if needed
-				for !p.match(RBRACE) && !p.match(EOF) {
+			savePos := p.pos
+			if berr := p.parseStructBody(structOrUnion, anonName, false); berr != nil {
+				// Lenient fallback (old behavior skipped junk): rewind,
+				// skip the balanced definition, register an empty struct.
+				p.pos = savePos
+				depth := 0
+				for !p.match(EOF) {
+					if p.match(LBRACE) {
+						depth++
+					}
+					if p.match(RBRACE) {
+						depth--
+						if depth == 0 {
+							p.advance()
+							break
+						}
+					}
 					p.advance()
 				}
-				if p.match(RBRACE) {
-					p.advance()
-				}
-			}
-			
-			// Register the anonymous struct/union
-			p.structs[anonName] = &StructDef{
-				Name:    anonName,
-				Members: members,
-				Size:    offset,
+				p.structs[anonName] = &StructDef{Name: anonName}
 			}
 		}
 	} else if p.match(IDENTIFIER) {
@@ -718,10 +892,17 @@ func (p *Parser) parseType() string {
 		// don't consume it - it's likely the variable name, not a type
 	}
 	
-	// Pointers
-	for p.match(STAR) {
-		typ += "*"
-		p.advance()
+	// Pointers, allowing interleaved qualifiers (char * const *p).
+	// Qualifiers don't affect layout, so only stars are recorded.
+	for {
+		if p.match(STAR) {
+			typ += "*"
+			p.advance()
+		} else if p.match(CONST) {
+			p.advance()
+		} else {
+			break
+		}
 	}
 	
 	// If we have modifiers but no base type, default to int
@@ -790,41 +971,99 @@ func (p *Parser) parseFnPtrMember(retType string, offset *int) (StructMember, er
 }
 
 func (p *Parser) parseStructDef() error {
-	p.advance() // skip 'struct'
-	
+	kind := p.current().Lexeme // "struct" or "union"
+	p.advance()                // skip it
+
 	// Get struct name (optional for anonymous structs in typedefs)
 	var structName string
 	if p.match(IDENTIFIER) {
 		structName = p.current().Lexeme
 		p.advance()
 	}
-	
+
 	// Check for just declaration (struct Foo;) or definition
 	if p.match(SEMICOLON) {
 		p.advance()
 		return nil // Forward declaration, ignore
 	}
-	
+
 	if !p.match(LBRACE) {
 		// It's a variable declaration using the struct, skip for now
 		p.skipStructOrTypedef()
 		return nil
 	}
-	
+
 	// Anonymous struct - generate a name
 	if structName == "" {
 		structName = "__anon_struct_" + fmt.Sprintf("%d", p.pos)
 	}
-	
+
+	return p.parseStructBody(kind, structName, true)
+}
+
+// parseStructBody parses `{ members }` (current token is `{`) and registers
+// the definition. Shared by named definitions and nested anonymous ones.
+// Unions get all-zero offsets; anonymous struct/union members (no declarator)
+// inline their members into the parent (C11 promotion). topLevel controls
+// the trailing `varname? ;` (a top-level definition owns it; a member type
+// must leave the `;` for the anonymous-member check).
+func (p *Parser) parseStructBody(kind string, structName string, topLevel bool) error {
 	p.advance() // skip {
-	
+
 	members := []StructMember{}
 	currentOffset := 0
-	
+	maxMemberSize := 0
+
 	// Parse members
 	for !p.match(RBRACE) && !p.match(EOF) {
 		// Parse member type
 		memberType := p.parseType()
+
+		// Anonymous member (no declarator): `struct {...};` — inline.
+		if p.match(SEMICOLON) {
+			subName := memberType
+			for _, q := range []string{"struct ", "union ", "const ", "volatile "} {
+				subName = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(subName), q))
+			}
+			if sub, ok := p.structs[subName]; ok {
+				subAlign := 1
+				for _, m := range sub.Members {
+					a := m.Align
+					if a <= 0 {
+						a = m.Size
+					}
+					if a > 8 {
+						a = 8
+					}
+					if a > subAlign {
+						subAlign = a
+					}
+				}
+				if currentOffset%subAlign != 0 {
+					currentOffset += subAlign - (currentOffset % subAlign)
+				}
+				for _, m := range sub.Members {
+					if m.Name == "" {
+						continue
+					}
+					members = append(members, StructMember{
+						Name:     m.Name,
+						Type:     m.Type,
+						Offset:   currentOffset + m.Offset,
+						Size:     m.Size,
+						ArrayLen: m.ArrayLen,
+						Dims:     m.Dims,
+						Align:    m.Align,
+					})
+				}
+				currentOffset += sub.Size
+				if sub.Size > maxMemberSize {
+					maxMemberSize = sub.Size
+				}
+			}
+			p.advance() // skip ;
+			continue
+		}
 
 		// Function pointer member: ret (*name)(params);
 		if p.match(LPAREN) {
@@ -840,8 +1079,15 @@ func (p *Parser) parseStructDef() error {
 			continue
 		}
 		
-		// Parse member name(s) - can have multiple per line
+		// Parse member name(s) - can have multiple per line.
+		// Each declarator may add its own stars: int *a, b;
+		baseMemberTypeB := memberType
 		for {
+			memberType = baseMemberTypeB
+			for p.match(STAR) {
+				memberType += "*"
+				p.advance()
+			}
 			if !p.match(IDENTIFIER) {
 				return fmt.Errorf("expected member name in struct")
 			}
@@ -851,48 +1097,74 @@ func (p *Parser) parseStructDef() error {
 			
 			// Calculate actual member size based on type
 			memberSize := p.getTypeSize(memberType)
+			elemAlignB := memberSize
 			
-			// Calculate alignment for this member
-			alignment := memberSize
-			if alignment > 8 {
-				alignment = 8  // Max alignment is 8 bytes
-			}
-			
-			// Add padding to align currentOffset
-			if currentOffset%alignment != 0 {
-				currentOffset += alignment - (currentOffset % alignment)
-			}
-			
-			// Handle arrays: int arr[10];
-			if p.match(LBRACKET) {
+			// Handle arrays (multi-dim supported): int arr[10][20];
+			var memberDims []int
+			for p.match(LBRACKET) {
 				p.advance()
-				if p.match(NUMBER) {
-					sizeVal, _ := strconv.Atoi(p.current().Lexeme)
-					memberSize = sizeVal * memberSize
-					p.advance()
+				dim := 0
+				if !p.match(RBRACKET) {
+					dimExpr, derr := p.parseExpression()
+					if derr != nil {
+						return derr
+					}
+					if folded, ok := p.evalConstInt(dimExpr); ok {
+						dim = folded
+					}
 				}
 				if !p.match(RBRACKET) {
 					return fmt.Errorf("expected ]")
 				}
 				p.advance()
+				if dim <= 0 {
+					return fmt.Errorf("array size must be a positive constant")
+				}
+				memberDims = append(memberDims, dim)
+				memberSize = dim * memberSize
 			}
 			
+			arrayLen := 0
+			for _, d := range memberDims {
+				if arrayLen == 0 { arrayLen = d } else { arrayLen *= d }
+			}
+			// Align by ELEMENT size (arrays align like their elements).
+			alignmentB := elemAlignB
+			if alignmentB > 8 {
+				alignmentB = 8  // Max alignment is 8 bytes
+			}
+			if alignmentB > 0 && currentOffset%alignmentB != 0 {
+				currentOffset += alignmentB - (currentOffset % alignmentB)
+			}
+			mAlignB := elemAlignB
+			if mAlignB <= 0 {
+				mAlignB = 1
+			}
+			if mAlignB > 8 {
+				mAlignB = 8
+			}
 			members = append(members, StructMember{
-				Name:   memberName,
-				Type:   memberType,
-				Offset: currentOffset,
-				Size:   memberSize,
+				Name:     memberName,
+				Type:     memberType,
+				Offset:   currentOffset,
+				Size:     memberSize,
+				ArrayLen: arrayLen,
+				Dims:     memberDims,
+				Align:    mAlignB,
 			})
 			
 			currentOffset += memberSize
-			
+			if memberSize > maxMemberSize {
+				maxMemberSize = memberSize
+			}
+
 			if p.match(COMMA) {
 				p.advance()
 				continue
 			}
 			break
 		}
-		
+
 		if !p.match(SEMICOLON) {
 			return fmt.Errorf("expected ; after struct member")
 		}
@@ -904,18 +1176,33 @@ func (p *Parser) parseStructDef() error {
 	}
 	p.advance()
 	
-	// Optional variable name and semicolon
-	if p.match(IDENTIFIER) {
-		p.advance()
-	}
-	if p.match(SEMICOLON) {
-		p.advance()
+	// Optional variable name and semicolon (top-level definitions only;
+	// member types must not consume the declarator or its semicolon).
+	if topLevel {
+		if p.match(IDENTIFIER) {
+			p.advance()
+		}
+		if p.match(SEMICOLON) {
+			p.advance()
+		}
 	}
 	
+	// Unions overlap: every member lives at offset 0 and the size is
+	// the largest member (anonymous members contribute via maxMemberSize).
+	if kind == "union" {
+		for i := range members {
+			members[i].Offset = 0
+		}
+		currentOffset = maxMemberSize
+	}
+
 	// Calculate struct's alignment (max of all member alignments, capped at 8)
 	structAlignment := 1
 	for _, member := range members {
-		memberAlign := member.Size
+		memberAlign := member.Align
+		if memberAlign <= 0 {
+			memberAlign = member.Size
+		}
 		if memberAlign > 8 {
 			memberAlign = 8
 		}
@@ -923,19 +1210,19 @@ func (p *Parser) parseStructDef() error {
 			structAlignment = memberAlign
 		}
 	}
-	
+
 	// Add padding at end to make struct size a multiple of its alignment
 	if currentOffset%structAlignment != 0 {
 		currentOffset += structAlignment - (currentOffset % structAlignment)
 	}
-	
+
 	// Store struct definition
 	p.structs[structName] = &StructDef{
 		Name:    structName,
 		Members: members,
 		Size:    currentOffset,
 	}
-	
+
 	return nil
 }
 
@@ -1041,6 +1328,9 @@ func (p *Parser) skipStructOrTypedef() {
 }
 
 func (p *Parser) parseFunction(name string, returnType string) (*ASTNode, error) {
+	if os.Getenv("SEAPARSE") != "" {
+		fmt.Fprintf(os.Stderr, "FUNCDEF %q ret=%q line=%d\n", name, returnType, p.current().Line)
+	}
 	p.advance() // skip (
 	
 	params := []string{}
@@ -1108,7 +1398,8 @@ func (p *Parser) parseFunction(name string, returnType string) (*ASTNode, error)
 					p.advance()
 				}
 			}
-		} else if lexeme == "extern" || lexeme == "static" || lexeme == "inline" {
+		} else if lexeme == "extern" || lexeme == "static" || lexeme == "inline" ||
+			lexeme == "_Thread_local" || lexeme == "__thread" {
 			// These might appear here too - just skip
 			p.advance()
 		} else {
@@ -1149,13 +1440,72 @@ func (p *Parser) parseFunction(name string, returnType string) (*ASTNode, error)
 }
 
 func (p *Parser) parseGlobalVar(name string, dataType string) (*ASTNode, error) {
-	var children []*ASTNode
-	// Array dimensions (record size, skip contents).
-	if p.match(LBRACKET) {
-		// Leave dims to best effort: skip to = or ;.
-		for !p.match(ASSIGN) && !p.match(SEMICOLON) && !p.match(EOF) {
+	var decls []*ASTNode
+	declType := dataType
+	declName := name
+	for {
+		node, err := p.parseGlobalDeclarator(declName, declType, dataType)
+		if err != nil {
+			return nil, err
+		}
+		decls = append(decls, node)
+		// Additional declarators: int a = 1, b = 2; (also with
+		// per-declarator pointers: int *a, *b;).
+		if !p.match(COMMA) {
+			break
+		}
+		p.advance()
+		declType = dataType
+		for p.match(STAR) {
+			declType += "*"
 			p.advance()
 		}
+		if !p.match(IDENTIFIER) {
+			return nil, fmt.Errorf("expected identifier after ,")
+		}
+		declName = p.current().Lexeme
+		p.advance()
+	}
+	for !p.match(SEMICOLON) && !p.match(EOF) {
+		p.advance()
+	}
+	if p.match(SEMICOLON) {
+		p.advance()
+	}
+	if len(decls) == 1 {
+		return decls[0], nil
+	}
+	return &ASTNode{
+		Type:     NodeBlock,
+		Children: decls,
+	}, nil
+}
+
+func (p *Parser) parseGlobalDeclarator(name string, declType string, dataType string) (*ASTNode, error) {
+	var children []*ASTNode
+	var dims []int
+	// Array dimensions: record constant sizes (needed for .data sizing
+	// and indexed addressing of initialized globals).
+	for p.match(LBRACKET) {
+		p.advance()
+		if p.match(RBRACKET) {
+			p.advance()
+			dims = append(dims, 0) // unsized: infer from init below
+			continue
+		}
+		sizeExpr, err := p.parseExpression()
+		if err != nil {
+			return nil, err
+		}
+		if v, ok := p.evalConstInt(sizeExpr); ok && v > 0 {
+			dims = append(dims, v)
+		} else {
+			return nil, fmt.Errorf("array size must be a constant")
+		}
+		if !p.match(RBRACKET) {
+			return nil, fmt.Errorf("expected ]")
+		}
+		p.advance()
 	}
 	// Optional constant initializer.
 	if p.match(ASSIGN) {
@@ -1175,20 +1525,36 @@ func (p *Parser) parseGlobalVar(name string, dataType string) (*ASTNode, error) 
 			children = append(children, init)
 		}
 	}
-	for !p.match(SEMICOLON) && !p.match(EOF) {
-		p.advance()
+	arraySize := 0
+	if len(dims) > 0 {
+		// Unsized single dim infers from a positional brace init.
+		if len(dims) == 1 && dims[0] == 0 && len(children) > 0 &&
+			children[0].Type == NodeCompoundLiteral && !p.isStructTypeName(declType) {
+			allPos := true
+			for _, f := range children[0].InitFields {
+				if f != "" {
+					allPos = false
+					break
+				}
+			}
+			if allPos {
+				dims[0] = len(children[0].Children)
+			}
+		}
+		total := 1
+		for _, d := range dims {
+			total *= d
+		}
+		arraySize = total
 	}
-
-	if p.match(SEMICOLON) {
-		p.advance()
-	}
-
 	return &ASTNode{
-		Type:     NodeVarDecl,
-		VarName:  name,
-		DataType: dataType,
-		IsGlobal: true,
-		Children: children,
+		Type:      NodeVarDecl,
+		VarName:   name,
+		DataType:  declType,
+		IsGlobal:  true,
+		Children:  children,
+		Dims:      dims,
+		ArraySize: arraySize,
 	}, nil
 }
 
@@ -1220,7 +1586,43 @@ func (p *Parser) parseBlock() (*ASTNode, error) {
 	return block, nil
 }
 
+// parseStaticAssert parses `_Static_assert(expr, msg);` at block or file
+// scope. Foldable-false conditions are compile errors (like C); anything
+// else is dropped (it carries no runtime meaning).
+func (p *Parser) parseStaticAssert() (*ASTNode, error) {
+	p.advance() // skip _Static_assert
+	if !p.match(LPAREN) {
+		return nil, fmt.Errorf("expected ( after _Static_assert")
+	}
+	p.advance()
+	cond, err := p.parseAssignment()
+	if err != nil {
+		return nil, err
+	}
+	if p.match(COMMA) {
+		p.advance()
+		// message: string literal (or any expression, skipped)
+		if _, err := p.parseAssignment(); err != nil {
+			return nil, err
+		}
+	}
+	if !p.match(RPAREN) {
+		return nil, fmt.Errorf("expected ) in _Static_assert")
+	}
+	p.advance()
+	if p.match(SEMICOLON) {
+		p.advance()
+	}
+	if v, ok := p.evalConstInt(cond); ok && v == 0 {
+		return nil, fmt.Errorf("_Static_assert failed")
+	}
+	return nil, nil
+}
+
 func (p *Parser) parseStatement() (*ASTNode, error) {
+	if p.match(IDENTIFIER) && p.current().Lexeme == "_Static_assert" {
+		return p.parseStaticAssert()
+	}
 	// Variable declaration (with optional storage class and type modifiers)
 	if p.match(INT, CHAR_KW, FLOAT, DOUBLE, VOID, STATIC, CONST, STRUCT, UNION, UNSIGNED, SIGNED, LONG, SHORT) {
 		return p.parseVarDecl()
@@ -1241,6 +1643,34 @@ func (p *Parser) parseStatement() (*ASTNode, error) {
 		}
 	}
 	
+	// Goto statement: goto label;
+	if p.match(GOTO) {
+		p.advance()
+		if !p.match(IDENTIFIER) {
+			return nil, fmt.Errorf("expected label name after goto")
+		}
+		name := p.current().Lexeme
+		p.advance()
+		if p.match(SEMICOLON) {
+			p.advance()
+		}
+		return &ASTNode{
+			Type:  NodeGoto,
+			Value: name,
+		}, nil
+	}
+
+	// Label definition: name: (function-scoped, resolved per function)
+	if p.match(IDENTIFIER) && p.peek(1).Type == COLON {
+		name := p.current().Lexeme
+		p.advance()
+		p.advance() // skip :
+		return &ASTNode{
+			Type:  NodeLabel,
+			Value: name,
+		}, nil
+	}
+
 	// Return
 	if p.match(RETURN) {
 		return p.parseReturn()
@@ -1254,6 +1684,11 @@ func (p *Parser) parseStatement() (*ASTNode, error) {
 	// While
 	if p.match(WHILE) {
 		return p.parseWhile()
+	}
+
+	// Do-while
+	if p.match(DO) {
+		return p.parseDoWhile()
 	}
 	
 	// For
@@ -1308,11 +1743,86 @@ func (p *Parser) parseStatement() (*ASTNode, error) {
 	return nil, nil
 }
 
+// evalConstInt folds a constant integer expression (for array sizes and
+// other compile-time contexts): literals, enum names, unary -/+, and
+// +,-,*,/,% over constants. sizeof() already folds to a number upstream.
+func (p *Parser) evalConstInt(node *ASTNode) (int, bool) {
+	if node == nil {
+		return 0, false
+	}
+	switch node.Type {
+	case NodeNumber:
+		if v, err := strconv.ParseInt(node.Value, 0, 64); err == nil {
+			return int(v), true
+		}
+		return node.IntValue, true
+	case NodeIdentifier:
+		if v, ok := p.enums[node.VarName]; ok {
+			return v, true
+		}
+		return 0, false
+	case NodeUnaryOp:
+		if len(node.Children) != 1 {
+			return 0, false
+		}
+		v, ok := p.evalConstInt(node.Children[0])
+		if !ok {
+			return 0, false
+		}
+		if node.Operator == "-" {
+			return -v, true
+		}
+		if node.Operator == "+" {
+			return v, true
+		}
+		return 0, false
+	case NodeBinaryOp:
+		if len(node.Children) != 2 {
+			return 0, false
+		}
+		a, ok1 := p.evalConstInt(node.Children[0])
+		b, ok2 := p.evalConstInt(node.Children[1])
+		if !ok1 || !ok2 {
+			return 0, false
+		}
+		switch node.Operator {
+		case "+":
+			return a + b, true
+		case "-":
+			return a - b, true
+		case "*":
+			return a * b, true
+		case "/":
+			if b == 0 {
+				return 0, false
+			}
+			return a / b, true
+		case "%":
+			if b == 0 {
+				return 0, false
+			}
+			return a % b, true
+		case "<<":
+			return a << uint(b), true
+		case ">>":
+			return a >> uint(b), true
+		}
+		return 0, false
+	}
+	return 0, false
+}
+
 func (p *Parser) parseVarDecl() (*ASTNode, error) {
 	dataType := p.parseType()
 
 	decls := []*ASTNode{}
 	for {
+		// Pointer declarators: float *v, *n;  T *a = 0, *b = 0
+		declType := dataType
+		for p.match(STAR) {
+			declType += "*"
+			p.advance()
+		}
 		if !p.match(IDENTIFIER) {
 			return nil, fmt.Errorf("expected identifier")
 		}
@@ -1323,23 +1833,22 @@ func (p *Parser) parseVarDecl() (*ASTNode, error) {
 		node := &ASTNode{
 			Type:     NodeVarDecl,
 			VarName:  varName,
-			DataType: dataType,
+			DataType: declType,
 		}
 
-		// Handle array declaration: int arr[10]
-		if p.match(LBRACKET) {
+		// Handle array declaration (multi-dim): int arr[10][20]
+		for p.match(LBRACKET) {
 			p.advance()
 
 			if !p.match(RBRACKET) {
-				// Array size
+				// Array size: any constant expression (8+1, 14*3, N).
 				sizeExpr, err := p.parseExpression()
 				if err != nil {
 					return nil, err
 				}
 
-				// For now, only support constant sizes
-				if sizeExpr.Type == NodeNumber {
-					node.ArraySize = sizeExpr.IntValue
+				if v, ok := p.evalConstInt(sizeExpr); ok && v > 0 {
+					node.Dims = append(node.Dims, v)
 				} else {
 					return nil, fmt.Errorf("array size must be a constant")
 				}
@@ -1349,6 +1858,13 @@ func (p *Parser) parseVarDecl() (*ASTNode, error) {
 				return nil, fmt.Errorf("expected ']'")
 			}
 			p.advance()
+		}
+		if len(node.Dims) > 0 {
+			total := 1
+			for _, d := range node.Dims {
+				total *= d
+			}
+			node.ArraySize = total
 		}
 
 		// Handle initialization
@@ -1365,11 +1881,32 @@ func (p *Parser) parseVarDecl() (*ASTNode, error) {
 				}
 				node.Children = []*ASTNode{initExpr}
 			} else {
-				initExpr, err := p.parseExpression()
+				// Assignment level only: a top-level comma separates
+				// declarators (int a = 1, b = 2), it isn't an operator.
+				initExpr, err := p.parseAssignment()
 				if err != nil {
 					return nil, err
 				}
 				node.Children = []*ASTNode{initExpr}
+			}
+		}
+
+		// Unsize arrays infer from brace init: `int a[] = {1,2,3}`.
+		// (Structs excluded: `struct P p = {1,2}` is not an array.)
+		if len(node.Dims) == 0 && len(node.Children) > 0 &&
+			node.Children[0].Type == NodeCompoundLiteral && !p.isStructTypeName(declType) {
+			allPos := true
+			for _, f := range node.Children[0].InitFields {
+				if f != "" {
+					allPos = false
+					break
+				}
+			}
+			if allPos {
+				if n := len(node.Children[0].Children); n > 0 {
+					node.Dims = []int{n}
+					node.ArraySize = n
+				}
 			}
 		}
 
@@ -1382,6 +1919,7 @@ func (p *Parser) parseVarDecl() (*ASTNode, error) {
 		p.advance()
 	}
 
+
 	if p.match(SEMICOLON) {
 		p.advance()
 	}
@@ -1393,6 +1931,24 @@ func (p *Parser) parseVarDecl() (*ASTNode, error) {
 		Type:     NodeBlock,
 		Children: decls,
 	}, nil
+}
+
+// isStructTypeName reports whether a declared type is a struct/union
+// (directly or via typedef), for array-size inference.
+func (p *Parser) isStructTypeName(t string) bool {
+	t = strings.TrimSpace(t)
+	for _, q := range []string{"const ", "volatile ", "static ", "extern "} {
+		t = strings.TrimSpace(strings.TrimPrefix(t, q))
+	}
+	// Strip pointers: `struct S *` is not a struct value.
+	t = strings.TrimSpace(strings.TrimRight(t, "*"))
+	if strings.HasPrefix(t, "struct ") || strings.HasPrefix(t, "union ") {
+		return true
+	}
+	if r := p.resolveTypedef(t); r != t {
+		return p.isStructTypeName(r)
+	}
+	return false
 }
 
 func (p *Parser) parseReturn() (*ASTNode, error) {
@@ -1480,6 +2036,41 @@ func (p *Parser) parseWhile() (*ASTNode, error) {
 	}, nil
 }
 
+func (p *Parser) parseDoWhile() (*ASTNode, error) {
+	p.advance() // skip do
+
+	body, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+
+	if !p.match(WHILE) {
+		return nil, fmt.Errorf("expected while after do body")
+	}
+	p.advance()
+
+	if p.match(LPAREN) {
+		p.advance()
+	}
+
+	cond, err := p.parseExpression()
+	if err != nil {
+		return nil, err
+	}
+
+	if p.match(RPAREN) {
+		p.advance()
+	}
+	if p.match(SEMICOLON) {
+		p.advance()
+	}
+
+	return &ASTNode{
+		Type:     NodeDoWhile,
+		Children: []*ASTNode{body, cond},
+	}, nil
+}
+
 func (p *Parser) parseFor() (*ASTNode, error) {
 	p.advance() // skip for
 	
@@ -1490,7 +2081,7 @@ func (p *Parser) parseFor() (*ASTNode, error) {
 	var init *ASTNode
 	if !p.match(SEMICOLON) {
 		var err error
-		if p.match(INT) {
+		if p.match(INT, CHAR_KW, FLOAT, DOUBLE, VOID, STATIC, CONST, STRUCT, UNION, UNSIGNED, SIGNED, LONG, SHORT) || p.isTypeName() {
 			init, err = p.parseVarDecl()
 		} else {
 			init, err = p.parseExpression()
@@ -1669,7 +2260,29 @@ func (p *Parser) parseCase() (*ASTNode, error) {
 }
 
 func (p *Parser) parseExpression() (*ASTNode, error) {
-	return p.parseAssignment()
+	// Comma operator (lowest precedence): a, b evaluates both, yields b.
+	// Separators (call args, init lists, declarators) use parseAssignment
+	// directly and are unaffected.
+	first, err := p.parseAssignment()
+	if err != nil {
+		return nil, err
+	}
+	if !p.match(COMMA) {
+		return first, nil
+	}
+	children := []*ASTNode{first}
+	for p.match(COMMA) {
+		p.advance()
+		next, err := p.parseAssignment()
+		if err != nil {
+			return nil, err
+		}
+		children = append(children, next)
+	}
+	return &ASTNode{
+		Type:     NodeComma,
+		Children: children,
+	}, nil
 }
 
 func (p *Parser) parseAssignment() (*ASTNode, error) {
@@ -1678,7 +2291,7 @@ func (p *Parser) parseAssignment() (*ASTNode, error) {
 		return nil, err
 	}
 	
-	if p.match(ASSIGN, PLUSASSIGN, MINUSASSIGN, STARASSIGN, SLASHASSIGN) {
+	if p.match(ASSIGN, PLUSASSIGN, MINUSASSIGN, STARASSIGN, SLASHASSIGN, PERCENTASSIGN, LSHIFTASSIGN, RSHIFTASSIGN, BANDASSIGN, BORASSIGN, BXORASSIGN) {
 		op := p.current().Lexeme
 		p.advance()
 		
@@ -2108,16 +2721,21 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 			typeName := p.parseType()
 			sizeVal = p.getTypeSize(typeName)
 		} else {
-			// Expression - parse and get its type
+			// Expression form: defer to selection (needs scope info for
+			// array totals; the parser has no symbol table).
 			expr, err := p.parseExpression()
 			if err != nil {
 				return nil, err
 			}
-			// For now, assume all expressions are int-sized
-			sizeVal = p.getTypeSize(expr.DataType)
-			if sizeVal == 0 {
-				sizeVal = 4 // Default to int size
+			if !p.match(RPAREN) {
+				return nil, fmt.Errorf("expected ')' after sizeof")
 			}
+			p.advance()
+
+			return &ASTNode{
+				Type:     NodeSizeof,
+				Children: []*ASTNode{expr},
+			}, nil
 		}
 		
 		if !p.match(RPAREN) {
@@ -2290,6 +2908,9 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 				if nextToken.Type == STAR || nextToken.Type == RPAREN {
 					// (TypeName*) or (TypeName) - likely a cast
 					isCast = true
+				} else if nextToken.Type == LPAREN && p.pos+2 < len(p.tokens) && p.tokens[p.pos+2].Type == STAR {
+					// (TypeName (*)(...)) - function-pointer cast
+					isCast = true
 				}
 			}
 		}
@@ -2297,6 +2918,49 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 		if isCast {
 			// Parse as cast
 			castType := p.parseType()
+			if p.match(LPAREN) {
+				// Function-pointer cast: (ret (*)(params)). The value
+				// passes through (all pointers are addresses); the type
+				// marks it callable through for indirect calls.
+				p.advance() // (
+				if !p.match(STAR) {
+					return nil, fmt.Errorf("expected * in function pointer cast")
+				}
+				p.advance()
+				if !p.match(RPAREN) {
+					return nil, fmt.Errorf("expected ) in function pointer cast")
+				}
+				p.advance()
+				if !p.match(LPAREN) {
+					return nil, fmt.Errorf("expected (params) in function pointer cast")
+				}
+				depth := 0
+				for !p.match(EOF) {
+					if p.match(LPAREN) {
+						depth++
+					} else if p.match(RPAREN) {
+						depth--
+						if depth == 0 {
+							p.advance()
+							break
+						}
+					}
+					p.advance()
+				}
+				if !p.match(RPAREN) {
+					return nil, fmt.Errorf("expected ) after function pointer cast")
+				}
+				p.advance()
+				expr, err := p.parseUnary()
+				if err != nil {
+					return nil, err
+				}
+				return &ASTNode{
+					Type:     NodeCast,
+					DataType: castType + "*",
+					Children: []*ASTNode{expr},
+				}, nil
+			}
 			if p.match(RPAREN) {
 				p.advance()
 				

@@ -103,13 +103,19 @@ func (ce *CodeEmitter) emitBssSection() {
 			continue
 		}
 		// Initialized globals go to .data (BSS would zero them).
-		if sym.Init != nil && sym.ArraySize == 0 {
-			if sym.Init.Type == NodeCompoundLiteral {
-				if ce.emitDataStruct(name, sym, sym.Init) {
+		if sym.Init != nil {
+			if sym.Init.Type == NodeCompoundLiteral && sym.ArraySize > 0 {
+				if ce.emitDataArray(name, sym, sym.Init) {
 					continue
 				}
-			} else if ce.emitDataGlobal(name, sym) {
-				continue
+			} else if sym.ArraySize == 0 {
+				if sym.Init.Type == NodeCompoundLiteral {
+					if ce.emitDataStruct(name, sym, sym.Init) {
+						continue
+					}
+				} else if ce.emitDataGlobal(name, sym) {
+					continue
+				}
 			}
 		}
 		ce.bssSection.WriteString(fmt.Sprintf("    .comm %s,%d,%d\n", name, sym.Size, sym.Size))
@@ -297,6 +303,75 @@ func (ce *CodeEmitter) emitDataGlobal(name string, sym *Symbol) bool {
 	return true
 }
 
+// emitDataArray emits an initialized global array to .data, element by
+// element with zero-fill for the remainder. Returns false (caller falls
+// back to .comm) when any element isn't a constant.
+func (ce *CodeEmitter) emitDataArray(name string, sym *Symbol, node *ASTNode) bool {
+	elemSize := 8
+	if sym.ArraySize > 0 {
+		elemSize = sym.Size / sym.ArraySize
+	}
+	if elemSize <= 0 {
+		elemSize = 8
+	}
+	type elemVal struct {
+		val  string
+		kind string
+	}
+	var vals []elemVal
+	for _, e := range node.Children {
+		v, k := ce.constInitValue(e, nil)
+		if k == "" {
+			return false
+		}
+		vals = append(vals, elemVal{v, k})
+	}
+	if sym.IsStatic {
+		ce.dataSection.WriteString(fmt.Sprintf("    .local %s\n", name))
+	} else {
+		ce.dataSection.WriteString(fmt.Sprintf("    .globl %s\n", name))
+	}
+	align := elemSize
+	if align > 8 {
+		align = 8
+	}
+	if align < 1 {
+		align = 1
+	}
+	ce.dataSection.WriteString(fmt.Sprintf("    .align %d\n", align))
+	ce.dataSection.WriteString(fmt.Sprintf("%s:\n", name))
+	emitOne := func(val, kind string) {
+		switch kind {
+		case "string":
+			ce.dataSection.WriteString(fmt.Sprintf("    .quad %s\n", val))
+		case "double":
+			if elemSize == 4 {
+				ce.dataSection.WriteString(fmt.Sprintf("    .float %s\n", val))
+			} else {
+				ce.dataSection.WriteString(fmt.Sprintf("    .double %s\n", val))
+			}
+		default:
+			switch elemSize {
+			case 4:
+				ce.dataSection.WriteString(fmt.Sprintf("    .long %s\n", val))
+			case 2:
+				ce.dataSection.WriteString(fmt.Sprintf("    .value %s\n", val))
+			case 1:
+				ce.dataSection.WriteString(fmt.Sprintf("    .byte %s\n", val))
+			default:
+				ce.dataSection.WriteString(fmt.Sprintf("    .quad %s\n", val))
+			}
+		}
+	}
+	for _, e := range vals {
+		emitOne(e.val, e.kind)
+	}
+	if rest := sym.ArraySize - len(vals); rest > 0 {
+		ce.dataSection.WriteString(fmt.Sprintf("    .zero %d\n", rest*elemSize))
+	}
+	return true
+}
+
 // constInitValue folds a global initializer to assembly text: (value, kind)
 // with kind in {"int", "double", "string"}, or ("", "") if not constant.
 func (ce *CodeEmitter) constInitValue(node *ASTNode, sym *Symbol) (string, string) {
@@ -305,7 +380,7 @@ func (ce *CodeEmitter) constInitValue(node *ASTNode, sym *Symbol) (string, strin
 	}
 	switch node.Type {
 	case NodeNumber:
-		if node.DataType == "float" || node.DataType == "double" || strings.Contains(node.Value, ".") {
+		if node.DataType == "float" || node.DataType == "double" || isFloatSpelling(node.Value) {
 			return node.Value, "double"
 		}
 		return node.Value, "int"
@@ -385,17 +460,26 @@ func (ce *CodeEmitter) emitFunction(name string, startIdx *int) {
 	// Prologue
 	ce.output.WriteString("    pushq %rbp\n")
 	ce.output.WriteString("    movq %rsp, %rbp\n")
-	
-	// Calculate stack size needed (skip the label instruction itself)
+
+	// Save callee-saved registers FIRST so the frame math accounts for
+	// them: pushes change rsp, and the sub below must keep 16-alignment
+	// (a push without padding misaligned every call -> printf crashed).
+	savedRegs := ce.savedRegList()
+	for _, reg := range savedRegs {
+		ce.output.WriteString(fmt.Sprintf("    pushq %%%s\n", reg))
+	}
+
+	// Calculate stack size needed (skip the label instruction itself).
+	// Include push bytes so (pushes + sub) stays 16-aligned.
 	ce.stackSize = ce.calculateStackSize(*startIdx + 1)
+	pushBytes := len(savedRegs) * 8
+	total := ce.stackSize + pushBytes
+	// Align to 16 bytes
+	total = (total + 15) & ^15
+	ce.stackSize = total - pushBytes
 	if ce.stackSize > 0 {
-		// Align to 16 bytes
-		ce.stackSize = (ce.stackSize + 15) & ^15
 		ce.output.WriteString(fmt.Sprintf("    subq $%d, %%rsp\n", ce.stackSize))
 	}
-	
-	// Save callee-saved registers
-	ce.emitRegisterSaves()
 	
 	// Process function body
 	*startIdx++
@@ -451,6 +535,21 @@ func (ce *CodeEmitter) calculateStackSize(startIdx int) int {
 	return maxOffset
 }
 
+// savedRegList returns the callee-saved register names in use (for
+// prologue pushes; restores mirror it).
+func (ce *CodeEmitter) savedRegList() []string {
+	calleeSaved := []int{RBX, R12, R13, R14, R15}
+	var out []string
+	for _, reg := range calleeSaved {
+		for _, usedReg := range ce.usedRegisters {
+			if reg == usedReg {
+				out = append(out, regNames[reg])
+			}
+		}
+	}
+	return out
+}
+
 func (ce *CodeEmitter) emitRegisterSaves() {
 	calleeSaved := []int{RBX, R12, R13, R14, R15}
 	
@@ -476,6 +575,12 @@ func (ce *CodeEmitter) emitRegisterRestores() {
 }
 
 func (ce *CodeEmitter) emitReturn() {
+	// Pops must read the push area (just below rbp), not wherever rsp
+	// wandered (locals/calls). Reset first, then pop, then tear down.
+	n := len(ce.savedRegList())
+	if n > 0 {
+		ce.output.WriteString(fmt.Sprintf("    leaq -%d(%%rbp), %%rsp\n", n*8))
+	}
 	ce.emitRegisterRestores()
 	ce.output.WriteString("    movq %rbp, %rsp\n")
 	ce.output.WriteString("    popq %rbp\n")
@@ -568,32 +673,43 @@ func (ce *CodeEmitter) emitInstruction(instr *IRInstruction) {
 		ce.emitLoad(instr.Dst, instr.Src1)
 		
 	case OpLoadAddr:
-		// Load address of variable/memory location
+		// Load address of variable/memory location. Dst may be spilled
+		// to memory (linear-scan); lea needs a reg dst, so bounce via
+		// scratch in that case.
 		dstStr := ce.formatOperand(instr.Dst)
 		src1 := instr.Src1
+		dstIsMem := strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")")
+		leaDst := dstStr
+		if dstIsMem {
+			// RAX is emitter scratch (never holds temps).
+			leaDst = "%rax"
+		}
 		
 		if src1.Type == "var" {
 			if src1.IsGlobal {
-				ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %s\n", src1.Value, dstStr))
+				ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %s\n", src1.Value, leaDst))
 			} else {
-				ce.output.WriteString(fmt.Sprintf("    leaq %d(%%rbp), %s\n", src1.Offset, dstStr))
+				ce.output.WriteString(fmt.Sprintf("    leaq %d(%%rbp), %s\n", src1.Offset, leaDst))
 			}
 		} else if src1.Type == "mem" {
-			ce.output.WriteString(fmt.Sprintf("    leaq %d(%%rbp), %s\n", src1.Offset, dstStr))
+			ce.output.WriteString(fmt.Sprintf("    leaq %d(%%rbp), %s\n", src1.Offset, leaDst))
 		} else if src1.Type == "temp" {
 			// Temp might have been allocated on stack - check allocator mapping
 			// For now, try to use formatOperand but strip the dereference
 			srcStr := ce.formatOperand(src1)
 			// If srcStr is like offset(%rbp), use leaq with it
 			if strings.Contains(srcStr, "(%rbp)") {
-				ce.output.WriteString(fmt.Sprintf("    leaq %s, %s\n", srcStr, dstStr))
+				ce.output.WriteString(fmt.Sprintf("    leaq %s, %s\n", srcStr, leaDst))
 			} else {
 				// Shouldn't happen - fallback to moving the value
-				ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", srcStr, dstStr))
+				ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", srcStr, leaDst))
 			}
 		} else {
 			// Fallback
-			ce.output.WriteString(fmt.Sprintf("    leaq %s, %s\n", ce.formatOperand(src1), dstStr))
+			ce.output.WriteString(fmt.Sprintf("    leaq %s, %s\n", ce.formatOperand(src1), leaDst))
+		}
+		if dstIsMem {
+			ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
 		}
 		
 	case OpStore:
@@ -607,7 +723,11 @@ func (ce *CodeEmitter) emitInstruction(instr *IRInstruction) {
 		
 	case OpJz:
 		src1Str := ce.formatOperand(instr.Src1)
-		if strings.Contains(src1Str, "(") && strings.Contains(src1Str, ")") {
+		if instr.Src1.Type == "imm" {
+			// test doesn't take two immediates: materialize first.
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", src1Str))
+			ce.output.WriteString("    testq %rax, %rax\n")
+		} else if strings.Contains(src1Str, "(") && strings.Contains(src1Str, ")") {
 			ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", src1Str))
 			ce.output.WriteString("    testq %rax, %rax\n")
 		} else {
@@ -617,7 +737,10 @@ func (ce *CodeEmitter) emitInstruction(instr *IRInstruction) {
 		
 	case OpJnz:
 		src1Str := ce.formatOperand(instr.Src1)
-		if strings.Contains(src1Str, "(") && strings.Contains(src1Str, ")") {
+		if instr.Src1.Type == "imm" {
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", src1Str))
+			ce.output.WriteString("    testq %rax, %rax\n")
+		} else if strings.Contains(src1Str, "(") && strings.Contains(src1Str, ")") {
 			ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", src1Str))
 			ce.output.WriteString("    testq %rax, %rax\n")
 		} else {
@@ -663,47 +786,192 @@ func (ce *CodeEmitter) emitInstruction(instr *IRInstruction) {
 
 // emitArrayLoadFromBase emits the final indexed load; %rdx holds the base,
 // %r11 the byte offset. Width follows Size (0/8 = 8 bytes, unchanged path).
-func (ce *CodeEmitter) emitArrayLoadFromBase(dst *Operand, dstReg string, size int) {
+func (ce *CodeEmitter) emitArrayLoadFromBase(dst *Operand, dstReg string, size int, indexReg string) {
+	idx := strings.TrimPrefix(indexReg, "%")
 	switch size {
 	case 4:
 		dstStr32 := ce.formatOperand32(dst)
-		ce.output.WriteString(fmt.Sprintf("    movl (%%rdx, %%r11, 1), %s\n", dstStr32))
+		ce.output.WriteString(fmt.Sprintf("    movl (%%rdx, %%%s, 1), %s\n", idx, dstStr32))
 	case 2:
 		dstStr32 := ce.formatOperand32(dst)
-		ce.output.WriteString(fmt.Sprintf("    movzwl (%%rdx, %%r11, 1), %s\n", dstStr32))
+		ce.output.WriteString(fmt.Sprintf("    movzwl (%%rdx, %%%s, 1), %s\n", idx, dstStr32))
 	case 1:
 		dstStr32 := ce.formatOperand32(dst)
-		ce.output.WriteString(fmt.Sprintf("    movzbl (%%rdx, %%r11, 1), %s\n", dstStr32))
+		ce.output.WriteString(fmt.Sprintf("    movzbl (%%rdx, %%%s, 1), %s\n", idx, dstStr32))
 	default:
-		ce.output.WriteString(fmt.Sprintf("    movq (%%rdx, %%r11, 1), %s\n", dstReg))
+		ce.output.WriteString(fmt.Sprintf("    movq (%%rdx, %%%s, 1), %s\n", idx, dstReg))
 	}
 }
 
 // emitArrayStoreToBase emits the final indexed store; value is in %rax.
-func (ce *CodeEmitter) emitArrayStoreToBase(size int) {
+func (ce *CodeEmitter) emitArrayStoreToBase(size int, indexReg string) {
+	idx := strings.TrimPrefix(indexReg, "%")
 	switch size {
 	case 4:
-		ce.output.WriteString("    movl %eax, (%rdx, %r11, 1)\n")
+		ce.output.WriteString("    movl %eax, (%rdx, %" + idx + ", 1)\n")
 	case 2:
-		ce.output.WriteString("    movw %ax, (%rdx, %r11, 1)\n")
+		ce.output.WriteString("    movw %ax, (%rdx, %" + idx + ", 1)\n")
 	case 1:
-		ce.output.WriteString("    movb %al, (%rdx, %r11, 1)\n")
+		ce.output.WriteString("    movb %al, (%rdx, %" + idx + ", 1)\n")
 	default:
-		ce.output.WriteString("    movq %rax, (%rdx, %r11, 1)\n")
+		ce.output.WriteString("    movq %rax, (%rdx, %" + idx + ", 1)\n")
 	}
+}
+
+// emitFloatCompare lowers a float comparison via ucomiss (both sides to
+// double in xmm0/xmm1). Ints convert (signed 32-bit; 64-bit via rax).
+func (ce *CodeEmitter) emitFloatCompare(setcc string, dst, src1, src2 *Operand) {
+	ce.loadDoubleToXmm(src1, "%xmm0")
+	ce.loadDoubleToXmm(src2, "%xmm1")
+	// Double compare (operands are doubles; ucomiss would read only
+	// the low 32 bits). Flag semantics match ucomiss for the cc map.
+	ce.output.WriteString("    ucomisd %xmm1, %xmm0\n")
+	// Map signed cc to unsigned (ucomiss uses CF/ZF) + NaN handling.
+	cc := setcc
+	fix := ""
+	switch setcc {
+	case "sete":
+		cc = "sete"
+		fix = "andnp"
+	case "setne":
+		cc = "setne"
+		fix = "orp"
+	case "setl":
+		cc = "setb"
+		fix = "andnp"
+	case "setle":
+		cc = "setbe"
+		fix = "andnp"
+	case "setg":
+		cc = "seta"
+	case "setge":
+		cc = "setae"
+	}
+	ce.output.WriteString(fmt.Sprintf("    %s %%al\n", cc))
+	if fix == "andnp" {
+		ce.output.WriteString("    setnp %dl\n")
+		ce.output.WriteString("    andb %dl, %al\n")
+	} else if fix == "orp" {
+		ce.output.WriteString("    setp %dl\n")
+		ce.output.WriteString("    orb %dl, %al\n")
+	}
+	dstStr := ce.formatOperand(dst)
+	dstIsMem := strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")")
+	if dstIsMem {
+		ce.output.WriteString("    movzbq %al, %rax\n")
+		ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+	} else {
+		ce.output.WriteString(fmt.Sprintf("    movzbq %%al, %s\n", dstStr))
+	}
+}
+
+// loadDoubleToXmm loads any int/float operand to xmm as a double.
+func (ce *CodeEmitter) loadDoubleToXmm(op *Operand, xmm string) {
+	if op.DataType == "float" {
+		ce.emitFloatLoadToXmm(op, xmm)
+		return
+	}
+	if op.DataType == "double" {
+		s := ce.formatOperand(op)
+		if op.Type == "imm" {
+			label := ce.getFloatLabel(op.Value)
+			ce.output.WriteString(fmt.Sprintf("    movsd %s(%%rip), %s\n", label, xmm))
+		} else if strings.Contains(s, "(") && strings.Contains(s, ")") {
+			ce.output.WriteString(fmt.Sprintf("    movsd %s, %s\n", s, xmm))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", s, xmm))
+		}
+		return
+	}
+	if op.Type == "imm" && isFloatSpelling(op.Value) {
+		label := ce.getFloatLabel(op.Value)
+		ce.output.WriteString(fmt.Sprintf("    movsd %s(%%rip), %s\n", label, xmm))
+		return
+	}
+	// Integer to double (signed). 64-bit longs use the q form.
+	// Immediates materialize through eax first (cvtsi2sd takes no imm).
+	if op.Type == "imm" {
+		ce.output.WriteString(fmt.Sprintf("    movq $%s, %%rax\n", op.Value))
+		if op.DataType == "long" || op.DataType == "unsigned long" || op.DataType == "long long" {
+			ce.output.WriteString(fmt.Sprintf("    cvtsi2sdq %%rax, %s\n", xmm))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    cvtsi2sd %%eax, %s\n", xmm))
+		}
+		return
+	}
+	is64 := op.DataType == "long" || op.DataType == "unsigned long" || op.DataType == "long long"
+	s := ce.formatOperand(op)
+	if strings.Contains(s, "(") && strings.Contains(s, ")") {
+		if is64 {
+			ce.output.WriteString(fmt.Sprintf("    cvtsi2sdq %s, %s\n", s, xmm))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    cvtsi2sdl %s, %s\n", s, xmm))
+		}
+	} else if is64 {
+		ce.output.WriteString(fmt.Sprintf("    cvtsi2sdq %s, %s\n", s, xmm))
+	} else {
+		ce.output.WriteString(fmt.Sprintf("    cvtsi2sd %s, %s\n", ce.formatOperand32(op), xmm))
+	}
+}
+
+// isInt32Type reports types compared as 32-bit: signed int plus
+// char/short (which C promotes to int). Unsigned uses different condition
+// codes (pre-existing gap); 64-bit uses cmpq. The 32-bit compare examines
+// low 32 only, so zero-extended uppers from movl loads are ignored.
+func isInt32Type(t string) bool {
+	t = strings.TrimSpace(t)
+	if t == "" || strings.Contains(t, "*") {
+		return false
+	}
+	for _, q := range []string{"const ", "volatile ", "static ", "extern ", "register "} {
+		t = strings.TrimSpace(strings.TrimPrefix(t, q))
+	}
+	if strings.Contains(t, "unsigned") {
+		return false
+	}
+	if s, ok := cSizeOf(t); ok {
+		return s == 4 || s == 2 || s == 1
+	}
+	return t == "int"
+}
+
+// isFloatSpelling reports whether an immediate spells a float: a dot,
+// or a decimal exponent (1e30). Hex integers (0x1e5, whose E is a digit)
+// are excluded.
+func isFloatSpelling(v string) bool {
+	if strings.Contains(v, ".") {
+		return true
+	}
+	if strings.HasPrefix(v, "0x") || strings.HasPrefix(v, "0X") {
+		return false
+	}
+	return strings.ContainsAny(v, "eE")
 }
 
 func (ce *CodeEmitter) emitMov(dst, src *Operand) {
 	if dst.Type == "reg" && src.Type == "reg" && dst.Value == src.Value {
 		return // No-op
 	}
-	
+
+	// freg source (xmm param regs): bitwise move out (float params lower
+	// into locals; movsd preserves the bit pattern, no conversion).
+	if src.Type == "freg" {
+		srcStr := "%" + src.Value
+		dstStr := ce.formatOperand(dst)
+		if strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")") {
+			ce.output.WriteString(fmt.Sprintf("    movsd %s, %s\n", srcStr, dstStr))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %s\n", srcStr, dstStr))
+		}
+		return
+	}
+
 	dstStr := ce.formatOperand(dst)
 	srcStr := ce.formatOperand(src)
 	
 	// Handle floating point immediate values (width-correct: float literals
 	// materialize as single-precision bits, doubles via .rodata).
-	if src.Type == "imm" && strings.Contains(src.Value, ".") {
+	if src.Type == "imm" && isFloatSpelling(src.Value) {
 		if src.DataType == "float" {
 			bits := floatBits32(src.Value)
 			dstIsMem := strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")")
@@ -750,7 +1018,7 @@ func (ce *CodeEmitter) emitMov(dst, src *Operand) {
 	if (src.DataType == "int" || src.DataType == "unsigned int" || src.DataType == "unsigned" || 
 	    dst.DataType == "int" || dst.DataType == "unsigned int" || dst.DataType == "unsigned" ||
 	    strings.HasPrefix(src.DataType, "enum ") || strings.HasPrefix(dst.DataType, "enum ")) &&
-	   src.Type != "imm" && !strings.Contains(src.Value, ".") {
+	   src.Type != "imm" && !isFloatSpelling(src.Value) {
 		// Use 32-bit mov for integer types when loading from memory
 		// But not for immediate integer values (those should use movl anyway)
 		if src.Type == "mem" || src.Type == "var" || src.Type == "ptr" {
@@ -783,7 +1051,7 @@ func (ce *CodeEmitter) emitMov(dst, src *Operand) {
 	
 	// Handle immediate to memory (movabs for wide constants)
 	if dst.Type == "mem" && src.Type == "imm" {
-		if !strings.Contains(src.Value, ".") {
+		if !isFloatSpelling(src.Value) {
 			ce.emitImmToReg64(src.Value, "%rax")
 		} else {
 			ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", srcStr))
@@ -804,7 +1072,7 @@ func (ce *CodeEmitter) emitMov(dst, src *Operand) {
 	}
 
 	// Wide integer immediates need movabs (plain movq can't encode them).
-	if src.Type == "imm" && !strings.Contains(src.Value, ".") {
+	if src.Type == "imm" && !isFloatSpelling(src.Value) {
 		if dstIsMem {
 			ce.emitImmToReg64(src.Value, "%rax")
 			ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
@@ -889,8 +1157,11 @@ func (ce *CodeEmitter) emitBinaryOp(op string, dst, src1, src2 *Operand) {
 	// Move src1 to dst
 	ce.emitMov(dst, src1)
 	
-	// Apply operation - handle float immediates
+	// Apply operation - handle float immediates, then oversized ints
 	src2Str := ce.loadFloatIfNeeded(src2, "%r10")
+	if src2Str == ce.formatOperand(src2) {
+		src2Str = ce.loadIntImmIfNeeded(src2, "%r10")
+	}
 	dstStr := ce.formatOperand(dst)
 	
 	if dst.Type == "mem" && src2.Type == "mem" {
@@ -1082,16 +1353,62 @@ func (ce *CodeEmitter) emitShift(op string, dst, src1, src2 *Operand) {
 	}
 }
 
+// floatOperand reports whether an operand is float/double (by type or
+// immediate spelling) for comparison routing.
+func floatOperand(op *Operand) bool {
+	if op == nil {
+		return false
+	}
+	if op.DataType == "float" || op.DataType == "double" {
+		return true
+	}
+	if op.Type == "imm" && isFloatSpelling(op.Value) {
+		return true
+	}
+	return false
+}
+
 func (ce *CodeEmitter) emitComparison(setcc string, dst, src1, src2 *Operand) {
+	// Any float side -> ucomiss in double (integer bit-cmp is meaningless
+	// for mixed int/float or negatives). NaN fixes: </<=/== clear on
+	// unordered (andnp); != sets on unordered (or-p); >/>= are exact.
+	if floatOperand(src1) || floatOperand(src2) {
+		ce.emitFloatCompare(setcc, dst, src1, src2)
+		return
+	}
+	// 32-bit signed comparison uses cmpl (examines low 32 only, so
+	// zero-extended upper garbage from movl loads is ignored). cmpq
+	// would misread int -1 (0xFFFFFFFF) as +4B. Both sides must be
+	// 32-bit int (mixed widths promote to 64-bit elsewhere).
+	cmpOp := "cmpq"
+	if isInt32Type(src1.DataType) && isInt32Type(src2.DataType) {
+		cmpOp = "cmpl"
+	}
 	src1Str := ce.formatOperand(src1)
 	src2Str := ce.formatOperand(src2)
+	if cmpOp == "cmpl" {
+		src1Str = ce.formatOperand32(src1)
+		src2Str = ce.formatOperand32(src2)
+	}
 	
-	// Handle float immediates - they need to be in .rodata
+	// Handle float immediates - they need to be in .rodata.
+	// Either side can be immediate (e.g. `1.5f < 3.5f` folds neither
+	// side); each gets its own scratch register.
+	if src1.Type == "imm" && (src1.DataType == "float" || src1.DataType == "double") {
+		label := ce.getFloatLabel(src1.Value)
+		ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %%r11\n", label))
+		src1Str = "%r11"
+	}
 	if src2.Type == "imm" && (src2.DataType == "float" || src2.DataType == "double") {
 		label := ce.getFloatLabel(src2.Value)
 		// Load into a register for comparison
 		ce.output.WriteString(fmt.Sprintf("    movq %s(%%rip), %%r10\n", label))
 		src2Str = "%r10"
+	} else if src2Str == ce.formatOperand(src2) {
+		src2Str = ce.loadIntImmIfNeeded(src2, "%r10")
+	}
+	if src1Str == ce.formatOperand(src1) {
+		src1Str = ce.loadIntImmIfNeeded(src1, "%r11")
 	}
 	
 	src1IsMem := strings.Contains(src1Str, "(") && strings.Contains(src1Str, ")")
@@ -1099,10 +1416,15 @@ func (ce *CodeEmitter) emitComparison(setcc string, dst, src1, src2 *Operand) {
 	
 	if src1IsMem && src2IsMem {
 		// Both are memory - load one into register
-		ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", src1Str))
-		ce.output.WriteString(fmt.Sprintf("    cmpq %s, %%rax\n", src2Str))
+		if cmpOp == "cmpl" {
+			ce.output.WriteString(fmt.Sprintf("    movl %s, %%eax\n", src1Str))
+			ce.output.WriteString(fmt.Sprintf("    cmpl %s, %%eax\n", src2Str))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%rax\n", src1Str))
+			ce.output.WriteString(fmt.Sprintf("    cmpq %s, %%rax\n", src2Str))
+		}
 	} else {
-		ce.output.WriteString(fmt.Sprintf("    cmpq %s, %s\n", src2Str, src1Str))
+		ce.output.WriteString(fmt.Sprintf("    %s %s, %s\n", cmpOp, src2Str, src1Str))
 	}
 	
 	ce.output.WriteString(fmt.Sprintf("    %s %%al\n", setcc))
@@ -1127,21 +1449,39 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 			// Load through register - use appropriate size
 			if src.Size > 0 && src.Size < 8 {
 				if src.IsGlobal {
+					unsigned := strings.Contains(src.DataType, "unsigned")
 					if src.Size == 4 {
 						// Load 32-bit and zero-extend
 						ce.output.WriteString(fmt.Sprintf("    movl %s, %%eax\n", ce.globalRef(src)))
 					} else if src.Size == 2 {
-						ce.output.WriteString(fmt.Sprintf("    movzwl %s, %%eax\n", ce.globalRef(src)))
+						if unsigned {
+							ce.output.WriteString(fmt.Sprintf("    movzwl %s, %%eax\n", ce.globalRef(src)))
+						} else {
+							ce.output.WriteString(fmt.Sprintf("    movswl %s, %%eax\n", ce.globalRef(src)))
+						}
 					} else if src.Size == 1 {
-						ce.output.WriteString(fmt.Sprintf("    movzbl %s, %%eax\n", ce.globalRef(src)))
+						if unsigned {
+							ce.output.WriteString(fmt.Sprintf("    movzbl %s, %%eax\n", ce.globalRef(src)))
+						} else {
+							ce.output.WriteString(fmt.Sprintf("    movsbl %s, %%eax\n", ce.globalRef(src)))
+						}
 					}
 				} else {
+					unsigned := strings.Contains(src.DataType, "unsigned")
 					if src.Size == 4 {
 						ce.output.WriteString(fmt.Sprintf("    movl %d(%%rbp), %%eax\n", src.Offset))
 					} else if src.Size == 2 {
-						ce.output.WriteString(fmt.Sprintf("    movzwl %d(%%rbp), %%eax\n", src.Offset))
+						if unsigned {
+							ce.output.WriteString(fmt.Sprintf("    movzwl %d(%%rbp), %%eax\n", src.Offset))
+						} else {
+							ce.output.WriteString(fmt.Sprintf("    movswl %d(%%rbp), %%eax\n", src.Offset))
+						}
 					} else if src.Size == 1 {
-						ce.output.WriteString(fmt.Sprintf("    movzbl %d(%%rbp), %%eax\n", src.Offset))
+						if unsigned {
+							ce.output.WriteString(fmt.Sprintf("    movzbl %d(%%rbp), %%eax\n", src.Offset))
+						} else {
+							ce.output.WriteString(fmt.Sprintf("    movsbl %d(%%rbp), %%eax\n", src.Offset))
+						}
 					}
 				}
 				// movl to %eax zeros upper 32 bits of %rax
@@ -1161,22 +1501,41 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 					if src.IsGlobal {
 						// For direct register loads, we can use movl directly which zeros upper bits
 						dstStr32 := ce.formatOperand32(dst)
+						unsigned := strings.Contains(src.DataType, "unsigned")
 						if src.Size == 4 {
 								ce.output.WriteString(fmt.Sprintf("    movl %s, %s\n", ce.globalRef(src), dstStr32))
 						} else if src.Size == 2 {
-								ce.output.WriteString(fmt.Sprintf("    movzwl %s, %s\n", ce.globalRef(src), dstStr32))
+								if unsigned {
+									ce.output.WriteString(fmt.Sprintf("    movzwl %s, %s\n", ce.globalRef(src), dstStr32))
+								} else {
+									ce.output.WriteString(fmt.Sprintf("    movswl %s, %s\n", ce.globalRef(src), dstStr32))
+								}
 						} else if src.Size == 1 {
-								ce.output.WriteString(fmt.Sprintf("    movzbl %s, %s\n", ce.globalRef(src), dstStr32))
+								if unsigned {
+									ce.output.WriteString(fmt.Sprintf("    movzbl %s, %s\n", ce.globalRef(src), dstStr32))
+								} else {
+									ce.output.WriteString(fmt.Sprintf("    movsbl %s, %s\n", ce.globalRef(src), dstStr32))
+								}
 						}
 					} else {
-					// Local variable load
+					// Local variable load (signed types sign-extend;
+					// plain char/short are signed on x86-64).
 					dstStr32 := ce.formatOperand32(dst)
+					unsigned := strings.Contains(src.DataType, "unsigned")
 					if src.Size == 4 {
 						ce.output.WriteString(fmt.Sprintf("    movl %d(%%rbp), %s\n", src.Offset, dstStr32))
 					} else if src.Size == 2 {
-						ce.output.WriteString(fmt.Sprintf("    movzwl %d(%%rbp), %s\n", src.Offset, dstStr32))
+						if unsigned {
+							ce.output.WriteString(fmt.Sprintf("    movzwl %d(%%rbp), %s\n", src.Offset, dstStr32))
+						} else {
+							ce.output.WriteString(fmt.Sprintf("    movswl %d(%%rbp), %s\n", src.Offset, dstStr32))
+						}
 					} else if src.Size == 1 {
-						ce.output.WriteString(fmt.Sprintf("    movzbl %d(%%rbp), %s\n", src.Offset, dstStr32))
+						if unsigned {
+							ce.output.WriteString(fmt.Sprintf("    movzbl %d(%%rbp), %s\n", src.Offset, dstStr32))
+						} else {
+							ce.output.WriteString(fmt.Sprintf("    movsbl %d(%%rbp), %s\n", src.Offset, dstStr32))
+						}
 					}
 				}
 			} else {
@@ -1193,17 +1552,22 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 		indexReg := ce.formatOperand(src.IndexTemp)
 		dstReg := ce.formatOperand(dst)
 		
-		// Move index to r11 to avoid clobbering
-		ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", indexReg))
+		// Index into r11 unless already a register (a blind copy would
+		// clobber a live temp allocated to r11; immediates can't encode
+		// in SIB addressing at all).
+		if !strings.HasPrefix(indexReg, "%") {
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", indexReg))
+			indexReg = "%r11"
+		}
 		
 		if src.IsGlobal {
 			// Global array: load from symbol + offset
 			ce.output.WriteString(fmt.Sprintf("    leaq %s, %%rdx\n", ce.globalRef(src)))
-			ce.emitArrayLoadFromBase(dst, dstReg, src.Size)
+			ce.emitArrayLoadFromBase(dst, dstReg, src.Size, indexReg)
 		} else {
 			// Local array: load from rbp + base_offset + computed_offset
 			ce.output.WriteString(fmt.Sprintf("    leaq %d(%%rbp), %%rdx\n", src.Offset))
-			ce.emitArrayLoadFromBase(dst, dstReg, src.Size)
+			ce.emitArrayLoadFromBase(dst, dstReg, src.Size, indexReg)
 		}
 	case "addr":
 		// Address-of: compute address and store in dst
@@ -1249,6 +1613,9 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 		dataType = strings.TrimSpace(dataType)
 		
 		movInstr := "movq"
+		// Signedness matters: plain char/short are SIGNED on x86-64
+		// (movsbl/movswl); only unsigned uses zero-extension.
+		isUnsigned := strings.Contains(dataType, "unsigned")
 		if dataType == "char" || dataType == "signed char" || dataType == "unsigned char" {
 			movInstr = "movb"
 		} else if dataType == "short" || dataType == "short int" || dataType == "signed short" || dataType == "unsigned short" {
@@ -1267,11 +1634,19 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 		
 		if dstIsMem {
 			if movInstr == "movb" {
-				ce.output.WriteString(fmt.Sprintf("    movb (%s), %%al\n", ptrReg))
-				ce.output.WriteString("    movzbq %al, %rax\n")  // Zero-extend to 64-bit
+				if isUnsigned {
+					ce.output.WriteString(fmt.Sprintf("    movb (%s), %%al\n", ptrReg))
+					ce.output.WriteString("    movzbq %al, %rax\n")  // Zero-extend to 64-bit
+				} else {
+					ce.output.WriteString(fmt.Sprintf("    movsbq (%s), %%rax\n", ptrReg))
+				}
 				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
 			} else if movInstr == "movw" {
-				ce.output.WriteString(fmt.Sprintf("    movzwl (%s), %%eax\n", ptrReg))
+				if isUnsigned {
+					ce.output.WriteString(fmt.Sprintf("    movzwl (%s), %%eax\n", ptrReg))
+				} else {
+					ce.output.WriteString(fmt.Sprintf("    movswl (%s), %%eax\n", ptrReg))
+				}
 				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
 			} else if movInstr == "movl" {
 				// movl zeros upper 32 bits automatically
@@ -1282,12 +1657,23 @@ func (ce *CodeEmitter) emitLoad(dst, src *Operand) {
 				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
 			}
 		} else {
+			// Register destination: load DIRECTLY into it (no rax staging:
+			// a hardcoded scratch register would clobber a live temp
+			// allocated there — this exact bug returned 0 for a[0]-b[0].
 			if movInstr == "movb" {
-				ce.output.WriteString(fmt.Sprintf("    movzbl (%s), %%eax\n", ptrReg))
-				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+				dstStr32 := ce.formatOperand32(dst)
+				if isUnsigned {
+					ce.output.WriteString(fmt.Sprintf("    movzbl (%s), %s\n", ptrReg, dstStr32))
+				} else {
+					ce.output.WriteString(fmt.Sprintf("    movsbl (%s), %s\n", ptrReg, dstStr32))
+				}
 			} else if movInstr == "movw" {
-				ce.output.WriteString(fmt.Sprintf("    movzwl (%s), %%eax\n", ptrReg))
-				ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", dstStr))
+				dstStr32 := ce.formatOperand32(dst)
+				if isUnsigned {
+					ce.output.WriteString(fmt.Sprintf("    movzwl (%s), %s\n", ptrReg, dstStr32))
+				} else {
+					ce.output.WriteString(fmt.Sprintf("    movswl (%s), %s\n", ptrReg, dstStr32))
+				}
 			} else if movInstr == "movl" {
 				// movl to 32-bit register zeros upper 32 bits
 				dstStr32 := ce.formatOperand32(dst)
@@ -1427,7 +1813,7 @@ func (ce *CodeEmitter) emitStore(dst, src *Operand) {
 				if src.Type == "imm" && src.DataType == "float" {
 				// Single-precision literal: materialize exact bits.
 				ce.output.WriteString(fmt.Sprintf("    movl $%d, %%eax\n", floatBits32(src.Value)))
-				} else if src.Type == "imm" && (src.DataType == "double" || strings.Contains(src.Value, ".")) {
+				} else if src.Type == "imm" && (src.DataType == "double" || isFloatSpelling(src.Value)) {
 				// Double immediate via .rodata.
 				loadedStr := ce.loadFloatIfNeeded(src, "%rax")
 				if loadedStr != "%rax" {
@@ -1480,14 +1866,19 @@ func (ce *CodeEmitter) emitStore(dst, src *Operand) {
 		// IMPORTANT: Use separate registers for index and value!
 		indexReg := ce.formatOperand(dst.IndexTemp)
 		
-		// Move index to r11 to avoid clobbering
-		ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", indexReg))
+		// Index into r11 unless already a register (a blind copy would
+		// clobber a live temp allocated to r11; immediates can't encode
+		// in SIB addressing at all).
+		if !strings.HasPrefix(indexReg, "%") {
+			ce.output.WriteString(fmt.Sprintf("    movq %s, %%r11\n", indexReg))
+			indexReg = "%r11"
+		}
 		
 		// Get source value into rax (movabs for wide integer immediates)
 		srcReg := ce.formatOperand(src)
 		if src.Type == "imm" && src.DataType == "float" {
 			ce.output.WriteString(fmt.Sprintf("    movl $%d, %%eax\n", floatBits32(src.Value)))
-		} else if src.Type == "imm" && !strings.Contains(src.Value, ".") && src.DataType != "float" && src.DataType != "double" {
+		} else if src.Type == "imm" && !isFloatSpelling(src.Value) && src.DataType != "float" && src.DataType != "double" {
 			ce.emitImmToReg64(src.Value, "%rax")
 		} else if src.Type == "imm" {
 			// Use helper for float immediates
@@ -1502,11 +1893,11 @@ func (ce *CodeEmitter) emitStore(dst, src *Operand) {
 		if dst.IsGlobal {
 			// Global array: store to symbol + offset
 			ce.output.WriteString(fmt.Sprintf("    leaq %s, %%rdx\n", ce.globalRef(dst)))
-			ce.emitArrayStoreToBase(dst.Size)
+			ce.emitArrayStoreToBase(dst.Size, indexReg)
 		} else {
 			// Local array: store to rbp + base_offset + computed_offset
 			ce.output.WriteString(fmt.Sprintf("    leaq %d(%%rbp), %%rdx\n", dst.Offset))
-			ce.emitArrayStoreToBase(dst.Size)
+			ce.emitArrayStoreToBase(dst.Size, indexReg)
 		}
 	case "ptr":
 		// Dereference store: store to address in IndexTemp
@@ -1532,6 +1923,8 @@ func (ce *CodeEmitter) emitStore(dst, src *Operand) {
 			// Need to load source into register first
 			if src.Type == "label" {
 				ce.output.WriteString(fmt.Sprintf("    leaq %s(%%rip), %s\n", srcReg, valueReg))
+			} else if src.Type == "imm" && src.DataType == "float" {
+				ce.output.WriteString(fmt.Sprintf("    movl $%d, %s\n", floatBits32(src.Value), "%"+ce.reg64to32(strings.TrimPrefix(valueReg, "%"))))
 			} else if src.Type == "imm" {
 				// Use helper for float immediates
 				loadedStr := ce.loadFloatIfNeeded(src, valueReg)
@@ -1625,6 +2018,15 @@ func doubleBits64(value string) uint64 {
 // known-float. No silent bit reinterpretation.
 func (ce *CodeEmitter) emitFloatLoadToXmm(op *Operand, xmm string) {
 	isFloat := op.DataType == "float"
+	// Integer operands convert (not bit-move): float h / int f must do
+	// 32.0/1300.0, not 32.0/tiny-denormal. Pointers/unknowns keep
+	// legacy bitwise behavior (their float use is invalid C anyway).
+	if !isFloat && op.DataType != "double" && op.DataType != "" && !strings.Contains(op.DataType, "*") {
+		if _, ok := cSizeOf(strings.TrimSpace(op.DataType)); ok {
+			ce.emitIntToXmmDoubleTo(op, xmm)
+			return
+		}
+	}
 	switch op.Type {
 	case "imm":
 		if isFloat {
@@ -1741,7 +2143,7 @@ func (ce *CodeEmitter) emitSetArg(instr *IRInstruction) {
 		// Moving to integer register (movabs for wide immediates)
 		switch src.Type {
 		case "imm":
-			if !strings.Contains(src.Value, ".") {
+			if !isFloatSpelling(src.Value) {
 				ce.emitImmToReg64(src.Value, dstStr)
 			} else {
 				ce.output.WriteString(fmt.Sprintf("    movq $%s, %s\n", src.Value, dstStr))
@@ -1766,6 +2168,40 @@ func (ce *CodeEmitter) emitSetArg(instr *IRInstruction) {
 }
 
 // Helper to load a float immediate into a register if needed
+// immFits32 reports whether an integer immediate fits in a signed
+// 32-bit instruction immediate (what andq/orq/addq/cmpq accept).
+func immFits32(val string) bool {
+	v := strings.TrimSpace(val)
+	neg := false
+	if strings.HasPrefix(v, "-") {
+		neg = true
+		v = v[1:]
+	} else if strings.HasPrefix(v, "+") {
+		v = v[1:]
+	}
+	// Strip integer suffixes.
+	v = strings.TrimRight(v, "uUlL")
+	u, err := strconv.ParseUint(v, 0, 64)
+	if err != nil {
+		return true // not parseable here: leave to existing paths
+	}
+	if neg {
+		return u <= 2147483648
+	}
+	return u <= 2147483647
+}
+
+// loadIntImmIfNeeded materializes an oversized integer immediate via
+// movabs (e.g. `& 0xFFFFFFFF` from SDL_Swap64: GAS rejects imm32-overflow
+// in andq). Returns the operand spelling to use.
+func (ce *CodeEmitter) loadIntImmIfNeeded(op *Operand, tempReg string) string {
+	if op.Type == "imm" && op.DataType != "float" && op.DataType != "double" && !immFits32(op.Value) {
+		ce.output.WriteString(fmt.Sprintf("    movabs $%s, %s\n", op.Value, tempReg))
+		return tempReg
+	}
+	return ce.formatOperand(op)
+}
+
 func (ce *CodeEmitter) loadFloatIfNeeded(op *Operand, tempReg string) string {
 	// Only treat as float if it's explicitly a float type
 	if op.Type == "imm" && (op.DataType == "float" || op.DataType == "double") {
@@ -1777,16 +2213,30 @@ func (ce *CodeEmitter) loadFloatIfNeeded(op *Operand, tempReg string) string {
 	return ce.formatOperand(op)
 }
 
+// emitIntToXmmDoubleTo loads an integer operand to any xmm as a double
+// (64-bit longs use the q form; 32-bit and below go through eax).
+func (ce *CodeEmitter) emitIntToXmmDoubleTo(op *Operand, xmm string) {
+	if s, ok := cSizeOf(strings.TrimSpace(op.DataType)); ok && s == 8 {
+		s := ce.formatOperand(op)
+		ce.output.WriteString(fmt.Sprintf("    cvtsi2sdq %s, %s\n", s, xmm))
+		return
+	}
+	ce.emitIntToEax(op)
+	ce.output.WriteString(fmt.Sprintf("    cvtsi2sd %%eax, %s\n", xmm))
+}
+
 // emitIntToXmmDouble loads a 32-bit integer operand to xmm0 as a double.
 func (ce *CodeEmitter) emitIntToXmmDouble(src *Operand) {
 	ce.emitIntToEax(src)
 	ce.output.WriteString("    cvtsi2sd %eax, %xmm0\n")
 }
 
-// emitIntToXmmFloat loads a 32-bit integer operand to xmm0 as a float.
+// emitIntToXmmFloat loads a 32-bit integer operand to xmm0. The value is
+// left as a double; emitFloatStoreFromXmm narrows for float destinations.
+// (Keeping a single double-based invariant avoids mismatched cvt pairs.)
 func (ce *CodeEmitter) emitIntToXmmFloat(src *Operand) {
 	ce.emitIntToEax(src)
-	ce.output.WriteString("    cvtsi2ss %eax, %xmm0\n")
+	ce.output.WriteString("    cvtsi2sd %eax, %xmm0\n")
 }
 
 // emitIntToEax materializes a 32-bit integer operand in %eax (sign- or
@@ -1837,6 +2287,195 @@ func (ce *CodeEmitter) emitMemToEax(mem string, width int, unsigned bool) {
 	}
 }
 
+// emitNarrowToInt extends 8/16-bit to 32-bit with C signedness.
+func (ce *CodeEmitter) emitNarrowToInt(src, dst *Operand, mode string) {
+	dstStr := ce.formatOperand32(dst)
+	signed := mode == "s82i"
+	// Immediates fold (movsbl takes no imm operand).
+	if src.Type == "imm" {
+		if v, err := strconv.ParseInt(src.Value, 0, 64); err == nil {
+			if src.Size == 2 || (!signed && false) {
+			}
+			// Truncate to source width, then extend with C signedness.
+			width := src.Size
+			if width != 1 && width != 2 {
+				if s, ok := cSizeOf(strings.TrimSpace(src.DataType)); ok && (s == 1 || s == 2) {
+					width = s
+				} else {
+					width = 1
+				}
+			}
+			if width == 2 {
+				v = int64(int16(v))
+				if !signed {
+					v = int64(uint16(v))
+				}
+			} else {
+				v = int64(int8(v))
+				if !signed {
+					v = int64(uint8(v))
+				}
+			}
+			ce.output.WriteString(fmt.Sprintf("    movl $%d, %s\n", v, dstStr))
+			return
+		}
+		ce.output.WriteString(fmt.Sprintf("    movl $%s, %%eax\n", src.Value))
+		if signed {
+			// eax holds full value; truncate via al/ax then extend.
+			ce.output.WriteString(fmt.Sprintf("    movsbl %%al, %s\n", dstStr))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    movzbl %%al, %s\n", dstStr))
+		}
+		return
+	}
+	// Determine source width: Size field, or DataType.
+	width := src.Size
+	if width != 1 && width != 2 {
+		if s, ok := cSizeOf(strings.TrimSpace(src.DataType)); ok && (s == 1 || s == 2) {
+			width = s
+		} else {
+			width = 1
+		}
+	}
+	srcStr := ce.formatOperand(src)
+	if strings.Contains(srcStr, "(") && strings.Contains(srcStr, ")") {
+		if width == 1 {
+			if signed {
+				ce.output.WriteString(fmt.Sprintf("    movsbl %s, %s\n", srcStr, dstStr))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movzbl %s, %s\n", srcStr, dstStr))
+			}
+		} else {
+			if signed {
+				ce.output.WriteString(fmt.Sprintf("    movswl %s, %s\n", srcStr, dstStr))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movzwl %s, %s\n", srcStr, dstStr))
+			}
+		}
+	} else {
+		if width == 1 {
+			r8 := ce.get8BitReg(srcStr)
+			if signed {
+				ce.output.WriteString(fmt.Sprintf("    movsbl %s, %s\n", r8, dstStr))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movzbl %s, %s\n", r8, dstStr))
+			}
+		} else {
+			r16 := ce.reg64to16(strings.TrimPrefix(srcStr, "%"))
+			if signed {
+				ce.output.WriteString(fmt.Sprintf("    movswl %%%s, %s\n", r16, dstStr))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movzwl %%%s, %s\n", r16, dstStr))
+			}
+		}
+	}
+}
+
+// emitNarrowToLong extends 8/16-bit to 64-bit with C signedness
+// (sbl/swl sign-extend, zbl/zwl zero-extend). Sources may be regs,
+// memory, or immediates.
+func (ce *CodeEmitter) emitNarrowToLong(src, dst *Operand, mode string) {
+	dstStr := ce.formatOperand(dst)
+	signed := mode == "sbl2l" || mode == "swl2l"
+	isByte := mode == "sbl2l" || mode == "zbl2l"
+	if src.Type == "imm" {
+		// Fold the constant at compile time when numeric.
+		if v, err := strconv.ParseInt(src.Value, 0, 64); err == nil {
+			if isByte {
+				v = int64(int8(v))
+				if !signed {
+					v = int64(uint8(v))
+				}
+			} else {
+				v = int64(int16(v))
+				if !signed {
+					v = int64(uint16(v))
+				}
+			}
+			ce.output.WriteString(fmt.Sprintf("    movq $%d, %s\n", v, dstStr))
+			return
+		}
+		ce.emitImmToReg64(src.Value, dstStr)
+		return
+	}
+	srcStr := ce.formatOperand(src)
+	if strings.Contains(srcStr, "(") && strings.Contains(srcStr, ")") {
+		if isByte {
+			if signed {
+				ce.output.WriteString(fmt.Sprintf("    movsbq %s, %s\n", srcStr, dstStr))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movzbq %s, %s\n", srcStr, dstStr))
+			}
+		} else {
+			if signed {
+				ce.output.WriteString(fmt.Sprintf("    movswq %s, %s\n", srcStr, dstStr))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movzwq %s, %s\n", srcStr, dstStr))
+			}
+		}
+	} else if isByte {
+		// Register holds the value with low 8 valid: extend via
+		// the 8-bit name (movsbq needs an 8-bit source).
+		r8 := ce.get8BitReg(ce.formatOperand(src))
+		if signed {
+			ce.output.WriteString(fmt.Sprintf("    movsbq %s, %s\n", r8, dstStr))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    movzbq %s, %s\n", r8, dstStr))
+		}
+	} else {
+		// Register holds the value with low 16 valid: extend via
+		// the 16-bit name (movswq needs a 16-bit source).
+		r16 := ce.reg64to16(strings.TrimPrefix(ce.formatOperand(src), "%"))
+		if signed {
+			ce.output.WriteString(fmt.Sprintf("    movswq %%%s, %s\n", r16, dstStr))
+		} else {
+			ce.output.WriteString(fmt.Sprintf("    movzwq %%%s, %s\n", r16, dstStr))
+		}
+	}
+}
+
+// emitIntToLong widens a 32-bit int to 64-bit:// emitIntToLong widens a 32-bit int to 64-bit: movslq (signed) or
+// movl (unsigned, zero-extends). Handles imm/mem/reg sources.
+func (ce *CodeEmitter) emitIntToLong(src, dst *Operand, signed bool) {
+	dstStr := ce.formatOperand(dst)
+	switch src.Type {
+	case "imm":
+		if signed {
+			// Sign-extend the constant at compile time when numeric.
+			if v, err := strconv.ParseInt(src.Value, 0, 32); err == nil {
+				ce.output.WriteString(fmt.Sprintf("    movq $%d, %s\n", v, dstStr))
+				return
+			}
+		}
+		ce.emitImmToReg64(src.Value, dstStr)
+		if signed {
+			// movabs zero-extends; fix sign via movslq through eax.
+			ce.output.WriteString(fmt.Sprintf("    movslq %s, %s\n", ce.formatOperand32(dst), dstStr))
+		}
+	default:
+		srcStr := ce.formatOperand(src)
+		// movl to a register must use the 32-bit name (zero-extends);
+		// to memory the size is inferred. movslq always takes full names.
+		dst32 := dstStr
+		if !strings.Contains(dstStr, "(") {
+			dst32 = ce.formatOperand32(dst)
+		}
+		if strings.Contains(srcStr, "(") && strings.Contains(srcStr, ")") {
+			if signed {
+				ce.output.WriteString(fmt.Sprintf("    movslq %s, %s\n", srcStr, dstStr))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movl %s, %s\n", srcStr, dst32))
+			}
+		} else {
+			if signed {
+				ce.output.WriteString(fmt.Sprintf("    movslq %s, %s\n", ce.formatOperand32(src), dstStr))
+			} else {
+				ce.output.WriteString(fmt.Sprintf("    movl %s, %s\n", ce.formatOperand32(src), dst32))
+			}
+		}
+	}
+}
+
 // emitCvt emits a numeric conversion (see OpCvt modes). Dst is always a
 // fresh temp (register or spilled slot) carrying the target DataType.
 func (ce *CodeEmitter) emitCvt(dst, src *Operand, mode string) {
@@ -1850,13 +2489,23 @@ func (ce *CodeEmitter) emitCvt(dst, src *Operand, mode string) {
 	case "i2f":
 		ce.emitIntToXmmFloat(src)
 		ce.emitFloatStoreFromXmm("%xmm0", dst)
+	case "i2l":
+		// Signed 32->64: sign-extend (int -1 stays -1, not +4B).
+		ce.emitIntToLong(src, dst, true)
+	case "s82i", "u82i":
+		// 8/16->32 (char/short to int): extend with C signedness.
+		// Plain char/short are signed; only unsigned zero-extends.
+		ce.emitNarrowToInt(src, dst, mode)
+	case "sbl2l", "zbl2l", "swl2l", "zwl2l":
+		// 8/16-bit to 64-bit (narrowing function returns).
+		ce.emitNarrowToLong(src, dst, mode)
+	case "u2l":
+		// Unsigned 32->64: zero-extend.
+		ce.emitIntToLong(src, dst, false)
 	case "f2i", "d2i":
 		ce.emitFloatLoadToXmm(src, "%xmm0")
-		if mode == "f2i" {
-			ce.output.WriteString("    cvttss2si %xmm0, %eax\n")
-		} else {
-			ce.output.WriteString("    cvttsd2si %xmm0, %eax\n")
-		}
+		// Loader always leaves a double in xmm0 (float promotes up).
+		ce.output.WriteString("    cvttsd2si %xmm0, %eax\n")
 		dstStr := ce.formatOperand(dst)
 		if strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")") {
 			ce.output.WriteString(fmt.Sprintf("    movl %%eax, %s\n", dstStr))

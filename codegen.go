@@ -74,7 +74,8 @@ type Symbol struct {
 	IsStatic   bool // Internal linkage (no .globl in .data)
 	Size       int
 	Type       string
-	ArraySize  int  // For arrays, 0 if not an array
+	ArraySize  int   // For arrays, 0 if not an array
+	Dims       []int // Per-dimension sizes for multi-dim arrays
 	Init       *ASTNode // Global initializer (constant expressions only)
 }
 

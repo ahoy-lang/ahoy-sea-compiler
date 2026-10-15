@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
 type CompilerPipeline struct {
 	source   string
+	sourceFile string // main input path (for relative #include resolution)
 	ast      *ASTNode
 	ir       []*IRInstruction
 	assembly string
@@ -18,6 +20,7 @@ type CompilerPipeline struct {
 	parser       *Parser
 	selector     *InstructionSelector
 	allocator    *RegisterAllocator
+	usedRegs     []int
 	emitter      *CodeEmitter
 	
 	options CompilerOptions
@@ -31,6 +34,7 @@ type CompilerOptions struct {
 	UseNativeBackend  bool
 	NoPreprocess      bool // Skip preprocessing
 	LibraryFlags      []string // Additional library flags like -lc, -lraylib
+	IncludePaths      []string // Additional #include search paths (-I)
 }
 
 func NewCompilerPipeline(source string, options CompilerOptions) *CompilerPipeline {
@@ -58,6 +62,12 @@ func (cp *CompilerPipeline) Compile() error {
 		
 		// Use our simple preprocessor to handle #include and #define
 		cp.preprocessor = NewPreprocessor()
+		for _, inc := range cp.options.IncludePaths {
+			cp.preprocessor.AddIncludePath(inc)
+		}
+		if cp.sourceFile != "" {
+			cp.preprocessor.AddIncludePath(filepath.Dir(cp.sourceFile))
+		}
 		var err error
 		preprocessedSource, err = cp.preprocessor.Process(cp.source)
 		if err != nil {
@@ -169,17 +179,21 @@ func (cp *CompilerPipeline) Compile() error {
 		if err != nil {
 			return fmt.Errorf("register allocation error: %w", err)
 		}
+		cp.usedRegs = lsAlloc.GetUsedRegisters()
+		if cp.options.Verbose {
+			fmt.Printf("  Used %d registers\n", len(cp.usedRegs))
+		}
 	} else {
 		cp.allocator = NewRegisterAllocator(cp.ir)
 		err = cp.allocator.Allocate()
 		if err != nil {
 			return fmt.Errorf("register allocation error: %w", err)
 		}
-		
+		cp.usedRegs = cp.allocator.GetUsedRegisters()
+
 		if cp.options.Verbose {
-			usedRegs := cp.allocator.GetUsedRegisters()
 			spilledVars := cp.allocator.GetSpilledVars()
-			fmt.Printf("  Used %d registers\n", len(usedRegs))
+			fmt.Printf("  Used %d registers\n", len(cp.usedRegs))
 			fmt.Printf("  Spilled %d variables\n", len(spilledVars))
 		}
 	}
@@ -187,7 +201,7 @@ func (cp *CompilerPipeline) Compile() error {
 	if cp.options.Verbose {
 		fmt.Printf("  Completed in %v\n", time.Since(start))
 	}
-	
+
 	// Phase 4: Code Emission
 	if cp.options.Verbose {
 		fmt.Println("\n[4/5] Code Emission...")
@@ -195,6 +209,7 @@ func (cp *CompilerPipeline) Compile() error {
 	start = time.Now()
 	
 	cp.emitter = NewCodeEmitter(cp.ir, cp.selector.stringLits, cp.selector.globalVars, cp.selector.structs, cp.selector.funcIsLocal)
+	cp.emitter.usedRegisters = cp.usedRegs
 	cp.assembly = cp.emitter.Emit()
 	
 	if cp.options.Verbose {
@@ -378,6 +393,20 @@ func runCompiler() {
 		case strings.HasPrefix(arg, "-l"):
 			// Library flag: -lc, -lraylib, etc.
 			options.LibraryFlags = append(options.LibraryFlags, arg)
+		case strings.HasPrefix(arg, "-L"):
+			// Library search path: forward to the link.
+			options.LibraryFlags = append(options.LibraryFlags, arg)
+		case strings.HasSuffix(arg, ".a") || strings.HasSuffix(arg, ".o") || strings.HasSuffix(arg, ".so"):
+			// Bare library/object paths: forward to the link (link
+			// order puts them after our object, like gcc).
+			options.LibraryFlags = append(options.LibraryFlags, arg)
+		case arg == "-I":
+			if i+1 < len(os.Args) {
+				options.IncludePaths = append(options.IncludePaths, os.Args[i+1])
+				i++
+			}
+		case strings.HasPrefix(arg, "-I"):
+			options.IncludePaths = append(options.IncludePaths, arg[2:])
 		case arg == "-O0":
 			options.OptimizationLevel = 0
 		case arg == "-O1":
@@ -400,6 +429,7 @@ func runCompiler() {
 	
 	// Create compiler
 	compiler := NewCompilerPipeline(string(source), options)
+	compiler.sourceFile = sourceFile
 	
 	// Compile
 	err = compiler.Compile()

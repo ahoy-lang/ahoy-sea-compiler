@@ -34,6 +34,7 @@ const (
 	IF
 	ELSE
 	WHILE
+	DO
 	FOR
 	RETURN
 	BREAK
@@ -42,6 +43,7 @@ const (
 	CASE
 	DEFAULT
 	SIZEOF
+	GOTO
 	
 	// Operators
 	PLUS
@@ -141,6 +143,7 @@ var keywords = map[string]TokenType{
 	"if":       IF,
 	"else":     ELSE,
 	"while":    WHILE,
+	"do":       DO,
 	"for":      FOR,
 	"return":   RETURN,
 	"break":    BREAK,
@@ -149,6 +152,7 @@ var keywords = map[string]TokenType{
 	"case":     CASE,
 	"default":  DEFAULT,
 	"sizeof":   SIZEOF,
+	"goto":     GOTO,
 }
 
 func (l *Lexer) current() byte {
@@ -275,8 +279,9 @@ func (l *Lexer) NextToken() Token {
 				l.pos = j
 			}
 		}
-		// Handle suffixes like L, U, UL, etc.
-		for l.current() == 'L' || l.current() == 'U' || l.current() == 'l' || l.current() == 'u' {
+		// Handle suffixes like L, U, UL, F (float), etc.
+		for l.current() == 'L' || l.current() == 'U' || l.current() == 'l' || l.current() == 'u' ||
+			l.current() == 'F' || l.current() == 'f' {
 			l.advance()
 		}
 		return Token{Type: NUMBER, Lexeme: l.source[start:l.pos], Line: startLine, Column: startColumn}
@@ -455,10 +460,17 @@ func (l *Lexer) AllTokens() []Token {
 	maxTokens := 1000000
 	for {
 		tok := l.NextToken()
-		tokens = append(tokens, tok)
 		if tok.Type == EOF {
-			break
+			if tok.Lexeme == "" {
+				tokens = append(tokens, tok) // keep terminator: parser needs it
+				break // real end of input
+			}
+			// Unknown byte (the old code ended the whole translation
+			// unit here, silently dropping everything after). Skip it.
+			l.advance()
+			continue
 		}
+		tokens = append(tokens, tok)
 		if len(tokens) > maxTokens {
 			// Add EOF and break
 			tokens = append(tokens, Token{Type: EOF, Lexeme: "", Line: l.line})
@@ -473,7 +485,7 @@ func (t TokenType) String() string {
 		EOF: "EOF", IDENTIFIER: "IDENTIFIER", NUMBER: "NUMBER", STRING: "STRING", CHAR: "CHAR",
 		INT: "INT", VOID: "VOID", CHAR_KW: "CHAR_KW", FLOAT: "FLOAT", DOUBLE: "DOUBLE",
 		STRUCT: "STRUCT", TYPEDEF: "TYPEDEF", ENUM: "ENUM", CONST: "CONST", STATIC: "STATIC",
-		IF: "IF", ELSE: "ELSE", WHILE: "WHILE", FOR: "FOR", RETURN: "RETURN",
+		IF: "IF", ELSE: "ELSE", WHILE: "WHILE", DO: "DO", FOR: "FOR", RETURN: "RETURN",
 		BREAK: "BREAK", CONTINUE: "CONTINUE", SWITCH: "SWITCH", CASE: "CASE", DEFAULT: "DEFAULT",
 		SIZEOF: "SIZEOF", PLUS: "PLUS", MINUS: "MINUS", STAR: "STAR", SLASH: "SLASH",
 		PERCENT: "PERCENT", ASSIGN: "ASSIGN", EQ: "EQ", NE: "NE", LT: "LT", LE: "LE",
