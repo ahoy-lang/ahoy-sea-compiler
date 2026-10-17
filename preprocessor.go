@@ -1313,11 +1313,17 @@ func (p *Preprocessor) expandMacros(line string) string {
 		prev := result
 		// First expand function-like macros
 		for name, macro := range p.funcMacros {
+			if !strings.Contains(result, name) {
+				continue
+			}
 			result = p.expandFunctionMacro(result, name, macro)
 		}
 
 		// Then expand object-like macros
 		for name, value := range p.defines {
+			if !strings.Contains(result, name) {
+				continue
+			}
 			// Use word boundary matching
 			result = replaceIdentifier(result, name, value)
 		}
