@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# bell-sea: run a bell game with the *sea* C compiler instead of tcc.
+#
+# Works as an AHOY_BIN drop-in for bell/run.sh: it forwards the same args
+# to the real ahoy-bin (to generate the C), then compiles that C with the
+# sea compiler and runs it.
+#
+#   AHOY_BIN=$PWD/ahoy-sea-compiler/bell-sea bell/run.sh editor
+#
+# or directly, from the bell directory:
+#
+#   ../ahoy-sea-compiler/bell-sea -f editor/main.ahoy -D BACKEND_RAYLIB
+#
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ahoy_root="$(cd "$here/.." && pwd)"
+real_bin="${AHOY_REAL_BIN:-$ahoy_root/ahoy/ahoy-bin}"
+sea="${SEA_BIN:-$here/ccompiler}"
+bell_dir="$ahoy_root/bell"
+
+if [ ! -x "$real_bin" ]; then
+    echo "bell-sea: real ahoy-bin not found at $real_bin" >&2
+    echo "          set AHOY_REAL_BIN=/path/to/ahoy-bin" >&2
+    exit 1
+fi
+if [ ! -x "$sea" ]; then
+    echo "bell-sea: sea compiler not found at $sea" >&2
+    echo "          build it with:  (cd $here && go build -o ccompiler .)" >&2
+    exit 1
+fi
+
+# --- 1. Collect args: forward everything to ahoy-bin except -r (we run it
+# ourselves).  Also extract -f <game> and the -D defines.
+game=""
+defines=()
+passthrough=()
+i=1
+n=$#
+args=("$@")
+while [ "$i" -le "$n" ]; do
+    a="${args[$((i-1))]}"
+    case "$a" in
+        -r) ;;
+        -f)
+            game="${args[$i]:-}"
+            passthrough+=(-f "$game")
+            i=$((i+1))
+            ;;
+        -D)
+            d="${args[$i]:-}"
+            defines+=("$d")
+            passthrough+=(-D "$d")
+            i=$((i+1))
+            ;;
+        -D*)
+            defines+=("${a#-D}")
+            passthrough+=("$a")
+            ;;
+        *)
+            passthrough+=("$a")
+            ;;
+    esac
+    i=$((i+1))
+done
+
+if [ -z "$game" ]; then
+    echo "bell-sea: no -f <game> argument (this wrapper expects run.sh-style args)" >&2
+    exit 1
+fi
+
+# ahoy-bin is invoked from the bell directory by run.sh; mirror that.
+cd "$bell_dir"
+
+# --- 2. Generate the C with the real ahoy-bin (no -r => no tcc compile).
+"$real_bin" "${passthrough[@]}"
+
+# --- 3. Locate the generated C (ahoy-bin writes output/<basename>.c).
+base="$(basename "${game%.ahoy}")"
+out_c="output/$base.c"
+if [ ! -f "$out_c" ]; then
+    echo "bell-sea: expected generated C at $out_c" >&2
+    exit 1
+fi
+
+# --- 4. Compile with sea. Paths mirror ahoy-bin's own link line.
+raylib_dir="$ahoy_root/ahoy/repos/raylib/src"
+out_bin="$bell_dir/output/${base}_sea"
+
+sea_defines=()
+for d in "${defines[@]}"; do sea_defines+=(-D "$d"); done
+
+echo "bell-sea: compiling $out_c with sea..."
+"$sea" "$out_c" -o "$out_bin" \
+    "${sea_defines[@]}" \
+    -I repos -I repos/box2d/include -I repos/box3d/include -I repos/SDL3/include \
+    "$raylib_dir/libraylib.a" -lm -lpthread -ldl -lrt -lX11 \
+    repos/SDL3/build/libSDL3.a \
+    -lX11 -lXext -lXrandr -lXcursor -lXi -lXinerama -lXxf86vm -lXfixes \
+    repos/box2d/lib/linux/libbox2d.a repos/box3d/lib/linux/libbox3d.a
+
+# --- 5. Run it.
+echo "bell-sea: running $out_bin"
+exec "$out_bin"
