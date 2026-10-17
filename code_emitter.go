@@ -1122,9 +1122,19 @@ func (ce *CodeEmitter) emitMovFloat(dst, src *Operand) {
 }
 func (ce *CodeEmitter) emitBinaryOp(op string, dst, src1, src2 *Operand) {
 	// Check if this is a float operation
-	isFloat := (dst.DataType == "float" || dst.DataType == "double" ||
-	            src1.DataType == "float" || src1.DataType == "double" ||
-	            src2.DataType == "float" || src2.DataType == "double")
+	// Strip storage qualifiers (static/inline/...) for float detection.
+	normDT := func(t string) string {
+		t = strings.TrimSpace(t)
+		for _, q := range []string{"static ", "inline ", "extern ", "const ", "volatile ", "register "} {
+			for strings.HasPrefix(t, q) {
+				t = strings.TrimSpace(t[len(q):])
+			}
+		}
+		return t
+	}
+	isFloat := (normDT(dst.DataType) == "float" || normDT(dst.DataType) == "double" ||
+	            normDT(src1.DataType) == "float" || normDT(src1.DataType) == "double" ||
+	            normDT(src2.DataType) == "float" || normDT(src2.DataType) == "double")
 	
 	if isFloat {
 		// Float operation using SSE instructions (computed in double;
@@ -2017,7 +2027,13 @@ func doubleBits64(value string) uint64 {
 // proper double, converting single-precision (cvtss2sd) when the operand is
 // known-float. No silent bit reinterpretation.
 func (ce *CodeEmitter) emitFloatLoadToXmm(op *Operand, xmm string) {
-	isFloat := op.DataType == "float"
+	norm := strings.TrimSpace(op.DataType)
+	for _, q := range []string{"static ", "inline ", "extern ", "const ", "volatile ", "register "} {
+		for strings.HasPrefix(norm, q) {
+			norm = strings.TrimSpace(norm[len(q):])
+		}
+	}
+	isFloat := norm == "float"
 	// Integer operands convert (not bit-move): float h / int f must do
 	// 32.0/1300.0, not 32.0/tiny-denormal. Pointers/unknowns keep
 	// legacy bitwise behavior (their float use is invalid C anyway).
@@ -2217,6 +2233,12 @@ func (ce *CodeEmitter) loadFloatIfNeeded(op *Operand, tempReg string) string {
 // (64-bit longs use the q form; 32-bit and below go through eax).
 func (ce *CodeEmitter) emitIntToXmmDoubleTo(op *Operand, xmm string) {
 	if s, ok := cSizeOf(strings.TrimSpace(op.DataType)); ok && s == 8 {
+		if op.Type == "imm" {
+			// cvtsi2sdq has no immediate form: materialize via rax.
+			ce.output.WriteString(fmt.Sprintf("    movabs $%s, %%rax\n", strings.TrimRight(op.Value, "uUlL")))
+			ce.output.WriteString(fmt.Sprintf("    cvtsi2sdq %%rax, %s\n", xmm))
+			return
+		}
 		s := ce.formatOperand(op)
 		ce.output.WriteString(fmt.Sprintf("    cvtsi2sdq %s, %s\n", s, xmm))
 		return
@@ -2484,10 +2506,12 @@ func (ce *CodeEmitter) emitCvt(dst, src *Operand, mode string) {
 		ce.emitFloatLoadToXmm(src, "%xmm0")
 		ce.emitFloatStoreFromXmm("%xmm0", dst)
 	case "i2d":
-		ce.emitIntToXmmDouble(src)
+		ce.emitIntToXmmDoubleTo(src, "%xmm0")
 		ce.emitFloatStoreFromXmm("%xmm0", dst)
 	case "i2f":
-		ce.emitIntToXmmFloat(src)
+		// Same double-based invariant as emitIntToXmmFloat: the store
+		// narrows to float when dst is float.
+		ce.emitIntToXmmDoubleTo(src, "%xmm0")
 		ce.emitFloatStoreFromXmm("%xmm0", dst)
 	case "i2l":
 		// Signed 32->64: sign-extend (int -1 stays -1, not +4B).
@@ -2505,6 +2529,12 @@ func (ce *CodeEmitter) emitCvt(dst, src *Operand, mode string) {
 	case "f2i", "d2i":
 		ce.emitFloatLoadToXmm(src, "%xmm0")
 		// Loader always leaves a double in xmm0 (float promotes up).
+		if s, ok := cSizeOf(strings.TrimSpace(dst.DataType)); ok && s == 8 {
+			// 64-bit destination (long): q-form convert + 8-byte store.
+			ce.output.WriteString("    cvttsd2siq %xmm0, %rax\n")
+			ce.output.WriteString(fmt.Sprintf("    movq %%rax, %s\n", ce.formatOperand(dst)))
+			break
+		}
 		ce.output.WriteString("    cvttsd2si %xmm0, %eax\n")
 		dstStr := ce.formatOperand(dst)
 		if strings.Contains(dstStr, "(") && strings.Contains(dstStr, ")") {

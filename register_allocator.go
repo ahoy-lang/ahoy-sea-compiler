@@ -153,22 +153,66 @@ func (ra *RegisterAllocator) computeLiveRanges() {
 }
 
 func (ra *RegisterAllocator) buildInterferenceGraph() {
-	// Two variables interfere if their live ranges overlap
-	for name1, lr1 := range ra.liveRanges {
-		if ra.interferenceGraph[name1] == nil {
-			ra.interferenceGraph[name1] = make(map[string]bool)
+	// Initialize graph
+	for name := range ra.liveRanges {
+		ra.interferenceGraph[name] = make(map[string]bool)
+	}
+
+	// Sweep-line construction: O(n * k) where k is average live-set
+	// size, instead of O(V^2). Two temps interfere iff their live
+	// ranges (inclusive [Start,End]) overlap.
+	type entry struct {
+		name string
+		lr   *LiveRange
+	}
+	sorted := make([]entry, 0, len(ra.liveRanges))
+	for name, lr := range ra.liveRanges {
+		sorted = append(sorted, entry{name, lr})
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].lr.Start != sorted[j].lr.Start {
+			return sorted[i].lr.Start < sorted[j].lr.Start
 		}
-		
-		for name2, lr2 := range ra.liveRanges {
-			if name1 == name2 {
-				continue
-			}
-			
-			// Check if live ranges overlap
-			if !(lr1.End < lr2.Start || lr2.End < lr1.Start) {
-				ra.interferenceGraph[name1][name2] = true
+		return sorted[i].lr.End < sorted[j].lr.End
+	})
+
+	active := make([]entry, 0, 64)
+	i := 0
+	n := len(sorted)
+	for i < n {
+		curStart := sorted[i].lr.Start
+		// Drop temps whose range ended before curStart.
+		kept := active[:0]
+		for _, a := range active {
+			if a.lr.End >= curStart {
+				kept = append(kept, a)
 			}
 		}
+		active = kept
+
+		// Collect all temps starting at curStart.
+		batch := []entry{}
+		for i < n && sorted[i].lr.Start == curStart {
+			batch = append(batch, sorted[i])
+			i++
+		}
+		// Each new temp interferes with every currently-live temp.
+		for _, b := range batch {
+			for _, a := range active {
+				if a.name != b.name {
+					ra.interferenceGraph[b.name][a.name] = true
+					ra.interferenceGraph[a.name][b.name] = true
+				}
+			}
+		}
+		// Temps starting together interfere with each other.
+		for x := 0; x < len(batch); x++ {
+			for y := x + 1; y < len(batch); y++ {
+				ra.interferenceGraph[batch[x].name][batch[y].name] = true
+				ra.interferenceGraph[batch[y].name][batch[x].name] = true
+			}
+		}
+		active = append(active, batch...)
 	}
 }
 
@@ -274,6 +318,20 @@ func (ra *RegisterAllocator) GetSpilledVars() map[string]int {
 	return ra.spilledVars
 }
 
+// argRegBusyRange records that a SysV call-argument register (rdi/rsi/...)
+// holds a live argument value from instruction Start through the closing
+// call at End. Temps must never be allocated to that register while their
+// live range overlaps the window: the float-arg staging temps used to land
+// in %rdi/%rsi and clobber earlier integer arguments (stbtt_Rasterize got
+// a 1.0f bit pattern as its vertices pointer). OpSetArg writes these
+// registers directly and bypasses the allocator, so the allocator has to
+// model them or it hands them out twice.
+type argRegBusyRange struct {
+	reg   int
+	start int
+	end   int
+}
+
 // Advanced: Linear scan register allocation (faster alternative)
 type LinearScanAllocator struct {
 	instructions []*IRInstruction
@@ -283,13 +341,15 @@ type LinearScanAllocator struct {
 	freeRegs     []int
 	stackSlots   map[string]int
 	frameBase    int
+	argBusy      []argRegBusyRange // pending call-argument register windows
 }
 
 type Interval struct {
-	VarName string
-	Start   int
-	End     int
-	Reg     int
+	VarName   string
+	Start     int
+	End       int
+	Reg       int
+	Forbidden uint16 // bit i set = register i is a pending call arg here
 }
 
 func NewLinearScanAllocator(instructions []*IRInstruction) *LinearScanAllocator {
@@ -319,17 +379,34 @@ func (lsa *LinearScanAllocator) Allocate() error {
 	sort.Slice(lsa.intervals, func(i, j int) bool {
 		return lsa.intervals[i].Start < lsa.intervals[j].Start
 	})
+
+	// Fixed argument registers live from their OpSetArg until the call;
+	// temps overlapping a window must not be colored into that register.
+	lsa.collectArgRegBusy()
+	lsa.computeForbiddenMasks()
+	// Emitter sequences (calls, shift count staging, imm materialization)
+	// write allocatable registers outside the allocator's model.
+	lsa.computeEmitterClobberMasks()
 	
 	// Linear scan
 	for _, interval := range lsa.intervals {
 		lsa.expireOldIntervals(interval)
 		
-		if len(lsa.freeRegs) == 0 {
+		// Pick the first free register that is not a pending call
+		// argument register for this interval.
+		pick := -1
+		for fi, r := range lsa.freeRegs {
+			if interval.Forbidden&(1<<uint(r)) == 0 {
+				pick = fi
+				break
+			}
+		}
+		if pick < 0 {
 			lsa.spillAtInterval(interval)
 		} else {
 			// Allocate register
-			reg := lsa.freeRegs[0]
-			lsa.freeRegs = lsa.freeRegs[1:]
+			reg := lsa.freeRegs[pick]
+			lsa.freeRegs = append(lsa.freeRegs[:pick], lsa.freeRegs[pick+1:]...)
 			
 			interval.Reg = reg
 			lsa.allocation[interval.VarName] = reg
@@ -346,6 +423,153 @@ func (lsa *LinearScanAllocator) Allocate() error {
 	lsa.rewriteInstructions()
 
 	return nil
+}
+
+// collectArgRegBusy scans for call-setup windows: every write into a SysV
+// integer argument register (OpSetArg / OpMov / OpLoadAddr with a reg dst)
+// opens a window that closes at the next OpCall. The written registers are
+// live (pending argument values) throughout the window.
+func (lsa *LinearScanAllocator) collectArgRegBusy() {
+	nameToReg := map[string]int{}
+	for _, r := range argRegs {
+		nameToReg[regNames[r]] = r
+	}
+
+	firstAt := map[int]int{}
+	flush := func(end int) {
+		for reg, start := range firstAt {
+			lsa.argBusy = append(lsa.argBusy, argRegBusyRange{reg: reg, start: start, end: end})
+		}
+		firstAt = map[int]int{}
+	}
+
+	for i, instr := range lsa.instructions {
+		if instr.Dst != nil && instr.Dst.Type == "reg" {
+			if r, ok := nameToReg[instr.Dst.Value]; ok {
+				if _, seen := firstAt[r]; !seen {
+					firstAt[r] = i
+				}
+			}
+		}
+		if instr.Op == OpCall {
+			flush(i)
+		}
+	}
+	flush(len(lsa.instructions) - 1)
+}
+
+// computeForbiddenMasks marks each interval with the argument registers
+// whose busy windows overlap it. Ranges are merged per register first, then
+// found by a linear two-pointer sweep (intervals are sorted by Start).
+func (lsa *LinearScanAllocator) computeForbiddenMasks() {
+	byReg := map[int][]argRegBusyRange{}
+	for _, b := range lsa.argBusy {
+		byReg[b.reg] = append(byReg[b.reg], b)
+	}
+	for reg, list := range byReg {
+		sort.Slice(list, func(i, j int) bool { return list[i].start < list[j].start })
+		merged := list[:1]
+		for _, b := range list[1:] {
+			last := &merged[len(merged)-1]
+			if b.start <= last.end+1 {
+				if b.end > last.end {
+					last.end = b.end
+				}
+			} else {
+				merged = append(merged, b)
+			}
+		}
+		byReg[reg] = merged
+	}
+
+	for reg, list := range byReg {
+		ri := 0
+		for _, interval := range lsa.intervals {
+			for ri < len(list) && list[ri].end < interval.Start {
+				ri++
+			}
+			if ri < len(list) && list[ri].start <= interval.End {
+				interval.Forbidden |= 1 << uint(reg)
+			}
+		}
+	}
+}
+
+// immMaterializedIntoReg reports whether the emitter would stage this
+// operand in a scratch GPR (loadFloatIfNeeded / loadIntImmIfNeeded):
+// float-typed immediates always materialize; integer immediates do when
+// they don't fit an imm32 field.
+func immMaterializedIntoReg(op *Operand) bool {
+	if op == nil || op.Type != "imm" {
+		return false
+	}
+	if op.DataType == "float" || op.DataType == "double" {
+		return true
+	}
+	return !immFits32(op.Value)
+}
+
+// computeEmitterClobberMasks marks intervals whose register would be
+// destroyed by emitter sequences that write allocatable registers outside
+// the allocator's model:
+//
+//   - A call clobbers the caller-saved set (RCX, RSI, RDI, R8, R9, R10):
+//     the emitter has no save/restore around calls, so an interval live
+//     strictly across one (Start < call < End) must sit in a callee-saved
+//     register or on the stack. (stbtt rasterizer bug: `s += f(...)` read
+//     the old value of s out of %edi after the call clobbered it. RAX/RDX/
+//     R11 are already reserved as emitter scratch.)
+//   - OpShl/OpShr with a register (or float) shift count stages the count
+//     via `movq src, %rcx`; nothing may live in RCX across that
+//     instruction (the dst would be overwritten before the shift).
+//   - add/sub/and/or/xor/mul/compare with an immediate that needs
+//     materializing (float, or !immFits32) loads it into %r10; nothing may
+//     live in R10 across that instruction.
+func (lsa *LinearScanAllocator) computeEmitterClobberMasks() {
+	var callIdxs, rcxIdxs, r10Idxs []int
+	for i, instr := range lsa.instructions {
+		switch instr.Op {
+		case OpCall:
+			callIdxs = append(callIdxs, i)
+		case OpShl, OpShr:
+			s2 := instr.Src2
+			if s2 == nil || s2.Type != "imm" ||
+				s2.DataType == "float" || s2.DataType == "double" {
+				rcxIdxs = append(rcxIdxs, i)
+			}
+		case OpAdd, OpSub, OpAnd, OpOr, OpXor, OpMul,
+			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
+			if immMaterializedIntoReg(instr.Src2) {
+				r10Idxs = append(r10Idxs, i)
+			}
+		}
+	}
+
+	callMask := uint16(0)
+	for _, r := range []int{RCX, RSI, RDI, R8, R9, R10} {
+		callMask |= 1 << uint(r)
+	}
+
+	// touching reports whether any index in the sorted list falls in
+	// [interval.Start, interval.End] (the emitter scratch use happens at
+	// that instruction, so both its definition site and any live-across
+	// interval are corrupted).
+	touching := func(list []int, iv *Interval) bool {
+		j := sort.SearchInts(list, iv.Start)
+		return j < len(list) && list[j] <= iv.End
+	}
+
+	for _, iv := range lsa.intervals {
+		if j := sort.SearchInts(callIdxs, iv.Start+1); j < len(callIdxs) && callIdxs[j] < iv.End {
+			iv.Forbidden |= callMask
+		}
+		if touching(rcxIdxs, iv) {
+			iv.Forbidden |= 1 << uint(RCX)
+		}
+		if touching(r10Idxs, iv) {
+			iv.Forbidden |= 1 << uint(R10)
+		}
+	}
 }
 
 // GetUsedRegisters returns the distinct registers holding temps (for
@@ -410,11 +634,20 @@ func (lsa *LinearScanAllocator) expireOldIntervals(interval *Interval) {
 }
 
 func (lsa *LinearScanAllocator) spillAtInterval(interval *Interval) {
-	// Find interval with furthest end point
-	spill := lsa.active[len(lsa.active)-1]
+	// Pick the active interval with the furthest end whose register this
+	// interval may legally take (never a pending call-arg register).
+	// active is sorted by End ascending.
+	pick := -1
+	for i := len(lsa.active) - 1; i >= 0; i-- {
+		if interval.Forbidden&(1<<uint(lsa.active[i].Reg)) == 0 {
+			pick = i
+			break
+		}
+	}
 	
-	if spill.End > interval.End {
-		// Spill the last active interval
+	if pick >= 0 && lsa.active[pick].End > interval.End {
+		// Spill the chosen active interval
+		spill := lsa.active[pick]
 		interval.Reg = spill.Reg
 		lsa.allocation[interval.VarName] = spill.Reg
 		
@@ -422,7 +655,7 @@ func (lsa *LinearScanAllocator) spillAtInterval(interval *Interval) {
 		lsa.stackSlots[spill.VarName] = offset
 		delete(lsa.allocation, spill.VarName)
 		
-		lsa.active[len(lsa.active)-1] = interval
+		lsa.active[pick] = interval
 		sort.Slice(lsa.active, func(i, j int) bool {
 			return lsa.active[i].End < lsa.active[j].End
 		})

@@ -457,7 +457,11 @@ func (l *Lexer) NextToken() Token {
 
 func (l *Lexer) AllTokens() []Token {
 	var tokens []Token
-	maxTokens := 1000000
+	// Safety cap against a runaway lexer. Bell's generated TU is ~1.8M
+	// tokens, so keep plenty of headroom (2M used to truncate the stream
+	// deep inside a function, yielding a bogus "expected }" parse error
+	// at a fake EOF).
+	maxTokens := 32000000
 	for {
 		tok := l.NextToken()
 		if tok.Type == EOF {

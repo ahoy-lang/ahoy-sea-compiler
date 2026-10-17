@@ -11,15 +11,15 @@ import (
 
 // Preprocessor handles C preprocessor directives
 type Preprocessor struct {
-	defines       map[string]string
-	funcMacros    map[string]*FunctionMacro // Function-like macros
-	includePaths  []string
-	processed     map[string]bool  // Track processed files to avoid cycles
-	dirStack      []string       // Including-file directories (innermost last)
-	mu            sync.RWMutex      // For thread-safe define access
-	typedefMap    map[string]*StructDef // External typedefs from headers
-	structMap     map[string]*StructDef // External structs from headers
-	functionSigs  map[string]*FunctionSignature // Function signatures from headers
+	defines      map[string]string
+	funcMacros   map[string]*FunctionMacro // Function-like macros
+	includePaths []string
+	processed    map[string]bool               // Track processed files to avoid cycles
+	dirStack     []string                      // Including-file directories (innermost last)
+	mu           sync.RWMutex                  // For thread-safe define access
+	typedefMap   map[string]*StructDef         // External typedefs from headers
+	structMap    map[string]*StructDef         // External structs from headers
+	functionSigs map[string]*FunctionSignature // Function signatures from headers
 }
 
 type FunctionMacro struct {
@@ -29,8 +29,8 @@ type FunctionMacro struct {
 
 func NewPreprocessor() *Preprocessor {
 	p := &Preprocessor{
-		defines:      make(map[string]string),
-		funcMacros:   make(map[string]*FunctionMacro),
+		defines:    make(map[string]string),
+		funcMacros: make(map[string]*FunctionMacro),
 		// NOTE: system dirs (/usr/include) are deliberately absent: glibc
 		// headers use extensions (attributes, asm labels, vector types)
 		// this compiler cannot parse, and inlining them breaks the TU
@@ -43,7 +43,7 @@ func NewPreprocessor() *Preprocessor {
 		structMap:    make(map[string]*StructDef),
 		functionSigs: make(map[string]*FunctionSignature),
 	}
-	
+
 	// Add standard built-in macros
 	p.defines["NULL"] = "0"
 	p.defines["true"] = "1"
@@ -53,6 +53,18 @@ func NewPreprocessor() *Preprocessor {
 	p.defines["SEEK_SET"] = "0"
 	p.defines["SEEK_CUR"] = "1"
 	p.defines["SEEK_END"] = "2"
+	// POSIX fd + signal surrogates from skipped <unistd.h>/<signal.h>
+	// (bell's generated crash handler uses these directly).
+	p.defines["STDIN_FILENO"] = "0"
+	p.defines["STDOUT_FILENO"] = "1"
+	p.defines["STDERR_FILENO"] = "2"
+	p.defines["SIGBUS"] = "7"
+	p.defines["SIG_DFL"] = "((void*)0)"
+	p.defines["SA_SIGINFO"] = "4"
+	p.defines["SEGV_ACCERR"] = "2"
+	p.defines["FPE_INTDIV"] = "1"
+	p.defines["FPE_INTOVF"] = "2"
+	p.defines["FPE_FLTDIV"] = "3"
 	// Integer limits (LP64) from skipped <stdint.h>/<limits.h>.
 	p.defines["CHAR_BIT"] = "8"
 	p.defines["INT_MAX"] = "2147483647"
@@ -91,7 +103,20 @@ func NewPreprocessor() *Preprocessor {
 	p.defines["st_atime"] = "st_atim.tv_sec"
 	p.defines["st_mtime"] = "st_mtim.tv_sec"
 	p.defines["st_ctime"] = "st_ctim.tv_sec"
+	// float.h constants (header skipped)
+	p.defines["FLT_EPSILON"] = "1.19209290e-07F"
+	p.defines["FLT_MAX"] = "3.40282347e+38F"
+	p.defines["FLT_MIN"] = "1.17549435e-38F"
 	// File-type test macros (glibc values; sys/stat.h skipped).
+	// S_IF* type constants (glibc values; sys/stat.h skipped).
+	p.defines["S_IFMT"] = "0170000"
+	p.defines["S_IFDIR"] = "0040000"
+	p.defines["S_IFREG"] = "0100000"
+	p.defines["S_IFLNK"] = "0120000"
+	p.defines["S_IFCHR"] = "0020000"
+	p.defines["S_IFBLK"] = "0060000"
+	p.defines["S_IFIFO"] = "0010000"
+	p.defines["S_IFSOCK"] = "0140000"
 	p.funcMacros["S_ISDIR"] = &FunctionMacro{Params: []string{"m"}, Body: "(((m) & 0170000) == 0040000)"}
 	p.funcMacros["S_ISREG"] = &FunctionMacro{Params: []string{"m"}, Body: "(((m) & 0170000) == 0100000)"}
 	p.funcMacros["S_ISLNK"] = &FunctionMacro{Params: []string{"m"}, Body: "(((m) & 0170000) == 0120000)"}
@@ -121,7 +146,7 @@ func NewPreprocessor() *Preprocessor {
 	// stb_image/stb_truetype gate their _simd paths on this and always
 	// carry bit-identical scalar fallbacks.
 	p.defines["STBI_NO_SIMD"] = "1"
-	
+
 	return p
 }
 
@@ -135,19 +160,19 @@ func (p *Preprocessor) parseRaylibHeader() {
 		p.addFallbackDefines()
 		return
 	}
-	
+
 	lines := strings.Split(string(content), "\n")
 	inEnum := false
 	enumValue := 0
-	
+
 	for i := 0; i < len(lines); i++ {
 		line := strings.TrimSpace(lines[i])
-		
+
 		// Skip comments
 		if strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*") {
 			continue
 		}
-		
+
 		// Check for #define directives
 		if strings.HasPrefix(line, "#define") {
 			parts := strings.Fields(line)
@@ -158,7 +183,7 @@ func (p *Preprocessor) parseRaylibHeader() {
 				value = strings.TrimSpace(value)
 				value = strings.Split(value, "//")[0] // Remove trailing comments
 				value = strings.TrimSpace(value)
-				
+
 				// Only add simple numeric or identifier defines
 				if len(value) > 0 && (isNumeric(value) || p.IsDefined(value)) {
 					p.defines[name] = value
@@ -166,30 +191,30 @@ func (p *Preprocessor) parseRaylibHeader() {
 			}
 			continue
 		}
-		
+
 		// Check for enum start
 		if strings.Contains(line, "typedef enum") || (strings.Contains(line, "enum") && strings.Contains(line, "{")) {
 			inEnum = true
 			enumValue = 0
 			continue
 		}
-		
+
 		// Check for enum end
 		if inEnum && strings.Contains(line, "}") {
 			inEnum = false
 			continue
 		}
-		
+
 		// Parse enum values
 		if inEnum {
 			// Remove comments
 			line = strings.Split(line, "//")[0]
 			line = strings.TrimSpace(line)
-			
+
 			if line == "" || line == "{" {
 				continue
 			}
-			
+
 			// Handle enum entries
 			if strings.Contains(line, "=") {
 				// Explicit value: NAME = value,
@@ -198,7 +223,7 @@ func (p *Preprocessor) parseRaylibHeader() {
 					name := strings.TrimSpace(parts[0])
 					valueStr := strings.TrimSuffix(strings.TrimSpace(parts[1]), ",")
 					valueStr = strings.TrimSpace(valueStr)
-					
+
 					// Parse the value (might be hex like 0x00000040)
 					if strings.HasPrefix(valueStr, "0x") || strings.HasPrefix(valueStr, "0X") {
 						// Hex value
@@ -239,7 +264,7 @@ func (p *Preprocessor) addFallbackDefines() {
 	p.defines["LOG_ERROR"] = "5"
 	p.defines["LOG_FATAL"] = "6"
 	p.defines["LOG_NONE"] = "7"
-	
+
 	// Add raylib window flags
 	p.defines["FLAG_VSYNC_HINT"] = "64"
 	p.defines["FLAG_FULLSCREEN_MODE"] = "2"
@@ -255,7 +280,7 @@ func (p *Preprocessor) addFallbackDefines() {
 	p.defines["FLAG_WINDOW_HIGHDPI"] = "8192"
 	p.defines["FLAG_MSAA_4X_HINT"] = "32"
 	p.defines["FLAG_INTERLACED_HINT"] = "65536"
-	
+
 	// Add shader uniform types
 	p.defines["SHADER_UNIFORM_FLOAT"] = "0"
 	p.defines["SHADER_UNIFORM_VEC2"] = "1"
@@ -323,7 +348,7 @@ func (p *Preprocessor) evaluateIfCondition(condition string) bool {
 	// Handle: defined(X) or defined X
 	if strings.HasPrefix(condition, "defined") {
 		rest := strings.TrimSpace(condition[7:])
-		
+
 		// Check for defined(X)
 		if strings.HasPrefix(rest, "(") {
 			closeIdx := strings.Index(rest, ")")
@@ -340,7 +365,7 @@ func (p *Preprocessor) evaluateIfCondition(condition string) bool {
 		}
 		return false
 	}
-	
+
 	// Handle: !defined(X) or !defined X
 	if strings.HasPrefix(condition, "!") {
 		rest := strings.TrimSpace(condition[1:])
@@ -348,8 +373,8 @@ func (p *Preprocessor) evaluateIfCondition(condition string) bool {
 			return !p.evaluateIfCondition(rest)
 		}
 	}
-	
-// Handle numeric comparisons: 0, 1, etc.
+
+	// Handle numeric comparisons: 0, 1, etc.
 	if condition == "0" {
 		return false
 	}
@@ -595,21 +620,31 @@ func (t *ppTokens) parseUnary(p *Preprocessor, depth int) (int64, bool) {
 	return 0, true
 }
 
+// seaPPTrace logs preprocessor decisions when SEA_PPTRACE=1 (debugging
+// nondeterminism).
+func seaPPTrace(format string, args ...interface{}) {
+	if os.Getenv("SEA_PPTRACE") != "" {
+		fmt.Fprintf(os.Stderr, "[PP] "+format+"\n", args...)
+	}
+}
 
 func (p *Preprocessor) Process(source string) (string, error) {
 	lines := strings.Split(joinLogicalLines(stripComments(joinContinuedLines(source))), "\n")
 	var result strings.Builder
-	
+
 	// Stack for conditional compilation
 	type condState struct {
-		active bool  // Whether this block is active
-		taken  bool  // Whether any branch was taken
+		active bool // Whether this block is active
+		taken  bool // Whether any branch was taken
 	}
 	condStack := []condState{{active: true, taken: false}}
-	
+
 	for i, line := range lines {
+		// Substitute predefined context macros (best-effort, per line).
+		line = strings.ReplaceAll(line, "__LINE__", fmt.Sprintf("%d", i+1))
+		line = strings.ReplaceAll(line, "__FILE__", "\"main.c\"")
 		trimmed := strings.TrimSpace(line)
-		
+
 		// Handle preprocessor directives
 		if strings.HasPrefix(trimmed, "#") {
 			// Whitespace may appear between # and the directive
@@ -618,25 +653,26 @@ func (p *Preprocessor) Process(source string) (string, error) {
 			if len(directive) == 0 {
 				continue
 			}
-			
+
 			cmd := directive[0]
-			
+
 			switch cmd {
 			case "#include":
 				if !condStack[len(condStack)-1].active {
 					continue
 				}
-				
+
 				if len(directive) < 2 {
 					return "", fmt.Errorf("line %d: #include requires filename", i+1)
 				}
-				
+
 				filename := includePathToken(directive)
 				originalFilename := ""
 				if len(directive) > 1 {
 					originalFilename = directive[1]
 				}
-				
+				seaPPTrace("include@%d %q active=%v condDepth=%d", i+1, filename, condStack[len(condStack)-1].active, len(condStack))
+
 				// Angle-bracket headers: try include paths first (project
 				// headers like <SDL3/SDL_gpu.h> resolve via -I); only skip
 				// when truly unfindable (real system headers).
@@ -649,7 +685,7 @@ func (p *Preprocessor) Process(source string) (string, error) {
 					result.WriteString(fmt.Sprintf("// Skipped system header: %s\n", originalFilename))
 					continue
 				}
-				
+
 				// Read and process included file
 				content, err := p.processInclude(filename)
 				if err != nil {
@@ -657,24 +693,24 @@ func (p *Preprocessor) Process(source string) (string, error) {
 					result.WriteString(fmt.Sprintf("// Skipped: #include %s\n", filename))
 					continue
 				}
-				
+
 				result.WriteString(content)
 				result.WriteString("\n")
-				
+
 			case "#define":
 				if !condStack[len(condStack)-1].active {
 					continue
 				}
-				
+
 				if len(directive) < 2 {
 					return "", fmt.Errorf("line %d: #define requires name", i+1)
 				}
-				
+
 				// Parse the full line to handle function-like macros
 				// Format: #define NAME(params) body
 				// or: #define NAME value
 				restOfLine := strings.TrimSpace(line[strings.Index(line, directive[1]):])
-				
+
 				// Check if it's a function-like macro
 				if len(restOfLine) > 0 && strings.Contains(restOfLine, "(") {
 					// C rule: the `(` must IMMEDIATELY follow the name.
@@ -687,7 +723,7 @@ func (p *Preprocessor) Process(source string) (string, error) {
 					}
 					name := restOfLine[:tokEnd]
 					parenIdx := strings.Index(restOfLine, "(")
-					
+
 					// Check if paren is immediately after name (no space = function macro)
 					if parenIdx == len(name) {
 						// Function-like macro
@@ -701,15 +737,16 @@ func (p *Preprocessor) Process(source string) (string, error) {
 									params = append(params, strings.TrimSpace(param))
 								}
 							}
-							
+
 							// Extract body (everything after closing paren).
 							// A trailing // comment is NOT part of the macro
 							// (it would comment out the invocation line).
 							body := stripDefineComment(strings.TrimSpace(restOfLine[closeParenIdx+1:]))
-							
+
 							if os.Getenv("SEAPP") != "" {
 								fmt.Fprintf(os.Stderr, "MACRO %s(%v) = %q\n", name, params, body)
 							}
+							seaPPTrace("definemacro %q(%v)", name, params)
 							p.mu.Lock()
 							p.funcMacros[name] = &FunctionMacro{
 								Params: params,
@@ -720,51 +757,53 @@ func (p *Preprocessor) Process(source string) (string, error) {
 						}
 					}
 				}
-				
+
 				// Simple object-like macro (comments stripped: see above).
 				name := directive[1]
 				value := ""
 				if len(directive) > 2 {
 					value = stripDefineComment(strings.Join(directive[2:], " "))
 				}
-				
+
+				seaPPTrace("define %q = %q", name, value)
 				p.Define(name, value)
 				// Don't output the #define itself
-				
+
 			case "#ifdef":
 				if len(directive) < 2 {
 					return "", fmt.Errorf("line %d: #ifdef requires name", i+1)
 				}
-				
+
 				name := directive[1]
 				active := condStack[len(condStack)-1].active && p.IsDefined(name)
 				condStack = append(condStack, condState{active: active, taken: active})
-				
+
 			case "#ifndef":
 				if len(directive) < 2 {
 					return "", fmt.Errorf("line %d: #ifndef requires name", i+1)
 				}
-				
+
 				name := directive[1]
 				active := condStack[len(condStack)-1].active && !p.IsDefined(name)
+				seaPPTrace("ifndef@%d %s defined=%v -> active=%v", i+1, name, p.IsDefined(name), active)
 				condStack = append(condStack, condState{active: active, taken: active})
-				
+
 			case "#else":
 				if len(condStack) <= 1 {
 					return "", fmt.Errorf("line %d: #else without #ifdef/#ifndef", i+1)
 				}
-				
+
 				parent := condStack[len(condStack)-2].active
 				current := &condStack[len(condStack)-1]
 				current.active = parent && !current.taken
-				
+
 			case "#endif":
 				if len(condStack) <= 1 {
 					return "", fmt.Errorf("line %d: #endif without #ifdef/#ifndef", i+1)
 				}
-				
+
 				condStack = condStack[:len(condStack)-1]
-				
+
 			case "#if":
 				// Parse #if expression
 				// For now, support: #if defined(X) and #if !defined(X)
@@ -772,16 +811,16 @@ func (p *Preprocessor) Process(source string) (string, error) {
 				condition := p.evaluateIfCondition(restOfLine)
 				active := condStack[len(condStack)-1].active && condition
 				condStack = append(condStack, condState{active: active, taken: active})
-				
+
 			case "#elif":
 				if len(condStack) <= 1 {
 					return "", fmt.Errorf("line %d: #elif without #if", i+1)
 				}
-				
+
 				// Only evaluate if parent is active and no previous branch was taken
 				parent := condStack[len(condStack)-2].active
 				current := &condStack[len(condStack)-1]
-				
+
 				if parent && !current.taken {
 					restOfLine := strings.TrimSpace(line[strings.Index(line, "#elif")+5:])
 					condition := p.evaluateIfCondition(restOfLine)
@@ -792,32 +831,32 @@ func (p *Preprocessor) Process(source string) (string, error) {
 				} else {
 					current.active = false
 				}
-				
+
 			case "#undef":
 				if !condStack[len(condStack)-1].active {
 					continue
 				}
-				
+
 				if len(directive) < 2 {
 					continue
 				}
-				
+
 				name := directive[1]
 				p.mu.Lock()
 				delete(p.defines, name)
 				delete(p.funcMacros, name)
 				p.mu.Unlock()
-				
+
 			case "#pragma":
 				// Ignore pragmas
-				
+
 			default:
 				// Unknown directive - skip
 			}
-			
+
 			continue
 		}
-		
+
 		// Only include line if we're in an active block
 		if condStack[len(condStack)-1].active {
 			// Expand macros in the line (proper text substitution)
@@ -826,20 +865,21 @@ func (p *Preprocessor) Process(source string) (string, error) {
 			result.WriteString("\n")
 		}
 	}
-	
+
 	return result.String(), nil
 }
 
 func (p *Preprocessor) processInclude(filename string) (string, error) {
 	// Check if already processed (avoid cycles)
 	if p.processed[filename] {
+		seaPPTrace("processInclude(%q): already processed (raw)", filename)
 		return "", nil
 	}
-	
+
 	// Try to find the file
 	var fullPath string
 	var found bool
-	
+
 	// If filename is an absolute path, try it directly first
 	if filepath.IsAbs(filename) {
 		if _, err := os.Stat(filename); err == nil {
@@ -847,7 +887,7 @@ func (p *Preprocessor) processInclude(filename string) (string, error) {
 			found = true
 		}
 	}
-	
+
 	// Otherwise, search in include paths
 	if !found {
 		for _, searchPath := range p.includePaths {
@@ -869,8 +909,9 @@ func (p *Preprocessor) processInclude(filename string) (string, error) {
 			found = true
 		}
 	}
-	
+
 	if !found {
+		seaPPTrace("processInclude(%q): NOT FOUND", filename)
 		return "", fmt.Errorf("include file not found: %s", filename)
 	}
 
@@ -882,26 +923,28 @@ func (p *Preprocessor) processInclude(filename string) (string, error) {
 		fullPath = abs
 	}
 	if p.processed[fullPath] {
+		seaPPTrace("processInclude(%q): canonical %q already processed", filename, fullPath)
 		return "", nil
 	}
-	
+
 	// Read file
 	content, err := os.ReadFile(fullPath)
 	if err != nil {
 		return "", err
 	}
-	
+
 	// Mark as processed
+	seaPPTrace("processInclude(%q): processing canonical %q", filename, fullPath)
 	p.processed[fullPath] = true
 
 	// Push this file's directory for relative nested includes.
 	p.dirStack = append(p.dirStack, filepath.Dir(fullPath))
 	defer func() { p.dirStack = p.dirStack[:len(p.dirStack)-1] }()
-	
+
 	// Extract types and function signatures from this header
 	// (Do this BEFORE processing to catch declarations before they're preprocessed away)
 	p.ExtractTypesFromHeader(fullPath)
-	
+
 	// Process all files the same way
 	return p.Process(string(content))
 }
@@ -970,7 +1013,7 @@ func analysisMask(s string) string {
 			for k := start; k < len(b); k++ {
 				b[k] = ' '
 			}
-		m = string(b)
+			m = string(b)
 			break
 		}
 		b := []byte(m)
@@ -1073,16 +1116,16 @@ func joinContinuedLines(source string) string {
 func (p *Preprocessor) processHeaderSimple(source string) (string, error) {
 	lines := strings.Split(joinLogicalLines(stripComments(joinContinuedLines(source))), "\n")
 	var result strings.Builder
-	
+
 	type condState struct {
 		active bool
 		taken  bool
 	}
 	condStack := []condState{{active: true, taken: false}}
-	
+
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		
+
 		if strings.HasPrefix(trimmed, "#") {
 			// Whitespace may appear between # and the directive
 			// (`# define X` is valid C and SDL uses it).
@@ -1090,21 +1133,21 @@ func (p *Preprocessor) processHeaderSimple(source string) (string, error) {
 			if len(directive) == 0 {
 				continue
 			}
-			
+
 			cmd := directive[0]
-			
+
 			switch cmd {
 			case "#include":
 				if !condStack[len(condStack)-1].active {
 					continue
 				}
-				
+
 				if len(directive) < 2 {
 					continue
 				}
-				
+
 				filename := includePathToken(directive)
-				
+
 				// Recursively include
 				content, err := p.processInclude(filename)
 				if err != nil {
@@ -1112,62 +1155,62 @@ func (p *Preprocessor) processHeaderSimple(source string) (string, error) {
 					result.WriteString(fmt.Sprintf("// Skipped: #include %s\n", filename))
 					continue
 				}
-				
+
 				result.WriteString(content)
 				result.WriteString("\n")
-				
+
 			case "#define":
 				if !condStack[len(condStack)-1].active {
 					continue
 				}
-				
+
 				if len(directive) < 2 {
 					continue
 				}
-				
+
 				name := directive[1]
 				value := ""
 				if len(directive) > 2 {
 					value = stripDefineComment(strings.Join(directive[2:], " "))
 				}
-				
+
 				p.Define(name, value)
 				// Don't output the #define itself
-				
+
 			case "#ifdef":
 				if len(directive) < 2 {
 					continue
 				}
-				
+
 				name := directive[1]
 				active := condStack[len(condStack)-1].active && p.IsDefined(name)
 				condStack = append(condStack, condState{active: active, taken: active})
-				
+
 			case "#ifndef":
 				if len(directive) < 2 {
 					continue
 				}
-				
+
 				name := directive[1]
 				active := condStack[len(condStack)-1].active && !p.IsDefined(name)
 				condStack = append(condStack, condState{active: active, taken: active})
-				
+
 			case "#else":
 				if len(condStack) <= 1 {
 					continue
 				}
-				
+
 				parent := condStack[len(condStack)-2].active
 				current := &condStack[len(condStack)-1]
 				current.active = parent && !current.taken
-				
+
 			case "#endif":
 				if len(condStack) <= 1 {
 					continue
 				}
-				
+
 				condStack = condStack[:len(condStack)-1]
-				
+
 			default:
 				// Keep other directives as comments
 				if condStack[len(condStack)-1].active {
@@ -1176,10 +1219,10 @@ func (p *Preprocessor) processHeaderSimple(source string) (string, error) {
 					result.WriteString("\n")
 				}
 			}
-			
+
 			continue
 		}
-		
+
 		// Copy non-directive lines if active, with macro expansion
 		if condStack[len(condStack)-1].active {
 			expanded := p.expandMacros(line)
@@ -1187,7 +1230,7 @@ func (p *Preprocessor) processHeaderSimple(source string) (string, error) {
 			result.WriteString("\n")
 		}
 	}
-	
+
 	return result.String(), nil
 }
 
@@ -1238,7 +1281,6 @@ func stripDefineComment(s string) string {
 	return strings.TrimSpace(out.String())
 }
 
-
 // includePathToken extracts the file path from a split #include directive.
 // Only the first token is the path (trailing // or /* */ comments belong
 // to the line, not the filename); surrounding quotes/angles are stripped.
@@ -1275,7 +1317,7 @@ func (p *Preprocessor) expandMacros(line string) string {
 			break
 		}
 	}
-	
+
 	return result
 }
 
@@ -1304,7 +1346,7 @@ func maskStrings(s string) string {
 				b[k] = ' '
 			}
 			i = j + 1
-			} else {
+		} else {
 			i++
 		}
 	}
@@ -1321,7 +1363,7 @@ func (p *Preprocessor) expandFunctionMacro(text string, name string, macro *Func
 		if strings.HasPrefix(masked[i:], name) {
 			// Check if it's a complete identifier followed by (
 			// (masked: strings/chars can't start or split an invocation)
-			if (i == 0 || !isIdentifierChar(masked[i-1])) {
+			if i == 0 || !isIdentifierChar(masked[i-1]) {
 				// Check for opening paren
 				j := i + len(name)
 				// Skip whitespace
@@ -1361,7 +1403,7 @@ func (p *Preprocessor) expandFunctionMacro(text string, name string, macro *Func
 						}
 						j++
 					}
-					
+
 					// Substitute parameters in body (#param stringifies
 					// first, so the # doesn't survive into the output).
 					expansion := macro.Body
@@ -1377,7 +1419,7 @@ func (p *Preprocessor) expandFunctionMacro(text string, name string, macro *Func
 					}
 					// Token pasting (SDL compile-time asserts rely on it).
 					expansion = pasteTokens(expansion)
-					
+
 					if os.Getenv("SEAPP") != "" {
 						fmt.Fprintf(os.Stderr, "EXPAND %s args=%q -> %q\n", name, args, expansion)
 					}
@@ -1387,11 +1429,11 @@ func (p *Preprocessor) expandFunctionMacro(text string, name string, macro *Func
 				}
 			}
 		}
-		
+
 		result.WriteByte(text[i])
 		i++
 	}
-	
+
 	return result.String()
 }
 
@@ -1478,7 +1520,7 @@ func (p *Preprocessor) ProcessFile(filename string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	
+
 	return p.Process(string(content))
 }
 
@@ -1488,26 +1530,26 @@ func (p *Preprocessor) ExtractTypesFromHeader(filename string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	lines := strings.Split(string(content), "\n")
-	
+
 	// First pass: collect all struct and typedef definitions
 	for i := 0; i < len(lines); i++ {
 		line := strings.TrimSpace(lines[i])
-		
+
 		// Match: typedef struct { ... } TypeName;
 		if strings.HasPrefix(line, "typedef struct") {
 			// Collect multi-line struct definition
 			structDef := line
 			braceCount := strings.Count(line, "{") - strings.Count(line, "}")
-			
+
 			for braceCount > 0 && i+1 < len(lines) {
 				i++
 				nextLine := strings.TrimSpace(lines[i])
 				structDef += " " + nextLine
 				braceCount += strings.Count(nextLine, "{") - strings.Count(nextLine, "}")
 			}
-			
+
 			// Parse the typedef
 			p.parseTypedefStruct(structDef)
 		} else if strings.HasPrefix(line, "typedef ") && !strings.Contains(line, "{") {
@@ -1520,10 +1562,10 @@ func (p *Preprocessor) ExtractTypesFromHeader(filename string) error {
 			p.parseFunctionDeclaration(line)
 		}
 	}
-	
+
 	// Second pass: resolve struct sizes now that all structs are known
 	p.resolveStructSizes()
-	
+
 	return nil
 }
 
@@ -1531,23 +1573,23 @@ func (p *Preprocessor) ExtractTypesFromHeader(filename string) error {
 func (p *Preprocessor) parseSimpleTypedef(line string) {
 	// Example: typedef Texture Texture2D;
 	// Example: typedef struct Color Color;
-	
+
 	line = strings.TrimPrefix(line, "typedef")
 	line = strings.TrimSpace(line)
 	line = strings.TrimSuffix(line, ";")
 	line = strings.TrimSpace(line)
-	
+
 	// Split into tokens
 	tokens := strings.Fields(line)
 	if len(tokens) < 2 {
 		return
 	}
-	
+
 	// Last token is the new type name
 	newTypeName := tokens[len(tokens)-1]
 	// Everything before is the old type
 	oldType := strings.Join(tokens[:len(tokens)-1], " ")
-	
+
 	// For simple aliases, we just create a struct with the same definition as the original
 	// If the original is in our structMap, copy it
 	if existing, ok := p.structMap[oldType]; ok {
@@ -1557,7 +1599,7 @@ func (p *Preprocessor) parseSimpleTypedef(line string) {
 		// Otherwise, create a placeholder struct
 		// This allows the typedef to be recognized even if we don't know the full definition
 		p.typedefMap[newTypeName] = &StructDef{
-			Name: newTypeName,
+			Name:    newTypeName,
 			Members: []StructMember{},
 		}
 	}
@@ -1568,22 +1610,22 @@ func (p *Preprocessor) parseTypedefStruct(def string) {
 	// Example: typedef struct { float x; float y; } Vector2;
 	// Example: typedef struct Color { unsigned char r, g, b, a; } Color;
 	// Example: typedef struct RenderTexture { ... } RenderTexture;
-	
+
 	// Find the type name (after closing brace)
 	closeBraceIdx := strings.LastIndex(def, "}")
 	if closeBraceIdx == -1 {
 		return
 	}
-	
+
 	afterBrace := strings.TrimSpace(def[closeBraceIdx+1:])
 	afterBrace = strings.TrimSuffix(afterBrace, ";")
 	afterBrace = strings.TrimSpace(afterBrace)
-	
+
 	typeName := afterBrace
 	if typeName == "" {
 		return
 	}
-	
+
 	// Extract struct name if it exists (between "struct" and "{")
 	var structName string
 	openBraceIdx := strings.Index(def, "{")
@@ -1593,15 +1635,15 @@ func (p *Preprocessor) parseTypedefStruct(def string) {
 		beforeBrace = strings.TrimPrefix(beforeBrace, "struct")
 		structName = strings.TrimSpace(beforeBrace)
 	}
-	
+
 	// Extract member definitions between braces
 	if openBraceIdx == -1 {
 		return
 	}
-	
+
 	membersStr := def[openBraceIdx+1 : closeBraceIdx]
 	members := p.parseStructMembers(membersStr)
-	
+
 	// Calculate total size
 	totalSize := 0
 	for _, member := range members {
@@ -1609,18 +1651,18 @@ func (p *Preprocessor) parseTypedefStruct(def string) {
 			totalSize = member.Offset + member.Size
 		}
 	}
-	
+
 	// Create struct type
 	structType := &StructDef{
 		Name:    typeName,
 		Members: members,
 		Size:    totalSize,
 	}
-	
+
 	// Store under the typedef name
 	p.typedefMap[typeName] = structType
 	p.structMap[typeName] = structType
-	
+
 	// Also store under the struct name if it exists and is different
 	if structName != "" && structName != typeName {
 		p.structMap[structName] = structType
@@ -1631,35 +1673,35 @@ func (p *Preprocessor) parseTypedefStruct(def string) {
 func (p *Preprocessor) parseStructMembers(membersStr string) []StructMember {
 	var members []StructMember
 	offset := 0
-	
+
 	// Split by semicolon to get individual member declarations
 	declarations := strings.Split(membersStr, ";")
-	
+
 	for _, decl := range declarations {
 		decl = strings.TrimSpace(decl)
 		if decl == "" {
 			continue
 		}
-		
+
 		// Parse declaration like "float x, y" or "unsigned char r"
 		parts := strings.Fields(decl)
 		if len(parts) < 2 {
 			continue
 		}
-		
+
 		// Build type name from all but last part
 		typeParts := parts[:len(parts)-1]
 		typeStr := strings.Join(typeParts, " ")
-		
+
 		// Last part contains variable name(s), possibly comma-separated
 		namesStr := parts[len(parts)-1]
 		names := strings.Split(namesStr, ",")
-		
+
 		memberType := p.mapTypeString(typeStr)
 		// Get size for basic types only during parsing
 		// Struct sizes will be calculated later
 		memberSize := p.getBasicTypeSize(memberType)
-		
+
 		for _, name := range names {
 			name = strings.TrimSpace(name)
 			if name != "" {
@@ -1673,19 +1715,19 @@ func (p *Preprocessor) parseStructMembers(membersStr string) []StructMember {
 			}
 		}
 	}
-	
+
 	return members
 }
 
 // getBasicTypeSize returns size of basic types without recursion
 func (p *Preprocessor) getBasicTypeSize(typ string) int {
 	typ = strings.TrimSpace(typ)
-	
+
 	// Pointers are 8 bytes
 	if strings.HasSuffix(typ, "*") {
 		return 8
 	}
-	
+
 	// Basic types
 	switch typ {
 	case "char", "signed char", "unsigned char":
@@ -1720,19 +1762,19 @@ func (p *Preprocessor) getTypeSizeHelper(typ string, visited map[string]bool) in
 		return 8 // Default to break cycle
 	}
 	visited[typ] = true
-	
+
 	typ = strings.TrimSpace(typ)
-	
+
 	// Pointers are 8 bytes
 	if strings.HasSuffix(typ, "*") {
 		return 8
 	}
-	
+
 	// Check if it's a known struct
 	if structDef, ok := p.structMap[typ]; ok {
 		return structDef.Size
 	}
-	
+
 	// Check for struct prefix
 	if strings.HasPrefix(typ, "struct ") {
 		structName := strings.TrimSpace(typ[7:])
@@ -1740,12 +1782,12 @@ func (p *Preprocessor) getTypeSizeHelper(typ string, visited map[string]bool) in
 			return structDef.Size
 		}
 	}
-	
+
 	// Check typedef map
 	if structDef, ok := p.typedefMap[typ]; ok {
 		return structDef.Size
 	}
-	
+
 	// Basic types
 	switch typ {
 	case "char", "signed char", "unsigned char":
@@ -1770,7 +1812,7 @@ func (p *Preprocessor) getTypeSizeHelper(typ string, visited map[string]bool) in
 // mapTypeString converts C type string to internal type
 func (p *Preprocessor) mapTypeString(typeStr string) string {
 	typeStr = strings.TrimSpace(typeStr)
-	
+
 	switch typeStr {
 	case "int", "signed int":
 		return "int"
@@ -1800,39 +1842,39 @@ func (p *Preprocessor) parseFunctionDeclaration(line string) {
 	// Clean up the line
 	line = strings.TrimSpace(line)
 	line = strings.ReplaceAll(line, "RLAPI ", "")
-	
+
 	// Skip if it doesn't look like a function declaration
 	if !strings.Contains(line, "(") || !strings.Contains(line, ")") {
 		return
 	}
-	
+
 	// Find the function name and return type
 	// Format: ReturnType FunctionName(params);
 	parenIdx := strings.Index(line, "(")
 	if parenIdx == -1 {
 		return
 	}
-	
+
 	beforeParen := strings.TrimSpace(line[:parenIdx])
 	parts := strings.Fields(beforeParen)
 	if len(parts) < 2 {
 		return
 	}
-	
+
 	// Last part is function name, everything before is return type
 	funcName := parts[len(parts)-1]
 	returnType := strings.Join(parts[:len(parts)-1], " ")
-	
+
 	// Extract parameter types
 	paramStart := parenIdx + 1
 	paramEnd := strings.Index(line[paramStart:], ")")
 	if paramEnd == -1 {
 		return
 	}
-	
+
 	paramsStr := strings.TrimSpace(line[paramStart : paramStart+paramEnd])
 	var paramTypes []string
-	
+
 	if paramsStr != "" && paramsStr != "void" {
 		// Split by comma
 		params := strings.Split(paramsStr, ",")
@@ -1853,7 +1895,7 @@ func (p *Preprocessor) parseFunctionDeclaration(line string) {
 			}
 		}
 	}
-	
+
 	// Store the function signature
 	p.functionSigs[funcName] = &FunctionSignature{
 		ReturnType: returnType,
@@ -1863,45 +1905,45 @@ func (p *Preprocessor) parseFunctionDeclaration(line string) {
 
 // resolveStructSizes computes actual sizes of all structs after they're all parsed
 func (p *Preprocessor) resolveStructSizes() {
-// Keep resolving until no changes (handles nested structs)
-maxIterations := 10
-for iter := 0; iter < maxIterations; iter++ {
-changed := false
+	// Keep resolving until no changes (handles nested structs)
+	maxIterations := 10
+	for iter := 0; iter < maxIterations; iter++ {
+		changed := false
 
-for _, structDef := range p.structMap {
-if structDef.Size > 0 {
-continue // Already computed
-}
+		for _, structDef := range p.structMap {
+			if structDef.Size > 0 {
+				continue // Already computed
+			}
 
-// Compute size from members
-totalSize := 0
-allResolved := true
+			// Compute size from members
+			totalSize := 0
+			allResolved := true
 
-for i := range structDef.Members {
-member := &structDef.Members[i]
-if member.Size == 0 {
-// Try to resolve the member size
-memberSize := p.getTypeSizeHelper(member.Type, make(map[string]bool))
-if memberSize > 0 {
-member.Size = memberSize
-member.Offset = totalSize
-totalSize += memberSize
-} else {
-allResolved = false
-}
-} else {
-totalSize = member.Offset + member.Size
-}
-}
+			for i := range structDef.Members {
+				member := &structDef.Members[i]
+				if member.Size == 0 {
+					// Try to resolve the member size
+					memberSize := p.getTypeSizeHelper(member.Type, make(map[string]bool))
+					if memberSize > 0 {
+						member.Size = memberSize
+						member.Offset = totalSize
+						totalSize += memberSize
+					} else {
+						allResolved = false
+					}
+				} else {
+					totalSize = member.Offset + member.Size
+				}
+			}
 
-if allResolved && totalSize > 0 {
-structDef.Size = totalSize
-changed = true
-}
-}
+			if allResolved && totalSize > 0 {
+				structDef.Size = totalSize
+				changed = true
+			}
+		}
 
-if !changed {
-break
-}
-}
+		if !changed {
+			break
+		}
+	}
 }
