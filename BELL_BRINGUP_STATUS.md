@@ -188,3 +188,24 @@ investigation needed). tcc reference completes 40 frames + screenshot +
 exit 0.
 
 Go tests: `go test -count=1 ./...` passes.
+
+## Update (Oct 18 2026, later) -- editor shot reaches FULL tcc parity
+
+`structArgInfo` did not handle `NodeArrayAccess` arguments, so `m.meshes[i]`
+(a `Mesh` struct) was passed to the extern `DrawMesh` as a plain 8-byte
+pointer instead of the 120-byte value. DrawMesh then read a corrupt
+`Material` (null `shader.locs`) and crashed. Adding a `NodeArrayAccess`
+case (using `structTypeOf`) fixed it.
+
+The sea-compiled `bell/output/main.c` (`-D BACKEND_RAYLIB -D DEMO_SHOT`)
+now behaves exactly like the tcc reference:
+- `preview target 1100 x 640`
+- renders 40 frames
+- `Screenshot taken successfully` (editor/shot.png, ~42 KB)
+- `editor closed after 40 frames`, exit 0
+
+Also landed: preprocessor `expandMacros` fast path (93s -> 5s
+preprocessing, ~8s total bell build), PC-relative global string inits,
+SysV by-value extern big-struct passing, natural struct alignment,
+adjacent string literals, CLOCK_* surrogates, `-D` flag support,
+forward-ref `funcDefined`.
