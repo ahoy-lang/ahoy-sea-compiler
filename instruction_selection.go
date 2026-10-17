@@ -2549,6 +2549,10 @@ var libcDoubleRet = map[string]bool{
 	"erfc": true, "ceil": true, "floor": true, "round": true,
 	"trunc": true, "fmod": true, "fmin": true, "fmax": true,
 	"fabs": true, "fma": true,
+	// String-to-double conversions (also skipped <stdlib.h>). Without
+	// these, atof("40") read rax (0) instead of xmm0 (40.0), which zeroed
+	// bell's editor settings and every scene coordinate parsed with atof.
+	"atof": true, "strtod": true,
 }
 
 // unknownStructCall returns true when node is (or wraps) a call whose
