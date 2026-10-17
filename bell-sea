@@ -101,6 +101,7 @@ echo "sea compiler: compiling $out_c ..."
 
 # --- 5. Run it. Bell's own debug chatter (SPRDBG ...) is suppressed here
 # so a sea production run prints just one line; real diagnostics on stderr
-# (e.g. the crash reporter) still pass through.
+# (e.g. the crash reporter) still pass through. -a so raylib's NUL-padded
+# output isn't treated as binary (which would swallow the crash report).
 echo "sea compiler: running $out_bin"
-exec "$out_bin" 2> >(grep -v --line-buffered '^SPRDBG' >&2)
+exec "$out_bin" 2> >(grep -a -v --line-buffered '^SPRDBG' >&2)
