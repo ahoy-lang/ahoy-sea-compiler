@@ -1403,6 +1403,20 @@ func (is *InstructionSelector) isLargeStruct(typ string) bool {
 	return is.isLargeStructHelper(typ, make(map[string]bool))
 }
 
+// stripStorageClass removes leading storage-class/qualifier keywords so a
+// declared return type like "inline struct Matrix" is classified the same
+// as "struct Matrix" (a mismatch here broke the caller/callee SRet ABI for
+// inline functions such as raymath.h's MatrixMultiply).
+func stripStorageClass(typ string) string {
+	t := strings.TrimSpace(typ)
+	for _, q := range []string{"static ", "inline ", "extern ", "const ", "volatile ", "register "} {
+		for strings.HasPrefix(t, q) {
+			t = strings.TrimSpace(t[len(q):])
+		}
+	}
+	return t
+}
+
 func (is *InstructionSelector) isLargeStructHelper(typ string, visited map[string]bool) bool {
 	// Prevent infinite recursion
 	if visited[typ] {
@@ -1566,7 +1580,7 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 		var hiddenRetPtr *Symbol
 		paramRegStartIdx := 0
 
-		if node.ReturnType != "" && is.isLargeStruct(node.ReturnType) {
+		if node.ReturnType != "" && is.isLargeStruct(stripStorageClass(node.ReturnType)) {
 			// Allocate space for hidden return pointer
 			is.stackOffset -= 8
 			hiddenRetPtr = &Symbol{
