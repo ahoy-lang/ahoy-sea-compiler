@@ -1505,11 +1505,6 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 				return err
 			}
 		}
-		if sig, ok := is.functions["cam3_apply"]; ok {
-			fmt.Fprintf(os.Stderr, "DEBUG NodeProgram: cam3_apply registered, ReturnType=%q\n", sig.ReturnType)
-		} else {
-			fmt.Fprintf(os.Stderr, "DEBUG NodeProgram: cam3_apply NOT registered\n")
-		}
 
 	case NodeFunction:
 		// Track the function signature
@@ -1524,9 +1519,6 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 		is.functions[node.Name] = &FunctionSignature{
 			ReturnType: rt,
 			ParamTypes: node.ParamTypes,
-		}
-		if node.Name == "rl_font_valid" {
-			fmt.Fprintf(os.Stderr, "DEBUG reg: name=%q ReturnType=%q hasBody=%v\n", node.Name, rt, len(node.Children) > 0)
 		}
 
 		if is.funcDefined == nil {
@@ -4654,9 +4646,6 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		var returnType string
 		if funcSig, ok := is.functions[node.Name]; ok {
 			returnType = funcSig.ReturnType
-		}
-		if node.Name == "IsFontValid" {
-			fmt.Fprintf(os.Stderr, "DEBUG IsFontValid: funcSig=%v returnType=%q funcDefined=%v structs_Font=%v\n", returnType != "" || true, returnType, is.funcDefined[node.Name], func() bool { _, ok := is.structs["Font"]; return ok }())
 		}
 
 		// External float/double returns (libc table; declared functions
