@@ -2723,6 +2723,11 @@ func (is *InstructionSelector) structArgInfo(argNode *ASTNode, arg *Operand) (st
 		if arg != nil {
 			typ = arg.DataType
 		}
+	case NodeArrayAccess:
+		// Element type (e.g. m.meshes[i] is a Mesh). arg.DataType is
+		// often the address type (Mesh*), which would wrongly look like
+		// a pointer and be passed as a plain 8-byte value.
+		typ = is.structTypeOf(argNode)
 	case NodeCompoundLiteral:
 		typ = argNode.DataType
 	}
