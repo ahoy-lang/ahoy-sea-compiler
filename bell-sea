@@ -90,7 +90,7 @@ out_bin="$bell_dir/output/${base}_sea"
 sea_defines=()
 for d in "${defines[@]}"; do sea_defines+=(-D "$d"); done
 
-echo "bell-sea: compiling $out_c with sea..."
+echo "sea compiler: compiling $out_c ..."
 "$sea" "$out_c" -o "$out_bin" \
     "${sea_defines[@]}" \
     -I repos -I repos/box2d/include -I repos/box3d/include -I repos/SDL3/include \
@@ -99,6 +99,8 @@ echo "bell-sea: compiling $out_c with sea..."
     -lX11 -lXext -lXrandr -lXcursor -lXi -lXinerama -lXxf86vm -lXfixes \
     repos/box2d/lib/linux/libbox2d.a repos/box3d/lib/linux/libbox3d.a
 
-# --- 5. Run it.
-echo "bell-sea: running $out_bin"
-exec "$out_bin"
+# --- 5. Run it. Bell's own debug chatter (SPRDBG ...) is suppressed here
+# so a sea production run prints just one line; real diagnostics on stderr
+# (e.g. the crash reporter) still pass through.
+echo "sea compiler: running $out_bin"
+exec "$out_bin" 2> >(grep -v --line-buffered '^SPRDBG' >&2)
