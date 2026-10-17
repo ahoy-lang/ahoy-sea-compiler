@@ -53,6 +53,14 @@ func NewPreprocessor() *Preprocessor {
 	p.defines["SEEK_SET"] = "0"
 	p.defines["SEEK_CUR"] = "1"
 	p.defines["SEEK_END"] = "2"
+	// <time.h> clock ids from the skipped header (glibc values).
+	// bell's perf.h times passes with clock_gettime(CLOCK_MONOTONIC, &ts).
+	p.defines["CLOCK_REALTIME"] = "0"
+	p.defines["CLOCK_MONOTONIC"] = "1"
+	p.defines["CLOCK_PROCESS_CPUTIME_ID"] = "2"
+	p.defines["CLOCK_THREAD_CPUTIME_ID"] = "3"
+	p.defines["CLOCK_MONOTONIC_RAW"] = "4"
+	p.defines["CLOCK_BOOTTIME"] = "7"
 	// POSIX fd + signal surrogates from skipped <unistd.h>/<signal.h>
 	// (bell's generated crash handler uses these directly).
 	p.defines["STDIN_FILENO"] = "0"

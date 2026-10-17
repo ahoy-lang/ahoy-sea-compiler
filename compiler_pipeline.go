@@ -35,6 +35,7 @@ type CompilerOptions struct {
 	NoPreprocess      bool     // Skip preprocessing
 	LibraryFlags      []string // Additional library flags like -lc, -lraylib
 	IncludePaths      []string // Additional #include search paths (-I)
+	Defines           []string // -D defines (name or name=value), applied to the preprocessor
 }
 
 func NewCompilerPipeline(source string, options CompilerOptions) *CompilerPipeline {
@@ -64,6 +65,15 @@ func (cp *CompilerPipeline) Compile() error {
 		cp.preprocessor = NewPreprocessor()
 		for _, inc := range cp.options.IncludePaths {
 			cp.preprocessor.AddIncludePath(inc)
+		}
+		// Command-line -D defines (e.g. -D BACKEND_RAYLIB like ahoy-bin
+		// passes through to the C compiler for the generated #ifdefs).
+		for _, def := range cp.options.Defines {
+			name, value := def, "1"
+			if eq := strings.IndexByte(def, '='); eq >= 0 {
+				name, value = def[:eq], def[eq+1:]
+			}
+			cp.preprocessor.Define(name, value)
 		}
 		if cp.sourceFile != "" {
 			cp.preprocessor.AddIncludePath(filepath.Dir(cp.sourceFile))
@@ -105,7 +115,6 @@ func (cp *CompilerPipeline) Compile() error {
 	if err != nil {
 		return fmt.Errorf("parse error: %w", err)
 	}
-
 	if cp.options.Verbose {
 		fmt.Printf("  Completed in %v\n", time.Since(start))
 	}
@@ -151,6 +160,15 @@ func (cp *CompilerPipeline) Compile() error {
 			cp.selector.functions[child.Name] = &FunctionSignature{
 				ReturnType: child.ReturnType,
 				ParamTypes: child.ParamTypes,
+			}
+			// Track defined (has body) functions up front so forward
+			// references (trampolines generated before their targets)
+			// use sea's internal ABI instead of the extern SysV one.
+			if cp.selector.funcDefined == nil {
+				cp.selector.funcDefined = make(map[string]bool)
+			}
+			if len(child.Children) > 0 {
+				cp.selector.funcDefined[child.Name] = true
 			}
 		}
 	}
@@ -248,15 +266,24 @@ func (cp *CompilerPipeline) AssembleAndLink(outputBinary string) error {
 	// the app never defines, and tcc links them fine.
 	gccArgs = append(gccArgs, "-Wl,--unresolved-symbols=ignore-all")
 
-	// Add Raylib library flags
-	gccArgs = append(gccArgs,
-		"-L/home/lee/Documents/clibs/raylib/src",
-		"-lraylib",
-		"-lm",
-		"-lpthread",
-		"-ldl",
-		"-lrt",
-	)
+	// Add Raylib library flags. The default clibs/raylib is only used
+	// when the caller did not supply their own raylib archive (e.g. bell
+	// passes ../ahoy/repos/raylib/src/libraylib.a, whose rmodels.o differs
+	// from the stale clibs one and avoids its strict face-count assert).
+	hasRaylibLib := false
+	for _, f := range cp.options.LibraryFlags {
+		if strings.Contains(f, "raylib") {
+			hasRaylibLib = true
+			break
+		}
+	}
+	if !hasRaylibLib {
+		gccArgs = append(gccArgs,
+			"-L/home/lee/Documents/clibs/raylib/src",
+			"-lraylib",
+		)
+	}
+	gccArgs = append(gccArgs, "-lm", "-lpthread", "-ldl", "-lrt")
 
 	// Add any additional library flags from options
 	if len(cp.options.LibraryFlags) > 0 {
@@ -415,6 +442,14 @@ func runCompiler() {
 			}
 		case strings.HasPrefix(arg, "-I"):
 			options.IncludePaths = append(options.IncludePaths, arg[2:])
+		case arg == "-D":
+			if i+1 < len(os.Args) {
+				options.Defines = append(options.Defines, os.Args[i+1])
+				i++
+			}
+		case strings.HasPrefix(arg, "-D"):
+			// -DNAME or -DNAME=value (preprocessor define).
+			options.Defines = append(options.Defines, arg[2:])
 		case arg == "-O0":
 			options.OptimizationLevel = 0
 		case arg == "-O1":

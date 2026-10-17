@@ -479,43 +479,74 @@ func (is *InstructionSelector) flattenMultiDim(node *ASTNode) (rootAddr, totalOf
 	for k := range chain {
 		chain[k].level = k
 	}
-	// Root must be an identifier with 2+ dims.
-	if cur.Type != NodeIdentifier {
-		return nil, nil, "", 0, false, false
-	}
-	var sym *Symbol
-	if s, found := is.localVars[cur.VarName]; found {
-		sym = s
-	} else if s, found := is.globalVars[cur.VarName]; found {
-		sym = s
-	} else {
-		return nil, nil, "", 0, false, false
-	}
-	if len(sym.Dims) < 2 {
-		return nil, nil, "", 0, false, false
-	}
-	dims := sym.Dims
-	if sym.ArraySize > 0 {
-		elemType = sym.Type
-	} else {
-		elemType = strings.TrimSuffix(strings.TrimSpace(sym.Type), "*")
-	}
-	var err error
-	if sym.ArraySize > 0 {
-		var baseOff int
-		var isG bool
-		if sym.IsGlobal {
-			baseOff, isG = 0, true
+	// Root must be an identifier or a struct member, both with 2+ dims.
+	var dims []int
+	if cur.Type == NodeIdentifier {
+		var sym *Symbol
+		if s, found := is.localVars[cur.VarName]; found {
+			sym = s
+		} else if s, found := is.globalVars[cur.VarName]; found {
+			sym = s
 		} else {
-			baseOff, isG = sym.Offset, false
-		}
-		rootAddr = is.newTemp()
-		is.emit(OpLoadAddr, rootAddr, &Operand{Type: "var", Value: cur.VarName, Offset: baseOff, IsGlobal: isG}, nil)
-	} else {
-		rootAddr, err = is.selectExpression(cur)
-		if err != nil {
 			return nil, nil, "", 0, false, false
 		}
+		if len(sym.Dims) < 2 {
+			return nil, nil, "", 0, false, false
+		}
+		dims = sym.Dims
+		if sym.ArraySize > 0 {
+			elemType = sym.Type
+		} else {
+			elemType = strings.TrimSuffix(strings.TrimSpace(sym.Type), "*")
+		}
+		var err error
+		if sym.ArraySize > 0 {
+			var baseOff int
+			var isG bool
+			if sym.IsGlobal {
+				baseOff, isG = 0, true
+			} else {
+				baseOff, isG = sym.Offset, false
+			}
+			rootAddr = is.newTemp()
+			is.emit(OpLoadAddr, rootAddr, &Operand{Type: "var", Value: cur.VarName, Offset: baseOff, IsGlobal: isG}, nil)
+		} else {
+			rootAddr, err = is.selectExpression(cur)
+			if err != nil {
+				return nil, nil, "", 0, false, false
+			}
+		}
+	} else if cur.Type == NodeMemberAccess && len(cur.Children) >= 1 {
+		// Struct member arrays: m.nodew[i][j], arr[k].nodew[i][j],
+		// p->nodew[i][j]. Member dims come from the struct definition;
+		// the row address comes from the member lvalue's address. Interior
+		// levels must yield the row address — the legacy path would load
+		// a scalar element and index through its bits.
+		baseT := is.structTypeOf(cur.Children[0])
+		if baseT == "" {
+			return nil, nil, "", 0, false, false
+		}
+		def, _, found := is.lookupMember(baseT, cur.MemberName)
+		if !found {
+			return nil, nil, "", 0, false, false
+		}
+		for _, m := range def.Members {
+			if m.Name == cur.MemberName {
+				dims = m.Dims
+				elemType = m.Type
+				break
+			}
+		}
+		if len(dims) < 2 {
+			return nil, nil, "", 0, false, false
+		}
+		addr, _, aok, aerr := is.lvalueAddrSize(cur)
+		if aerr != nil || !aok {
+			return nil, nil, "", 0, false, false
+		}
+		rootAddr = addr
+	} else {
+		return nil, nil, "", 0, false, false
 	}
 	elemSize = is.getTypeSize(elemType)
 	if elemSize <= 0 {
@@ -1134,6 +1165,14 @@ func (is *InstructionSelector) convertForHome(v *Operand, homeType string) *Oper
 		}
 		return v
 	}
+	// Address constants (string literals, function names — Operand Type
+	// "label") are address VALUES, not lvalues: integer conversions must
+	// not load from the label. (intptr_t)"" used to compile to movslq of
+	// the literal's first four bytes (bell's search field then held rodata
+	// junk like 'NUR\0' → strcmp ran off unmapped memory).
+	if v.Type == "label" {
+		return v
+	}
 	if mode := cvtMode(v.DataType, homeType); mode != "" {
 		c := is.newTemp()
 		c.DataType = homeType
@@ -1335,6 +1374,18 @@ func (is *InstructionSelector) getTypeSizeHelper(typ string, visited map[string]
 		return 8 // Default struct size
 	}
 
+	// Check for union types (definitions live in the same table as
+	// structs). Missing this made union locals get the 8-byte default
+	// slot while sizeof() reported the real size: SDL_Event (128B)
+	// locals smashed the frame when SDL wrote a full event into them.
+	if len(typ) > 6 && typ[:6] == "union " {
+		unionName := strings.TrimSpace(typ[6:])
+		if unionDef, ok := is.structs[unionName]; ok {
+			return unionDef.Size
+		}
+		return 8 // Default union size
+	}
+
 	// Check for typedef'd types
 	if actualType, ok := is.typedefs[typ]; ok {
 		return is.getTypeSizeHelper(actualType, visited)
@@ -1380,10 +1431,12 @@ func (is *InstructionSelector) isLargeStructHelper(typ string, visited map[strin
 		return false
 	}
 
-	// Check if it's a struct type
+	// Check if it's a struct or union type
 	structName := typ
 	if len(typ) > 7 && typ[:7] == "struct " {
 		structName = typ[7:]
+	} else if len(typ) > 6 && typ[:6] == "union " {
+		structName = strings.TrimSpace(typ[6:])
 	} else if actualType, ok := is.typedefs[typ]; ok {
 		// Resolve typedef
 		return is.isLargeStructHelper(actualType, visited)
@@ -1452,6 +1505,11 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 				return err
 			}
 		}
+		if sig, ok := is.functions["cam3_apply"]; ok {
+			fmt.Fprintf(os.Stderr, "DEBUG NodeProgram: cam3_apply registered, ReturnType=%q\n", sig.ReturnType)
+		} else {
+			fmt.Fprintf(os.Stderr, "DEBUG NodeProgram: cam3_apply NOT registered\n")
+		}
 
 	case NodeFunction:
 		// Track the function signature
@@ -1467,6 +1525,10 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 			ReturnType: rt,
 			ParamTypes: node.ParamTypes,
 		}
+		if node.Name == "rl_font_valid" {
+			fmt.Fprintf(os.Stderr, "DEBUG reg: name=%q ReturnType=%q hasBody=%v\n", node.Name, rt, len(node.Children) > 0)
+		}
+
 		if is.funcDefined == nil {
 			is.funcDefined = make(map[string]bool)
 		}
@@ -1562,8 +1624,14 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 					// Indirect: save the pointer reg to a slot now;
 					// copy in the second pass.
 					is.stackOffset -= sz
-					if is.stackOffset%8 != 0 {
-						is.stackOffset -= is.stackOffset % 8
+					// Round DOWN (more negative) to an 8-byte boundary.
+					// Go's % keeps the sign of the dividend, so a naive
+					// `stackOffset -= stackOffset % 8` rounds UP for
+					// negative offsets and overlaps the following slot
+					// (e.g. a 44-byte struct at -88 followed by an
+					// 8-byte __retptr at -48 overlapped by 4 bytes).
+					for is.stackOffset%8 != 0 {
+						is.stackOffset--
 					}
 					base := is.stackOffset
 					is.stackOffset -= 8
@@ -4582,6 +4650,10 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		if funcSig, ok := is.functions[node.Name]; ok {
 			returnType = funcSig.ReturnType
 		}
+		if node.Name == "IsFontValid" {
+			fmt.Fprintf(os.Stderr, "DEBUG IsFontValid: funcSig=%v returnType=%q funcDefined=%v structs_Font=%v\n", returnType != "" || true, returnType, is.funcDefined[node.Name], func() bool { _, ok := is.structs["Font"]; return ok }())
+		}
+
 		// External float/double returns (libc table; declared functions
 		// resolve via the map above). Sea-defined functions use rax
 		// convention (handled by normal path); externals use xmm0.
@@ -4649,8 +4721,17 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				if srcAddr == nil {
 					return nil, fmt.Errorf("cannot pass struct argument (in function: %s)", is.currentFunc)
 				}
+				// Extern (gcc-compiled) DIRECT calls use the SysV ABI:
+				// structs larger than 16 bytes are passed by VALUE on the
+				// stack, not by pointer (sea's internal ABI). Passing a
+				// pointer corrupts the callee. Indirect calls (through
+				// function pointers) target sea-compiled trampolines and
+				// keep sea's internal ABI (pointer).
+				isExtern := (node.Target == nil) && !is.funcDefined[node.Name]
 				var chunks []string
-				if ssize > 16 {
+				if isExtern && ssize > 16 {
+					chunks = []string{"sysv"}
+				} else if ssize > 16 {
 					chunks = []string{"mem"}
 				} else {
 					chunks = is.structChunkClasses(sname)
@@ -4683,6 +4764,7 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		// Check if we need to allocate space for a large struct return
 		var retSlot *Operand
 		argStartIdx := 0
+
 
 		if returnType != "" && is.isLargeStruct(returnType) {
 			// Allocate space for return value on stack
@@ -4723,6 +4805,34 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		for ai, ca := range args {
 			// Struct over 8 bytes: chunked regs (9-16) or pointer (>16).
 			if ca.isStruct {
+				if len(ca.chunks) == 1 && ca.chunks[0] == "sysv" {
+					// SysV: pass big struct by value on the stack
+					// (consecutive 8-byte slots). Spill the source
+					// address to a stack slot first (like emitStructCopy)
+					// so the chunk loop can't clobber it.
+					nslots := (ca.ssize + 7) / 8
+					is.stackOffset -= 8
+					srcSlot := is.stackOffset
+					is.emit(OpStore, &Operand{Type: "mem", Offset: srcSlot}, ca.srcAddr, nil)
+					for k := 0; k < nslots; k++ {
+						is.stackOffset -= 8
+						st := &Operand{Type: "mem", Offset: is.stackOffset, DataType: "long"}
+						srcBase := is.newTemp()
+						is.emit(OpLoad, srcBase, &Operand{Type: "mem", Offset: srcSlot}, nil)
+						if k > 0 {
+							offOp := &Operand{Type: "imm", Value: fmt.Sprintf("%d", k*8)}
+							tmp := is.newTemp()
+							is.emit(OpAdd, tmp, srcBase, offOp)
+							srcBase = tmp
+						}
+						val := is.newTemp()
+						val.DataType = "long"
+						is.emit(OpLoad, val, &Operand{Type: "ptr", IndexTemp: srcBase, Size: 8}, nil)
+						is.emit(OpStore, st, val, nil)
+						stackArgs = append(stackArgs, stackArg{slot: st, idx: len(stackArgs)})
+					}
+					continue
+				}
 				if len(ca.chunks) == 1 && ca.chunks[0] == "mem" {
 					if intRegIdx < len(intRegs) {
 						regOp := &Operand{Type: "reg", Value: intRegs[intRegIdx]}
@@ -5089,6 +5199,13 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				if !found {
 					return nil, fmt.Errorf("struct %s has no member %s (in function: %s)", structName, fieldName, is.currentFunc)
 				}
+			}
+
+			// Convert the initializer to the field's type (e.g. an int
+			// literal initializing a double field must become a double,
+			// not raw integer bits).
+			if value != nil && fieldType != "" {
+				value = is.convertForHome(value, fieldType)
 			}
 
 			// Struct-typed field from a struct value (nested compound,

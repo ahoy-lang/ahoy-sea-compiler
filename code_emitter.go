@@ -267,6 +267,10 @@ func (ce *CodeEmitter) emitDataGlobal(name string, sym *Symbol) bool {
 	} else {
 		ce.dataSection.WriteString(fmt.Sprintf("    .globl %s\n", name))
 	}
+
+	// For string (char*) globals, emit the string in .data with its own
+	// label, then store the address. Keeping both in .data avoids
+	// cross-section local-label mis-resolution by the linker.
 	align := sym.Size
 	if align > 8 {
 		align = 8
@@ -276,10 +280,20 @@ func (ce *CodeEmitter) emitDataGlobal(name string, sym *Symbol) bool {
 	}
 	ce.dataSection.WriteString(fmt.Sprintf("    .align %d\n", align))
 	ce.dataSection.WriteString(fmt.Sprintf("%s:\n", name))
+	if kind == "string" {
+		str := val
+		if s, ok := ce.stringLits[val]; ok {
+			str = s
+		}
+		// Emit the string immediately after the pointer slot, and store
+		// a PC-relative offset (8) so the value is resolved at assembly
+		// time (no cross-section relocation, which mis-resolves in large
+		// files). The variable's address+8 points at the string.
+		ce.dataSection.WriteString(fmt.Sprintf("    .quad . + 8\n"))
+		ce.dataSection.WriteString(fmt.Sprintf("    .string \"%s\"\n", escapeString(str)))
+		return true
+	}
 	switch kind {
-	case "string":
-		// char* init: address of (possibly newly interned) literal.
-		ce.dataSection.WriteString(fmt.Sprintf("    .quad %s\n", val))
 	case "double":
 		if sym.Size == 4 {
 			ce.dataSection.WriteString(fmt.Sprintf("    .float %s\n", val))
@@ -391,7 +405,10 @@ func (ce *CodeEmitter) constInitValue(node *ASTNode, sym *Symbol) (string, strin
 				return label, "string"
 			}
 		}
-		label := fmt.Sprintf(".str_g%d", len(ce.stringLits))
+		// Use a non-local (global) label: a leading-dot label referenced
+		// across sections (.data -> .rodata) was mis-resolved by the linker
+		// for large strings, leaving the pointer (e.g. ahoy_lit_vs) 0.
+		label := fmt.Sprintf("str_g%d", len(ce.stringLits))
 		ce.stringLits[label] = node.Value
 		return label, "string"
 	case NodeUnaryOp:

@@ -113,6 +113,7 @@ type StructDef struct {
 	Name    string
 	Members []StructMember
 	Size    int
+	Align   int // natural alignment (max member alignment, capped at 8)
 }
 
 type Parser struct {
@@ -209,6 +210,7 @@ func NewParser(source string) *Parser {
 			{Name: "tv_nsec", Type: "long", Offset: 8, Size: 8, Align: 8},
 		},
 		Size: 16,
+		Align: 8,
 	}
 	p.structs["stat"] = &StructDef{
 		Name: "stat",
@@ -229,6 +231,7 @@ func NewParser(source string) *Parser {
 			{Name: "st_ctim", Type: "struct timespec", Offset: 104, Size: 16, Align: 8},
 		},
 		Size: 144,
+		Align: 8,
 	}
 	// struct dirent from skipped <dirent.h> (exact glibc x86-64 layout;
 	// bell reads entry->d_name via glue.h).
@@ -242,6 +245,7 @@ func NewParser(source string) *Parser {
 			{Name: "d_name", Type: "char", Offset: 19, Size: 256, Align: 1, ArrayLen: 256, Dims: []int{256}},
 		},
 		Size: 280,
+		Align: 8,
 	}
 	// struct sigaction / siginfo_t / sigset_t from skipped <signal.h>
 	// (exact glibc x86-64 layout; bell's crash handler installs handlers
@@ -256,6 +260,7 @@ func NewParser(source string) *Parser {
 			{Name: "sa_restorer", Type: "void*", Offset: 144, Size: 8, Align: 8},
 		},
 		Size: 152,
+		Align: 8,
 	}
 	p.structs["siginfo_t"] = &StructDef{
 		Name: "siginfo_t",
@@ -267,6 +272,7 @@ func NewParser(source string) *Parser {
 			{Name: "si_addr", Type: "void*", Offset: 16, Size: 8, Align: 8},
 		},
 		Size: 128,
+		Align: 8,
 	}
 	p.structs["sigset_t"] = &StructDef{
 		Name: "sigset_t",
@@ -274,6 +280,7 @@ func NewParser(source string) *Parser {
 			{Name: "__val", Type: "unsigned long", Offset: 0, Size: 128, Align: 8, ArrayLen: 16, Dims: []int{16}},
 		},
 		Size: 128,
+		Align: 8,
 	}
 	return p
 }
@@ -399,6 +406,76 @@ func (p *Parser) getTypeSize(typ string) int {
 	// Basic types (shared LP64 table; keeps parser and codegen in agreement)
 	if s, ok := cSizeOf(typ); ok {
 		return s
+	}
+	return 4 // Default
+}
+
+// getTypeAlign returns the natural alignment in bytes of a type. For struct
+// types this is the struct's own alignment (max member alignment), NOT the
+// size-based heuristic that previously over-aligned embedded structs (e.g.
+// RenderTexture's Texture member was aligned to 8 instead of its true 4,
+// producing a 56-byte layout instead of the real 44-byte one).
+func (p *Parser) getTypeAlign(typ string) int {
+	// Peel qualifiers / arrays / pointers.
+	typ = stripQualifiers(typ)
+	// Resolve typedef chains to the underlying type.
+	for {
+		resolved := p.resolveTypedef(typ)
+		if resolved == typ {
+			break
+		}
+		typ = resolved
+	}
+	// Pointers are 8 bytes, 8-aligned.
+	if len(typ) > 0 && typ[len(typ)-1] == '*' {
+		return 8
+	}
+	// Struct types: use the struct's stored natural alignment.
+	if len(typ) > 7 && typ[:7] == "struct " {
+		structName := typ[7:]
+		if structDef, ok := p.structs[structName]; ok {
+			a := structDef.Align
+			if a <= 0 {
+				a = structDef.Size
+			}
+			if a <= 0 {
+				a = 1
+			}
+			if a > 8 {
+				a = 8
+			}
+			return a
+		}
+		return 8 // Default struct alignment
+	}
+	// Union types.
+	if len(typ) > 6 && typ[:6] == "union " {
+		unionName := typ[6:]
+		if unionDef, ok := p.structs[unionName]; ok {
+			a := unionDef.Align
+			if a <= 0 {
+				a = unionDef.Size
+			}
+			if a <= 0 {
+				a = 1
+			}
+			if a > 8 {
+				a = 8
+			}
+			return a
+		}
+		return 8
+	}
+	// Basic types: infer alignment from size (capped at 8).
+	if s, ok := cSizeOf(typ); ok {
+		a := s
+		if a > 8 {
+			a = 8
+		}
+		if a <= 0 {
+			a = 1
+		}
+		return a
 	}
 	return 4 // Default
 }
@@ -1099,7 +1176,7 @@ func (p *Parser) parseStructBody(kind string, structName string, topLevel bool) 
 
 			// Calculate actual member size based on type
 			memberSize := p.getTypeSize(memberType)
-			elemAlignB := memberSize
+			elemAlignB := p.getTypeAlign(memberType)
 
 			// Handle arrays (multi-dim supported): int arr[10][20];
 			var memberDims []int
@@ -1229,6 +1306,7 @@ func (p *Parser) parseStructBody(kind string, structName string, topLevel bool) 
 		Name:    structName,
 		Members: members,
 		Size:    currentOffset,
+		Align:   structAlignment,
 	}
 
 	return nil
@@ -2794,10 +2872,17 @@ func (p *Parser) parsePrimary() (*ASTNode, error) {
 		}, nil
 	}
 
-	// String
+	// String (with adjacent-string-literal concatenation, as in C:
+	// "a" "b" -> "ab"). Sea used to take only the first literal, which
+	// truncated global char* initializers like ahoy_lit_vs to "#version 330\\n"
+	// and left the shader unusable.
 	if p.match(STRING) {
 		value := p.current().Lexeme
 		p.advance()
+		for p.match(STRING) {
+			value += p.current().Lexeme
+			p.advance()
+		}
 		return &ASTNode{
 			Type:  NodeString,
 			Value: value,
