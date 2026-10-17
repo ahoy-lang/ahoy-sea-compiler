@@ -1,6 +1,7 @@
 package main
 
 import (
+	"runtime"
 	"fmt"
 	"os"
 	"os/exec"
@@ -115,6 +116,12 @@ func (cp *CompilerPipeline) Compile() error {
 	if err != nil {
 		return fmt.Errorf("parse error: %w", err)
 	}
+	// The token stream is dead once the AST exists; drop it (and the
+	// source text) so the parse-phase memory can be reclaimed.
+	cp.parser.tokens = nil
+	cp.parser.compiler = nil
+	cp.source = ""
+	runtime.GC()
 	if cp.options.Verbose {
 		fmt.Printf("  Completed in %v\n", time.Since(start))
 	}
@@ -194,6 +201,11 @@ func (cp *CompilerPipeline) Compile() error {
 		fmt.Printf("  Completed in %v\n", time.Since(start))
 	}
 
+	// The AST is no longer needed: only the global initializer nodes
+	// (referenced by sym.Init) survive, so dropping the tree lets the
+	// bulk of the parse-phase memory be reclaimed before code emission.
+	cp.ast = nil
+	runtime.GC()
 	// Phase 3: Register Allocation
 	if cp.options.Verbose {
 		fmt.Println("\n[3/5] Register Allocation...")

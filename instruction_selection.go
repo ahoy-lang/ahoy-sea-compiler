@@ -2732,7 +2732,7 @@ func (is *InstructionSelector) structArgInfo(argNode *ASTNode, arg *Operand) (st
 		return "", 0, false
 	}
 	size := is.structDefSize(typ)
-	if size <= 8 {
+	if size <= 0 {
 		return "", 0, false
 	}
 	// struct name for chunk classification
@@ -4710,22 +4710,45 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 			// Structs over 8 bytes need special passing (chunked regs
 			// for 9-16, hidden pointer for larger). Detect AFTER eval
 			// so calls/compound literals materialize first.
-			if sname, ssize, ok := is.structArgInfo(argNode, arg); ok {
+			sname, ssize, sIsStruct := is.structArgInfo(argNode, arg)
+			// Extern (gcc-compiled) DIRECT calls use the SysV ABI.
+			// Indirect calls (through function pointers) target
+			// sea-compiled trampolines and keep sea's internal ABI.
+			// A call is extern only when it names a known function that
+			// has no body in this TU; a call through a variable is
+			// indirect even though node.Target is still nil here.
+			isExtern := node.Target == nil && is.functions[node.Name] != nil && !is.funcDefined[node.Name]
+			// Small structs (<= 8 bytes, e.g. Vector2/Color) use sea's
+			// internal value convention for sea-to-sea calls, but an
+			// extern call needs proper SysV classification (a float
+			// struct like Vector2 must go in an xmm register, not an
+			// integer one). So only take the struct path for extern
+			// calls or structs larger than 8 bytes.
+			if sIsStruct && (ssize > 8 || isExtern) {
 				srcAddr := is.structSrcAddr(argNode, arg)
+				if srcAddr == nil && ssize <= 8 {
+					// Small struct value with no address (e.g. a
+					// register-returned struct like b2MakeRot()):
+					// spill it to a stack temp so the chunk loader can
+					// read it back.
+					is.stackOffset -= 8
+					tmpOff := is.stackOffset
+					sp := is.newTemp()
+					sp.DataType = "long"
+					is.emit(OpMov, sp, arg, nil)
+					is.emit(OpStore, &Operand{Type: "mem", Offset: tmpOff}, sp, nil)
+					srcAddr = is.newTemp()
+					is.emit(OpLoadAddr, srcAddr, &Operand{Type: "mem", Offset: tmpOff}, nil)
+				}
 				if srcAddr == nil {
 					return nil, fmt.Errorf("cannot pass struct argument (in function: %s)", is.currentFunc)
 				}
-				// Extern (gcc-compiled) DIRECT calls use the SysV ABI:
-				// structs larger than 16 bytes are passed by VALUE on the
-				// stack, not by pointer (sea's internal ABI). Passing a
-				// pointer corrupts the callee. Indirect calls (through
-				// function pointers) target sea-compiled trampolines and
-				// keep sea's internal ABI (pointer).
-				isExtern := (node.Target == nil) && !is.funcDefined[node.Name]
 				var chunks []string
 				if isExtern && ssize > 16 {
+					// SysV: pass big struct by value on the stack.
 					chunks = []string{"sysv"}
 				} else if ssize > 16 {
+					// sea internal ABI: pass a pointer to the struct.
 					chunks = []string{"mem"}
 				} else {
 					chunks = is.structChunkClasses(sname)
