@@ -3,7 +3,11 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // Three-address code intermediate representation
@@ -76,8 +80,15 @@ type FunctionSignature struct {
 type InstructionSelector struct {
 	instructions []*IRInstruction
 	currentFunc  string
-	labelCounter int
-	tempCounter  int
+	// counters holds the temp/label counters. It is shared across
+	// parallel clones and bumped with atomics so generated names stay
+	// globally unique; the sequential path observes the same 1,2,3...
+	// sequence as the old plain increments.
+	counters *selCounters
+	// sigsRecorded skips function-signature recording in selectNode.
+	// Parallel workers set it: the sequential pre-pass already filled
+	// the shared signature tables, which stay read-only afterwards.
+	sigsRecorded bool
 	varCounter   int // Counter to make variable names unique
 	// Loop/switch break+continue targets (innermost last). breakStack
 	// top is the switch end when inside a switch, else the loop end.
@@ -105,6 +116,11 @@ type InstructionSelector struct {
 	typedefs     map[string]string     // Typedef aliases from parser
 	enums        map[string]int        // Enum constants from parser
 
+	// tempNext/tempLeft implement batched temp-id reservation (see newTemp).
+	// Per-selector (per-worker) state: no synchronization needed.
+	tempNext int64
+	tempLeft int64
+
 	// slotSizes maps frame offsets (negative rbp offsets) to their declared
 	// byte size for the CURRENT function. emit() stamps it onto var/mem
 	// operands so loads/stores use width-correct movs (movl for int).
@@ -120,9 +136,17 @@ type InstructionSelector struct {
 	stackOffset int
 }
 
+// selCounters holds the globally-unique temp/label counters shared by a
+// selector and all of its parallel clones.
+type selCounters struct {
+	tempCounter  int64
+	labelCounter int64
+}
+
 func NewInstructionSelector() *InstructionSelector {
 	is := &InstructionSelector{
 		instructions: []*IRInstruction{},
+		counters:     &selCounters{},
 		localVars:    make(map[string]*Symbol),
 		allLocalVars: make(map[string]*Symbol),
 		globalVars:   make(map[string]*Symbol),
@@ -174,17 +198,40 @@ func NewInstructionSelector() *InstructionSelector {
 	return is
 }
 
-func (is *InstructionSelector) newTemp() *Operand {
-	is.tempCounter++
+// tempBatch is how many ids a worker reserves per atomic increment.
+// The counter is shared across parallel workers; grabbing one id at a time
+// kept all 24 cores contending on one cache line (newTemp was 9% of select).
+// MaxTemp bounds every temp id issued so far (single dense atomic
+// counter shared by sequential and parallel selection).
+func (is *InstructionSelector) MaxTemp() int {
+	return int(atomic.LoadInt64(&is.counters.tempCounter))
+}
+
+func (is *InstructionSelector) newTemp() *Operand {	if is.tempLeft == 0 {
+		const tempBatch = 256
+		base := atomic.AddInt64(&is.counters.tempCounter, tempBatch)
+		is.tempNext = base - tempBatch + 1
+		is.tempLeft = tempBatch
+	}
+	n := is.tempNext
+	is.tempNext++
+	is.tempLeft--
+	var buf [24]byte
+	b := append(buf[:0], 't')
+	b = strconv.AppendInt(b, n, 10)
 	return &Operand{
 		Type:  "temp",
-		Value: fmt.Sprintf("t%d", is.tempCounter),
+		Value: string(b),
 	}
 }
 
 func (is *InstructionSelector) newLabel(prefix string) string {
-	is.labelCounter++
-	return fmt.Sprintf("%s_%d", prefix, is.labelCounter)
+	n := atomic.AddInt64(&is.counters.labelCounter, 1)
+	var buf [64]byte
+	b := append(buf[:0], prefix...)
+	b = append(b, '_')
+	b = strconv.AppendInt(b, n, 10)
+	return string(b)
 }
 
 // cSizeOf maps a basic C type spelling to its LP64 size.
@@ -436,11 +483,11 @@ func (is *InstructionSelector) memberArrayInfo(target *ASTNode) (elemType string
 	if !found {
 		return "", 0, false
 	}
-	if os.Getenv("SEADBG") != "" {
+	if envSeaDbg {
 		fmt.Fprintf(os.Stderr, "memberArrayInfo struct=%q member=%q nmembers=%d\n", structName, target.MemberName, len(def.Members))
 	}
 	for _, m := range def.Members {
-		if os.Getenv("SEADBG") != "" {
+		if envSeaDbg {
 			fmt.Fprintf(os.Stderr, "  member %q type=%q arrayLen=%d size=%d\n", m.Name, m.Type, m.ArrayLen, m.Size)
 		}
 		if m.Name == target.MemberName && m.ArrayLen > 0 {
@@ -580,6 +627,33 @@ func (is *InstructionSelector) flattenMultiDim(node *ASTNode) (rootAddr, totalOf
 // sizeofStatic computes sizeof for an expression node without evaluating
 // it: identifiers (arrays give totals), member access, *p dereference,
 // else legacy DataType sizing (4 fallback, as before).
+// castFuncReturnType extracts the return type from a function-pointer
+// cast's DataType. The parser records (ret (*)(params)) as "ret*" (params
+// skipped), so stripping one trailing "*" yields the return type
+// ("double*" -> "double", "char**" -> "char*"). Returns "" for void,
+// struct/union, oversized, or non-pointer spellings (those keep the
+// existing largeRetHint/default paths).
+func (is *InstructionSelector) castFuncReturnType(dataType string) string {
+	t := strings.TrimSpace(dataType)
+	if !strings.HasSuffix(t, "*") {
+		return ""
+	}
+	ret := strings.TrimSpace(strings.TrimSuffix(t, "*"))
+	if ret == "" || ret == "void" {
+		return ""
+	}
+	if strings.Contains(ret, "struct ") || strings.Contains(ret, "union ") {
+		return ""
+	}
+	if strings.HasSuffix(ret, "*") {
+		return ret // pointer return: 8 bytes, rax convention
+	}
+	if s := is.getTypeSize(ret); s <= 0 || s > 8 {
+		return ""
+	}
+	return ret
+}
+
 func (is *InstructionSelector) sizeofStatic(sub *ASTNode) int {
 	if sub.Type == NodeIdentifier {
 		if sym, found := is.localVars[sub.VarName]; found {
@@ -604,17 +678,50 @@ func (is *InstructionSelector) sizeofStatic(sub *ASTNode) int {
 		if _, size, ok := is.memberTypeSize(sub); ok {
 			return size
 		}
+		// Complex base (arr[i].member, p->member, a.b.c): memberTypeSize
+		// only handles identifier roots. Resolve the base struct type
+		// (array/nesting aware) and take the member's declared size, so
+		// e.g. sizeof(slots[i].path) yields 1024, not the 4-byte fallback.
+		if baseT := is.resolveType(is.structTypeOf(sub.Children[0])); baseT != "" {
+			if def, _, ok := is.lookupMember(baseT, sub.MemberName); ok && def != nil {
+				for _, m := range def.Members {
+					if m.Name == sub.MemberName {
+						if m.Size > 0 {
+							return m.Size
+						}
+						break
+					}
+				}
+			}
+		}
 	}
 	if sub.Type == NodeArrayAccess && len(sub.Children) >= 2 {
-		baseNode := sub.Children[0]
-		if baseNode.Type == NodeIdentifier {
-			if sym, found := is.localVars[baseNode.VarName]; found {
-				et, es := is.arrayElemSize(sym)
-				_ = et
-				if es > 0 {
-					return es
+		// Walk nested indexing to the root identifier, counting depth:
+		// sizeof(arr[i]) on char[4][64] is the remaining dims' product
+		// (64), not the base element size (1). Mirrors exSizeofStatic.
+		depth := 0
+		root := sub
+		for root.Type == NodeArrayAccess && len(root.Children) >= 1 {
+			depth++
+			root = root.Children[0]
+		}
+		if root.Type == NodeIdentifier {
+			var sym *Symbol
+			if s, found := is.localVars[root.VarName]; found {
+				sym = s
+			} else if s, found := is.globalVars[root.VarName]; found {
+				sym = s
+			}
+			if sym != nil {
+				if baseSize := is.getTypeSize(sym.Type); baseSize > 0 && len(sym.Dims) >= depth {
+					total := baseSize
+					for _, d := range sym.Dims[depth:] {
+						total *= d
+					}
+					if total > 0 {
+						return total
+					}
 				}
-			} else if sym, found := is.globalVars[baseNode.VarName]; found {
 				et, es := is.arrayElemSize(sym)
 				_ = et
 				if es > 0 {
@@ -623,6 +730,7 @@ func (is *InstructionSelector) sizeofStatic(sub *ASTNode) int {
 			}
 		} else {
 			// Complex base: infer element size from pointer type.
+			baseNode := sub.Children[0]
 			if baseNode.DataType != "" {
 				if es := is.elemSizeForPtr(baseNode.DataType); es > 0 {
 					return es
@@ -1141,6 +1249,14 @@ func (is *InstructionSelector) derefHomeType(inner *ASTNode) string {
 			return trimPtr(t)
 		}
 	}
+	// Casts: *(T*)expr names its pointee explicitly. Without this,
+	// *p = structval through a cast address (e.g. ahoy-gen'd
+	// *(Node*)arr->data[i] = n) fell back to an 8-byte scalar store
+	// and silently dropped the struct tail (bell process scripts lost
+	// every node write-back: HUD text, orbiter positions, timers).
+	if inner.Type == NodeCast {
+		return trimPtr(inner.DataType)
+	}
 	return ""
 }
 
@@ -1287,48 +1403,57 @@ func (is *InstructionSelector) emit(op OpCode, dst, src1, src2 *Operand) {
 	// no explicit Size that addresses the current frame (negative offset)
 	// gets the declared slot size, so the emitter uses movl/movw/movb for
 	// sub-8-byte locals instead of 8-byte movq (which read/wrote neighbors).
-	for _, op := range []*Operand{dst, src1, src2} {
-		if op == nil {
-			continue
-		}
-		// Stamp declared type (for signed loads) alongside width.
-		if op.DataType == "" {
-			if op.IsGlobal {
-				if (op.Type == "var" || op.Type == "mem") && op.Value != "" {
-					if sym, ok := is.globalVars[op.Value]; ok {
-						op.DataType = sym.Type
-					}
-				}
-			} else if (op.Type == "var" || op.Type == "mem") && op.Offset < 0 {
-				if t, ok := is.slotTypes[op.Offset]; ok {
-					op.DataType = t
-				}
-			}
-		}
-		if op.Size != 0 {
-			continue
-		}
-		if op.IsGlobal {
-			// Globals: size from the symbol table (skip zero-size junk).
-			if (op.Type == "var" || op.Type == "mem") && op.Value != "" {
-				if sym, ok := is.globalVars[op.Value]; ok && sym.Size > 0 && sym.Size < 8 {
-					op.Size = sym.Size
-				}
-			}
-			continue
-		}
-		if (op.Type == "var" || op.Type == "mem") && op.Offset < 0 {
-			if sz, ok := is.slotSizes[op.Offset]; ok && sz > 0 {
-				op.Size = sz
-			}
-		}
-	}
+	// NOTE: unrolled over the three operands instead of ranging over a
+	// []*Operand{...} slice literal — that literal allocated once per IR
+	// instruction (~1M allocs on the editor TU).
+	is.stampOperand(dst)
+	is.stampOperand(src1)
+	is.stampOperand(src2)
 	is.instructions = append(is.instructions, &IRInstruction{
 		Op:   op,
 		Dst:  dst,
 		Src1: src1,
 		Src2: src2,
 	})
+}
+
+// stampOperand stamps declared width/type onto one frame operand (the body
+// extracted from emit so emit stays allocation-free in its dispatch).
+func (is *InstructionSelector) stampOperand(op *Operand) {
+	if op == nil {
+		return
+	}
+	// Stamp declared type (for signed loads) alongside width.
+	if op.DataType == "" {
+		if op.IsGlobal {
+			if (op.Type == "var" || op.Type == "mem") && op.Value != "" {
+				if sym, ok := is.globalVars[op.Value]; ok {
+					op.DataType = sym.Type
+				}
+			}
+		} else if (op.Type == "var" || op.Type == "mem") && op.Offset < 0 {
+			if t, ok := is.slotTypes[op.Offset]; ok {
+				op.DataType = t
+			}
+		}
+	}
+	if op.Size != 0 {
+		return
+	}
+	if op.IsGlobal {
+		// Globals: size from the symbol table (skip zero-size junk).
+		if (op.Type == "var" || op.Type == "mem") && op.Value != "" {
+			if sym, ok := is.globalVars[op.Value]; ok && sym.Size > 0 && sym.Size < 8 {
+				op.Size = sym.Size
+			}
+		}
+		return
+	}
+	if (op.Type == "var" || op.Type == "mem") && op.Offset < 0 {
+		if sz, ok := is.slotSizes[op.Offset]; ok && sz > 0 {
+			op.Size = sz
+		}
+	}
 }
 
 // getTypeSize returns the size in bytes of a type
@@ -1507,6 +1632,176 @@ func (is *InstructionSelector) SelectInstructions(ast *ASTNode) error {
 	return nil
 }
 
+// recordFunctionSignature records a function node's signature, defined
+// status, and linkage in the shared tables from its declaration alone
+// (no body walk). The sequential path calls it from selectNode; the
+// parallel pre-pass calls it directly for every function so workers can
+// treat the tables as read-only.
+func (is *InstructionSelector) recordFunctionSignature(node *ASTNode) {
+	// Normalize return type: drop storage-class qualifiers so downstream
+	// type checks (float detection etc.) see "float", not "static float".
+	rt := strings.TrimSpace(node.ReturnType)
+	for _, q := range []string{"static ", "inline ", "extern ", "const ", "volatile ", "register "} {
+		for strings.HasPrefix(rt, q) {
+			rt = strings.TrimSpace(rt[len(q):])
+		}
+	}
+	is.functions[node.Name] = &FunctionSignature{
+		ReturnType: rt,
+		ParamTypes: node.ParamTypes,
+	}
+
+	if is.funcDefined == nil {
+		is.funcDefined = make(map[string]bool)
+	}
+	// Definitions (have bodies) use sea conventions; bare
+	// declarations are external (SysV).
+	if len(node.Children) > 0 {
+		is.funcDefined[node.Name] = true
+	}
+	// static and plain-inline definitions get internal linkage (no
+	// .globl): otherwise headers like raymath.h multiply-define them
+	// at link time against their library copies. extern (incl. extern
+	// inline, which requests an instance) stays global.
+	if funcHasWord(node.ReturnType, "static") ||
+		(funcHasWord(node.ReturnType, "inline") && !funcHasWord(node.ReturnType, "extern")) {
+		is.funcIsLocal[node.Name] = true
+	}
+}
+
+// cloneForFunction returns a selector that shares the read-only tables
+// (functions, funcDefined, funcIsLocal, structs, typedefs, enums,
+// globalVars) and the atomic counters with its parent, but owns all
+// per-function state (locals, slots, labelMap, stringLits, instructions).
+func (is *InstructionSelector) cloneForFunction() *InstructionSelector {
+	return &InstructionSelector{
+		counters:     is.counters,
+		sigsRecorded: true,
+		functions:    is.functions,
+		funcDefined:  is.funcDefined,
+		funcIsLocal:  is.funcIsLocal,
+		structs:      is.structs,
+		typedefs:     is.typedefs,
+		enums:        is.enums,
+		globalVars:   is.globalVars,
+		stringLits:   make(map[string]string),
+		localVars:    make(map[string]*Symbol),
+		allLocalVars: make(map[string]*Symbol),
+		slotSizes:    make(map[int]int),
+		slotTypes:    make(map[int]string),
+		labelMap:     make(map[string]string),
+	}
+}
+
+// SelectInstructionsParallel selects instructions for each top-level
+// function body concurrently while preserving the sequential
+// instruction layout.
+//
+// A sequential pre-pass runs first: every non-function top-level child
+// (globals, prototypes, ...) is selected inline exactly as before, and
+// each function signature is recorded. Afterwards the shared tables are
+// only read, so a worker pool (runtime.NumCPU) can select one function
+// per cloned selector with no locks: temp/label counters are shared
+// atomics (names stay globally unique; only their numbering order across
+// functions is nondeterministic), and string literals accumulate in
+// per-worker maps merged in function order (labels are unique, so every
+// use resolves to its definition). Segments are concatenated in AST
+// order, so the merged IR matches the sequential layout.
+func (is *InstructionSelector) SelectInstructionsParallel(ast *ASTNode) error {
+	children := ast.Children
+	segments := make([][]*IRInstruction, len(children))
+
+	// Pre-pass: non-function nodes inline (same order, same behavior as
+	// sequential), signatures only for functions with bodies.
+	for i, child := range children {
+		if child.Type == NodeFunction && len(child.Children) > 0 {
+			is.recordFunctionSignature(child)
+			continue
+		}
+		start := len(is.instructions)
+		if err := is.selectNode(child); err != nil {
+			return err
+		}
+		if seg := is.instructions[start:]; len(seg) > 0 {
+			cp := make([]*IRInstruction, len(seg))
+			copy(cp, seg)
+			segments[i] = cp
+		}
+		is.instructions = is.instructions[:start]
+	}
+	is.sigsRecorded = true
+
+	// Function bodies in AST order.
+	funcOrder := make([]int, 0)
+	for i, child := range children {
+		if child.Type == NodeFunction && len(child.Children) > 0 {
+			funcOrder = append(funcOrder, i)
+		}
+	}
+
+	if len(funcOrder) > 0 {
+		type funcResult struct {
+			instrs []*IRInstruction
+			lits   map[string]string
+			err    error
+		}
+		results := make([]funcResult, len(funcOrder))
+		workers := runtime.NumCPU()
+		if workers < 1 {
+			workers = 1
+		}
+		if workers > len(funcOrder) {
+			workers = len(funcOrder)
+		}
+		jobs := make(chan int, len(funcOrder))
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := range jobs {
+					clone := is.cloneForFunction()
+					// Signatures were recorded in the pre-pass
+					// (sigsRecorded skips them); only the body runs.
+					if err := clone.selectNode(children[funcOrder[j]]); err != nil {
+						results[j].err = err
+						continue
+					}
+					results[j].instrs = clone.instructions
+					results[j].lits = clone.stringLits
+				}
+			}()
+		}
+		for j := range funcOrder {
+			jobs <- j
+		}
+		close(jobs)
+		wg.Wait()
+
+		for j := range funcOrder {
+			if results[j].err != nil {
+				return results[j].err
+			}
+		}
+		// Merge in original AST order (deterministic given the same
+		// per-function IR; only cross-function temp/label numbering
+		// varies with scheduling).
+		for j, ci := range funcOrder {
+			segments[ci] = results[j].instrs
+			for label, str := range results[j].lits {
+				is.stringLits[label] = str
+			}
+		}
+	}
+
+	merged := is.instructions[:0]
+	for _, seg := range segments {
+		merged = append(merged, seg...)
+	}
+	is.instructions = merged
+	return nil
+}
+
 func (is *InstructionSelector) selectNode(node *ASTNode) error {
 	if node == nil {
 		return nil
@@ -1521,35 +1816,11 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 		}
 
 	case NodeFunction:
-		// Track the function signature
-		// Normalize return type: drop storage-class qualifiers so downstream
-		// type checks (float detection etc.) see "float", not "static float".
-		rt := strings.TrimSpace(node.ReturnType)
-		for _, q := range []string{"static ", "inline ", "extern ", "const ", "volatile ", "register "} {
-			for strings.HasPrefix(rt, q) {
-				rt = strings.TrimSpace(rt[len(q):])
-			}
-		}
-		is.functions[node.Name] = &FunctionSignature{
-			ReturnType: rt,
-			ParamTypes: node.ParamTypes,
-		}
-
-		if is.funcDefined == nil {
-			is.funcDefined = make(map[string]bool)
-		}
-		// Definitions (have bodies) use sea conventions; bare
-		// declarations are external (SysV).
-		if len(node.Children) > 0 {
-			is.funcDefined[node.Name] = true
-		}
-		// static and plain-inline definitions get internal linkage (no
-		// .globl): otherwise headers like raymath.h multiply-define them
-		// at link time against their library copies. extern (incl. extern
-		// inline, which requests an instance) stays global.
-		if funcHasWord(node.ReturnType, "static") ||
-			(funcHasWord(node.ReturnType, "inline") && !funcHasWord(node.ReturnType, "extern")) {
-			is.funcIsLocal[node.Name] = true
+		// Track the function signature (skipped by parallel workers:
+		// the pre-pass already recorded every signature and the shared
+		// tables stay read-only during the parallel phase).
+		if !is.sigsRecorded {
+			is.recordFunctionSignature(node)
 		}
 
 		// Skip external function declarations (no body)
@@ -2075,6 +2346,12 @@ func (is *InstructionSelector) selectNode(node *ASTNode) error {
 					is.emit(OpMov, &Operand{Type: "reg", Value: "rdx"}, hi, nil)
 				}
 			} else if funcSig != nil && funcSig.ReturnType != "" {
+				// Scalar value conversion (float<->double, int<->float):
+				// a bitwise move is wrong when the value's type differs
+				// from the declared return (e.g. `double f(){return f32;}`
+				// copied xmm0 bits as a double: 0.0166f became ~2.4e-313).
+				// Untyped sources convert to a no-op (today's behavior).
+				result = is.convertForHome(result, funcSig.ReturnType)
 				// Narrow sub-int returns (short/char) with C semantics:
 				// truncate to width, then extend to 64-bit (signed types
 				// sign-extend, so int16 -1 stays -1, not 65535).
@@ -2797,14 +3074,14 @@ func (is *InstructionSelector) emitStructCopy(dstAddr, srcAddr *Operand, structS
 		// rax = src base + offset; tmp = *rax.
 		is.emit(OpLoad, rax, &Operand{Type: "mem", Offset: srcSlot}, nil)
 		if offset > 0 {
-			is.emit(OpAdd, rax, rax, &Operand{Type: "imm", Value: fmt.Sprintf("%d", offset)})
+			is.emit(OpAdd, rax, rax, &Operand{Type: "imm", Value: strconv.Itoa(offset)})
 		}
 		tmp := is.newTemp()
 		is.emit(OpLoad, tmp, &Operand{Type: "ptr", IndexTemp: rax, Size: chunk}, nil)
 		// r11 = dst base + offset; *r11 = tmp.
 		is.emit(OpLoad, r11, &Operand{Type: "mem", Offset: dstSlot}, nil)
 		if offset > 0 {
-			is.emit(OpAdd, r11, r11, &Operand{Type: "imm", Value: fmt.Sprintf("%d", offset)})
+			is.emit(OpAdd, r11, r11, &Operand{Type: "imm", Value: strconv.Itoa(offset)})
 		}
 		is.emit(OpStore, &Operand{Type: "ptr", IndexTemp: r11, Size: chunk}, tmp, nil)
 		offset += chunk
@@ -3407,11 +3684,11 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 
 			// Element size comes from the pointer type (e.g. enum* -> 4).
 			// Hardcoding 8 here overflowed realloc'd buffers (heap corruption).
-			if os.Getenv("SEADBG") != "" {
+			if envSeaDbg {
 				fmt.Fprintf(os.Stderr, "ARRLOAD baseType=%q elemSize=%d\n", baseAddr.DataType, 0)
 			}
 			elemSize := is.elemSizeForPtr(baseAddr.DataType)
-			elementSizeOp := &Operand{Type: "imm", Value: fmt.Sprintf("%d", elemSize)}
+			elementSizeOp := &Operand{Type: "imm", Value: strconv.Itoa(elemSize)}
 			byteOffset := is.newTemp()
 			is.emit(OpMul, byteOffset, index, elementSizeOp)
 
@@ -3462,7 +3739,7 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		memberName := node.MemberName
 		isPtr := node.IsPointer // true for -> operator
 
-		if os.Getenv("SEADEBUG") != "" {
+		if envSeaDebug {
 			fmt.Fprintf(os.Stderr, "MEMBERACCESS baseNodeType=%d member=%s func=%s\n", baseNode.Type, memberName, is.currentFunc)
 		}
 
@@ -4665,6 +4942,16 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 		if funcSig, ok := is.functions[node.Name]; ok {
 			returnType = funcSig.ReturnType
 		}
+		// Indirect calls through a function-pointer cast carry the
+		// signature in the cast's DataType ("double*" for
+		// (double(*)(void*))): the prefix is the return type. Without
+		// this the result defaults to int handling (movslq of eax),
+		// which truncates double returns in rax to their low 32 bits
+		// (3.25 becomes 0.0). Mirrors exIndirectRetType in spass.
+		// Struct/void returns stay "" (largeRetHint / existing paths).
+		if returnType == "" && node.Target != nil && node.Target.Type == NodeCast {
+			returnType = is.castFuncReturnType(node.Target.DataType)
+		}
 
 		// External float/double returns (libc table; declared functions
 		// resolve via the map above). Sea-defined functions use rax
@@ -4776,6 +5063,21 @@ func (is *InstructionSelector) selectExpression(node *ASTNode) (*Operand, error)
 				}
 				callArgs = append(callArgs, callArg{isStruct: true, chunks: chunks, srcAddr: srcAddr, ssize: ssize})
 				continue
+			}
+			// Sea-to-sea small structs (<= 8 bytes, e.g. Vector2/Color)
+			// pass BY VALUE in int regs/slots (see above): load the
+			// value bits now, so the slot below carries the value
+			// rather than the struct's address. Without this the
+			// callee homed the address bits as the value (raymath
+			// Vector2Rotate saw v=(addr-lo,addr-hi) and returned zeros).
+			// (Extern calls took the SysV struct path above.)
+			if sIsStruct && ssize > 0 && ssize <= 8 && !isExtern {
+				if src := is.structSrcAddr(argNode, arg); src != nil {
+					val := is.newTemp()
+					val.DataType = "long"
+					is.emit(OpLoad, val, &Operand{Type: "ptr", IndexTemp: src, Size: 8}, nil)
+					arg = val
+				}
 			}
 			// C conversion to the expected param type (int->float,
 			// float->double...). Unknown/varargs keep arg as-is.

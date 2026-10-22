@@ -18,24 +18,29 @@ var scratchRegs = map[int]bool{RAX: true, RDX: true, R11: true}
 // this, spill slot 0 landed on the saved-rbp slot and corrupted frames.
 func frameExtent(instructions []*IRInstruction) int {
 	maxOff := 0
-	var walk func(op *Operand)
-	walk = func(op *Operand) {
-		if op == nil {
-			return
-		}
-		if (op.Type == "var" || op.Type == "mem" || op.Type == "array") && op.Offset < 0 && !op.IsGlobal {
-			if -op.Offset > maxOff {
-				maxOff = -op.Offset
+	for _, instr := range instructions {
+		// Unrolled over the three operands; IndexTemp chains are
+		// shallow (one level in practice), so walk them iteratively
+		// instead of via a per-instruction closure.
+		for k := 0; k < 3; k++ {
+			var op *Operand
+			switch k {
+			case 0:
+				op = instr.Dst
+			case 1:
+				op = instr.Src1
+			default:
+				op = instr.Src2
+			}
+			for op != nil {
+				if (op.Type == "var" || op.Type == "mem" || op.Type == "array") && op.Offset < 0 && !op.IsGlobal {
+					if -op.Offset > maxOff {
+						maxOff = -op.Offset
+					}
+				}
+				op = op.IndexTemp
 			}
 		}
-		if op.IndexTemp != nil {
-			walk(op.IndexTemp)
-		}
-	}
-	for _, instr := range instructions {
-		walk(instr.Dst)
-		walk(instr.Src1)
-		walk(instr.Src2)
 	}
 	return maxOff
 }
@@ -65,23 +70,29 @@ type LiveRange struct {
 // inside a ptr/array operand is still live at this instruction — skipping it
 // let two live temps share one register (segfaults). No opts, just correct.
 func instrTemps(instr *IRInstruction) []*Operand {
-	var out []*Operand
-	var walk func(op *Operand)
-	walk = func(op *Operand) {
-		if op == nil {
-			return
-		}
-		if op.Type == "temp" {
-			out = append(out, op)
-		}
-		if op.IndexTemp != nil {
-			walk(op.IndexTemp)
-		}
+	return instrTempsInto(instr, nil)
+}
+
+// instrTempsInto is the allocation-free variant: operands are appended to
+// buf (caller passes a reused scratch, e.g. tbuf[:0]). computeIntervals
+// calls this 1.6M times; a fresh slice per call was ~half its allocs.
+func instrTempsInto(instr *IRInstruction, buf []*Operand) []*Operand {
+	walkTemps(instr.Dst, &buf)
+	walkTemps(instr.Src1, &buf)
+	walkTemps(instr.Src2, &buf)
+	return buf
+}
+
+func walkTemps(op *Operand, buf *[]*Operand) {
+	if op == nil {
+		return
 	}
-	walk(instr.Dst)
-	walk(instr.Src1)
-	walk(instr.Src2)
-	return out
+	if op.Type == "temp" {
+		*buf = append(*buf, op)
+	}
+	if op.IndexTemp != nil {
+		walkTemps(op.IndexTemp, buf)
+	}
 }
 
 func NewRegisterAllocator(instructions []*IRInstruction) *RegisterAllocator {
@@ -337,11 +348,78 @@ type LinearScanAllocator struct {
 	instructions []*IRInstruction
 	intervals    []*Interval
 	active       []*Interval
-	allocation   map[string]int
+	slots        []tempSlot // indexed by temp id (tN -> N); replaces
+	nSpills      int        // distinct spilled temps (for slot offsets)
 	freeRegs     []int
-	stackSlots   map[string]int
 	frameBase    int
 	argBusy      []argRegBusyRange // pending call-argument register windows
+}
+
+// tempSlot is one temp's allocator state. Temps are always named tN with
+// dense N (single atomic counter), so id-indexed slots replace the three
+// name-keyed maps (varIntervals/allocation/stackSlots) from the hot path:
+// a manual integer parse + slice index is far cheaper than a string hash.
+type tempSlot struct {
+	iv    *Interval // interval under construction (computeIntervals)
+	reg   int32     // allocated register, -1 = none
+	spill int32     // spill offset, 0 = none
+}
+
+// tempID parses a "tN" temp name to its numeric id.
+func tempID(name string) (int, bool) {
+	if len(name) < 2 || name[0] != 't' {
+		return 0, false
+	}
+	id := 0
+	for i := 1; i < len(name); i++ {
+		c := name[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		id = id*10 + int(c-'0')
+	}
+	return id, true
+}
+
+// PreSizeTemps sizes slots (and intervals capacity) for temp ids up to
+// maxID in one allocation, so the computeIntervals/Allocate walks never
+// regrow: growTemp's doubling make+copy+init cost ~34MB transient on the
+// editor TU. Temp ids come from one dense atomic counter (see newTemp),
+// so the selector's MaxTemp bounds every id. Callers that skip this still
+// work via growTemp.
+func (lsa *LinearScanAllocator) PreSizeTemps(maxID int) {
+	need := maxID + 64
+	if need <= len(lsa.slots) {
+		return
+	}
+	ns := make([]tempSlot, need)
+	copy(ns, lsa.slots)
+	for i := len(lsa.slots); i < need; i++ {
+		ns[i].reg = -1
+	}
+	lsa.slots = ns
+	if cap(lsa.intervals) < need {
+		ni := make([]*Interval, len(lsa.intervals), need)
+		copy(ni, lsa.intervals)
+		lsa.intervals = ni
+	}
+}
+
+// growTemp ensures slots covers id, preserving existing entries.
+func (lsa *LinearScanAllocator) growTemp(id int) {
+	if id < len(lsa.slots) {
+		return
+	}
+	n := len(lsa.slots)*2 + 64
+	if n <= id {
+		n = id + 64
+	}
+	ns := make([]tempSlot, n)
+	copy(ns, lsa.slots)
+	for i := len(lsa.slots); i < n; i++ {
+		ns[i].reg = -1
+	}
+	lsa.slots = ns
 }
 
 type Interval struct {
@@ -359,26 +437,32 @@ func NewLinearScanAllocator(instructions []*IRInstruction) *LinearScanAllocator 
 			freeRegs = append(freeRegs, r)
 		}
 	}
-	
+
+	n := len(instructions)
+	// slots starts empty; growTemp initializes reg=-1 on expansion.
 	return &LinearScanAllocator{
 		instructions: instructions,
-		intervals:    []*Interval{},
+		intervals:    make([]*Interval, 0, n/4),
 		active:       []*Interval{},
-		allocation:   make(map[string]int),
+		slots:        make([]tempSlot, 0, n/4),
 		freeRegs:     freeRegs,
-		stackSlots:   make(map[string]int),
 	}
 }
 
+// intervalByStart sorts intervals by Start without sort.Slice's per-call
+// reflection overhead (~500K intervals on the editor TU).
+type intervalByStart []*Interval
+
+func (s intervalByStart) Len() int           { return len(s) }
+func (s intervalByStart) Less(i, j int) bool { return s[i].Start < s[j].Start }
+func (s intervalByStart) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+
 func (lsa *LinearScanAllocator) Allocate() error {
-	lsa.frameBase = frameExtent(lsa.instructions)
-	// Compute intervals
+	// Compute intervals (frame extent is measured in the same walk).
 	lsa.computeIntervals()
 	
 	// Sort intervals by start point
-	sort.Slice(lsa.intervals, func(i, j int) bool {
-		return lsa.intervals[i].Start < lsa.intervals[j].Start
-	})
+	sort.Sort(intervalByStart(lsa.intervals))
 
 	// Fixed argument registers live from their OpSetArg until the call;
 	// temps overlapping a window must not be colored into that register.
@@ -407,15 +491,13 @@ func (lsa *LinearScanAllocator) Allocate() error {
 			// Allocate register
 			reg := lsa.freeRegs[pick]
 			lsa.freeRegs = append(lsa.freeRegs[:pick], lsa.freeRegs[pick+1:]...)
-			
+
 			interval.Reg = reg
-			lsa.allocation[interval.VarName] = reg
-			lsa.active = append(lsa.active, interval)
-			
-			// Keep active sorted by end point
-			sort.Slice(lsa.active, func(i, j int) bool {
-				return lsa.active[i].End < lsa.active[j].End
-			})
+			if id, ok := tempID(interval.VarName); ok {
+				lsa.growTemp(id)
+				lsa.slots[id].reg = int32(reg)
+			}
+			lsa.insertActive(interval)
 		}
 	}
 	
@@ -430,22 +512,23 @@ func (lsa *LinearScanAllocator) Allocate() error {
 // opens a window that closes at the next OpCall. The written registers are
 // live (pending argument values) throughout the window.
 func (lsa *LinearScanAllocator) collectArgRegBusy() {
-	nameToReg := map[string]int{}
-	for _, r := range argRegs {
-		nameToReg[regNames[r]] = r
+	firstAt := make(map[int]int, 6)
+	// Roughly one busy range per call-argument register per call.
+	if cap(lsa.argBusy) == 0 {
+		lsa.argBusy = make([]argRegBusyRange, 0, len(lsa.instructions)/64)
 	}
-
-	firstAt := map[int]int{}
 	flush := func(end int) {
 		for reg, start := range firstAt {
 			lsa.argBusy = append(lsa.argBusy, argRegBusyRange{reg: reg, start: start, end: end})
 		}
-		firstAt = map[int]int{}
+		// Reuse the map across calls (was: fresh map per OpCall, ~10K
+		// allocs on the editor TU).
+		clear(firstAt)
 	}
 
 	for i, instr := range lsa.instructions {
 		if instr.Dst != nil && instr.Dst.Type == "reg" {
-			if r, ok := nameToReg[instr.Dst.Value]; ok {
+			if r, ok := argRegNameToReg(instr.Dst.Value); ok {
 				if _, seen := firstAt[r]; !seen {
 					firstAt[r] = i
 				}
@@ -456,6 +539,26 @@ func (lsa *LinearScanAllocator) collectArgRegBusy() {
 		}
 	}
 	flush(len(lsa.instructions) - 1)
+}
+
+// argRegNameToReg maps a SysV integer argument register name to its number
+// without a per-call map lookup (collectArgRegBusy runs per instruction).
+func argRegNameToReg(name string) (int, bool) {
+	switch name {
+	case "rdi":
+		return RDI, true
+	case "rsi":
+		return RSI, true
+	case "rdx":
+		return RDX, true
+	case "rcx":
+		return RCX, true
+	case "r8":
+		return R8, true
+	case "r9":
+		return R9, true
+	}
+	return 0, false
 }
 
 // computeForbiddenMasks marks each interval with the argument registers
@@ -526,6 +629,25 @@ func immMaterializedIntoReg(op *Operand) bool {
 //     materializing (float, or !immFits32) loads it into %r10; nothing may
 //     live in R10 across that instruction.
 func (lsa *LinearScanAllocator) computeEmitterClobberMasks() {
+	// Imm32-fit results are cached per unique immediate spelling: the
+	// editor TU has ~340K ALU-with-imm instructions but only ~1.4K distinct
+	// spellings, and immFits32 parses each from scratch.
+	fitsCache := make(map[string]bool, 2048)
+	immNeedsR10 := func(op *Operand) bool {
+		if op == nil || op.Type != "imm" {
+			return false
+		}
+		if op.DataType == "float" || op.DataType == "double" {
+			return true
+		}
+		if fits, ok := fitsCache[op.Value]; ok {
+			return !fits
+		}
+		fits := immFits32(op.Value)
+		fitsCache[op.Value] = fits
+		return !fits
+	}
+
 	var callIdxs, rcxIdxs, r10Idxs []int
 	for i, instr := range lsa.instructions {
 		switch instr.Op {
@@ -539,7 +661,7 @@ func (lsa *LinearScanAllocator) computeEmitterClobberMasks() {
 			}
 		case OpAdd, OpSub, OpAnd, OpOr, OpXor, OpMul,
 			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
-			if immMaterializedIntoReg(instr.Src2) {
+			if immNeedsR10(instr.Src2) {
 				r10Idxs = append(r10Idxs, i)
 			}
 		}
@@ -550,23 +672,30 @@ func (lsa *LinearScanAllocator) computeEmitterClobberMasks() {
 		callMask |= 1 << uint(r)
 	}
 
-	// touching reports whether any index in the sorted list falls in
-	// [interval.Start, interval.End] (the emitter scratch use happens at
-	// that instruction, so both its definition site and any live-across
-	// interval are corrupted).
-	touching := func(list []int, iv *Interval) bool {
-		j := sort.SearchInts(list, iv.Start)
-		return j < len(list) && list[j] <= iv.End
-	}
-
+	// All three index lists are ascending (built in instruction order)
+	// and intervals arrive sorted by Start (Allocate sorts before this
+	// pass), so each list is swept once with a monotone cursor: total
+	// O(intervals + events) instead of 3 binary searches per interval.
+	// Predicates match the old searches exactly: a call strictly inside
+	// (Start, End); rcx/r10 touching [Start, End].
+	ci, ri, ti := 0, 0, 0
 	for _, iv := range lsa.intervals {
-		if j := sort.SearchInts(callIdxs, iv.Start+1); j < len(callIdxs) && callIdxs[j] < iv.End {
+		for ci < len(callIdxs) && callIdxs[ci] <= iv.Start {
+			ci++
+		}
+		if ci < len(callIdxs) && callIdxs[ci] < iv.End {
 			iv.Forbidden |= callMask
 		}
-		if touching(rcxIdxs, iv) {
+		for ri < len(rcxIdxs) && rcxIdxs[ri] < iv.Start {
+			ri++
+		}
+		if ri < len(rcxIdxs) && rcxIdxs[ri] <= iv.End {
 			iv.Forbidden |= 1 << uint(RCX)
 		}
-		if touching(r10Idxs, iv) {
+		for ti < len(r10Idxs) && r10Idxs[ti] < iv.Start {
+			ti++
+		}
+		if ti < len(r10Idxs) && r10Idxs[ti] <= iv.End {
 			iv.Forbidden |= 1 << uint(R10)
 		}
 	}
@@ -575,62 +704,98 @@ func (lsa *LinearScanAllocator) computeEmitterClobberMasks() {
 // GetUsedRegisters returns the distinct registers holding temps (for
 // callee-saved push/pop in the emitter).
 func (lsa *LinearScanAllocator) GetUsedRegisters() []int {
-	seen := make(map[int]bool)
-	var regs []int
-	for _, r := range lsa.allocation {
-		if !seen[r] {
-			seen[r] = true
-			regs = append(regs, r)
+	var mask uint32
+	for i := range lsa.slots {
+		if r := lsa.slots[i].reg; r >= 0 {
+			mask |= 1 << uint(r)
 		}
 	}
-	sort.Ints(regs)
+	var regs []int
+	for r := 0; mask != 0; r++ {
+		if mask&1 != 0 {
+			regs = append(regs, r)
+		}
+		mask >>= 1
+	}
 	return regs
 }
 
 func (lsa *LinearScanAllocator) computeIntervals() {
-	varIntervals := make(map[string]*Interval)
-	
+	maxOff := 0
 	for i, instr := range lsa.instructions {
-		operands := instrTemps(instr)
-
-		for _, op := range operands {
-			// Only compute intervals for temporaries, not variables
-			// Variables stay on the stack
-			if op == nil || op.Type != "temp" {
-			continue
+		// Single walk over the three operand chains per instruction:
+		// temps extend intervals, var/mem/array deepen the frame extent
+		// for spill slots (used to be two separate full walks plus an
+		// instrTempsInto scratch pass).
+		for k := 0; k < 3; k++ {
+			var op *Operand
+			switch k {
+			case 0:
+				op = instr.Dst
+			case 1:
+				op = instr.Src1
+			default:
+				op = instr.Src2
 			}
-			
-			varName := op.Value
-			
-			if _, exists := varIntervals[varName]; !exists {
-				varIntervals[varName] = &Interval{
-					VarName: varName,
-					Start:   i,
-					End:     i,
-					Reg:     -1,
+			for op != nil {
+				if op.Type == "temp" {
+					if id, ok := tempID(op.Value); ok {
+						lsa.growTemp(id)
+						if lsa.slots[id].iv == nil {
+							iv := &Interval{
+								VarName: op.Value,
+								Start:   i,
+								End:     i,
+								Reg:     -1,
+							}
+							lsa.slots[id].iv = iv
+							lsa.intervals = append(lsa.intervals, iv)
+						} else {
+							lsa.slots[id].iv.End = i
+						}
+					}
+				} else if (op.Type == "var" || op.Type == "mem" || op.Type == "array") && op.Offset < 0 && !op.IsGlobal {
+					if -op.Offset > maxOff {
+						maxOff = -op.Offset
+					}
 				}
-			} else {
-				varIntervals[varName].End = i
+				op = op.IndexTemp
 			}
 		}
 	}
-	
-	for _, interval := range varIntervals {
-		lsa.intervals = append(lsa.intervals, interval)
-	}
+	lsa.frameBase = maxOff
 }
 
 func (lsa *LinearScanAllocator) expireOldIntervals(interval *Interval) {
-	i := 0
-	for i < len(lsa.active) {
-		if lsa.active[i].End >= interval.Start {
-			break
-		}
-		
-		// Free the register
-		lsa.freeRegs = append(lsa.freeRegs, lsa.active[i].Reg)
-		lsa.active = append(lsa.active[:i], lsa.active[i+1:]...)
+	// active is sorted by End, so expired intervals form a prefix: free
+	// them and drop the prefix with one memmove instead of one per expiry.
+	k := 0
+	for k < len(lsa.active) && lsa.active[k].End < interval.Start {
+		lsa.freeRegs = append(lsa.freeRegs, lsa.active[k].Reg)
+		lsa.active[k] = nil
+		k++
 	}
+	if k == 0 {
+		return
+	}
+	copy(lsa.active, lsa.active[k:])
+	for i := len(lsa.active) - k; i < len(lsa.active); i++ {
+		lsa.active[i] = nil
+	}
+	lsa.active = lsa.active[:len(lsa.active)-k]
+}
+
+// insertActive adds an interval to active, which is kept sorted by End.
+// Active holds at most a handful of intervals (bounded by free registers),
+// so insertion sort beats sort.Slice's reflection overhead per interval.
+func (lsa *LinearScanAllocator) insertActive(interval *Interval) {
+	pos := len(lsa.active)
+	for pos > 0 && lsa.active[pos-1].End > interval.End {
+		pos--
+	}
+	lsa.active = append(lsa.active, nil)
+	copy(lsa.active[pos+1:], lsa.active[pos:])
+	lsa.active[pos] = interval
 }
 
 func (lsa *LinearScanAllocator) spillAtInterval(interval *Interval) {
@@ -649,20 +814,51 @@ func (lsa *LinearScanAllocator) spillAtInterval(interval *Interval) {
 		// Spill the chosen active interval
 		spill := lsa.active[pick]
 		interval.Reg = spill.Reg
-		lsa.allocation[interval.VarName] = spill.Reg
-		
-		offset := lsa.frameBase + (len(lsa.stackSlots)+1)*8
-		lsa.stackSlots[spill.VarName] = offset
-		delete(lsa.allocation, spill.VarName)
-		
+		if id, ok := tempID(interval.VarName); ok {
+			lsa.growTemp(id)
+			lsa.slots[id].reg = int32(spill.Reg)
+		}
+
+		lsa.spillTemp(spill.VarName)
+		lsa.unallocTemp(spill.VarName)
+
 		lsa.active[pick] = interval
-		sort.Slice(lsa.active, func(i, j int) bool {
-			return lsa.active[i].End < lsa.active[j].End
-		})
+		// Active was sorted by End before the swap; only the element at
+		// pick can be out of place, so bubble it to its slot instead of
+		// re-sorting (sort.Slice per spill showed up in profiles).
+		for pick > 0 && lsa.active[pick-1].End > lsa.active[pick].End {
+			lsa.active[pick-1], lsa.active[pick] = lsa.active[pick], lsa.active[pick-1]
+			pick--
+		}
+		for pick+1 < len(lsa.active) && lsa.active[pick].End > lsa.active[pick+1].End {
+			lsa.active[pick], lsa.active[pick+1] = lsa.active[pick+1], lsa.active[pick]
+			pick++
+		}
 	} else {
 		// Spill current interval
-		offset := lsa.frameBase + (len(lsa.stackSlots)+1)*8
-		lsa.stackSlots[interval.VarName] = offset
+		lsa.spillTemp(interval.VarName)
+	}
+}
+
+// spillTemp assigns a stack slot to a temp (idempotent: each temp is
+// spilled at most once, mirroring the old map-len-based offsets exactly).
+func (lsa *LinearScanAllocator) spillTemp(varName string) {
+	id, ok := tempID(varName)
+	if !ok {
+		return
+	}
+	lsa.growTemp(id)
+	if lsa.slots[id].spill == 0 {
+		lsa.nSpills++
+		lsa.slots[id].spill = int32(lsa.frameBase + lsa.nSpills*8)
+	}
+}
+
+// unallocTemp drops a temp's register assignment (spill of an active).
+func (lsa *LinearScanAllocator) unallocTemp(varName string) {
+	if id, ok := tempID(varName); ok {
+		lsa.growTemp(id)
+		lsa.slots[id].reg = -1
 	}
 }
 
@@ -684,18 +880,16 @@ func (lsa *LinearScanAllocator) rewriteOperand(op **Operand) {
 	// Only allocate registers to temporaries, not to variables
 	// Variables should stay on the stack
 	if operand.Type == "temp" {
-		varName := operand.Value
-		
-		if reg, ok := lsa.allocation[varName]; ok {
-			oldDataType := operand.DataType  // Preserve DataType
-			operand.Type = "reg"
-			operand.Value = regNames[reg]
-			operand.DataType = oldDataType  // Restore DataType
-		} else if offset, ok := lsa.stackSlots[varName]; ok {
-			oldDataType := operand.DataType  // Preserve DataType
-			operand.Type = "mem"
-			operand.Offset = -offset
-			operand.DataType = oldDataType  // Restore DataType
+		// NOTE: DataType needs no save/restore: assigning Type/Value
+		// leaves it untouched (the old dance was a no-op).
+		if id, ok := tempID(operand.Value); ok && id < len(lsa.slots) {
+			if reg := lsa.slots[id].reg; reg >= 0 {
+				operand.Type = "reg"
+				operand.Value = regNames[reg]
+			} else if off := lsa.slots[id].spill; off != 0 {
+				operand.Type = "mem"
+				operand.Offset = -int(off)
+			}
 		}
 	} else if operand.Type == "var" {
 		// Variables are always on the stack - keep as "var" type

@@ -138,6 +138,15 @@ func NewPreprocessor() *Preprocessor {
 	// so `{0}` is exact and folds through global .comm/.data paths).
 	p.defines["PTHREAD_MUTEX_INITIALIZER"] = "{0}"
 	p.defines["PTHREAD_COND_INITIALIZER"] = "{0}"
+	// <dlfcn.h> RTLD mode flags (header skipped; glibc bits/dlfcn.h values).
+	p.defines["RTLD_LAZY"] = "1"
+	p.defines["RTLD_NOW"] = "2"
+	p.defines["RTLD_BINDING_MASK"] = "3"
+	p.defines["RTLD_NOLOAD"] = "4"
+	p.defines["RTLD_DEEPBIND"] = "8"
+	p.defines["RTLD_GLOBAL"] = "256"
+	p.defines["RTLD_LOCAL"] = "0"
+	p.defines["RTLD_NODELETE"] = "4096"
 	p.defines["PTHREAD_ONCE_INIT"] = "0"
 	// Standard predefined macros (C17 hosted-ish): headers key bool,
 	// stdint and feature paths off these. Deliberately NOT defining
@@ -631,7 +640,7 @@ func (t *ppTokens) parseUnary(p *Preprocessor, depth int) (int64, bool) {
 // seaPPTrace logs preprocessor decisions when SEA_PPTRACE=1 (debugging
 // nondeterminism).
 func seaPPTrace(format string, args ...interface{}) {
-	if os.Getenv("SEA_PPTRACE") != "" {
+	if envSeaPPTrace {
 		fmt.Fprintf(os.Stderr, "[PP] "+format+"\n", args...)
 	}
 }
@@ -649,8 +658,15 @@ func (p *Preprocessor) Process(source string) (string, error) {
 
 	for i, line := range lines {
 		// Substitute predefined context macros (best-effort, per line).
-		line = strings.ReplaceAll(line, "__LINE__", fmt.Sprintf("%d", i+1))
-		line = strings.ReplaceAll(line, "__FILE__", "\"main.c\"")
+		// Guarded by Contains: ReplaceAll scans the whole line even on
+		// miss, and __LINE__/__FILE__ almost never appear (~500k lines
+		// flow through here on the editor TU).
+		if strings.Contains(line, "__LINE__") {
+			line = strings.ReplaceAll(line, "__LINE__", strconv.Itoa(i+1))
+		}
+		if strings.Contains(line, "__FILE__") {
+			line = strings.ReplaceAll(line, "__FILE__", "\"main.c\"")
+		}
 		trimmed := strings.TrimSpace(line)
 
 		// Handle preprocessor directives
@@ -751,7 +767,7 @@ func (p *Preprocessor) Process(source string) (string, error) {
 							// (it would comment out the invocation line).
 							body := stripDefineComment(strings.TrimSpace(restOfLine[closeParenIdx+1:]))
 
-							if os.Getenv("SEAPP") != "" {
+							if envSeaPP {
 								fmt.Fprintf(os.Stderr, "MACRO %s(%v) = %q\n", name, params, body)
 							}
 							seaPPTrace("definemacro %q(%v)", name, params)
@@ -951,7 +967,7 @@ func (p *Preprocessor) processInclude(filename string) (string, error) {
 
 	// Extract types and function signatures from this header
 	// (Do this BEFORE processing to catch declarations before they're preprocessed away)
-	p.ExtractTypesFromHeader(fullPath)
+	p.ExtractTypesFromHeader(fullPath, content)
 
 	// Process all files the same way
 	return p.Process(string(content))
@@ -974,8 +990,14 @@ func joinLogicalLines(source string) string {
 			continue
 		}
 		merged := stripLineComment(lines[i])
+		// Fast path: no parens means depth 0 without masking/scanning.
+		if strings.IndexAny(merged, "()") < 0 {
+			out = append(out, merged)
+			i++
+			continue
+		}
 		consumed := 0
-		for parenDepth(analysisMask(merged)) > 0 && i+consumed+1 < len(lines) {
+		for parenDepthMasked(merged) > 0 && i+consumed+1 < len(lines) {
 			nxt := lines[i+consumed+1]
 			if strings.HasPrefix(strings.TrimSpace(nxt), "#") {
 				break
@@ -1031,6 +1053,56 @@ func analysisMask(s string) string {
 		m = string(b)
 	}
 	return m
+}
+
+// parenDepthMasked counts unbalanced open parens in one pass, skipping
+// string/char literals and comments inline. Replaces the
+// analysisMask+parenDepth pair (two allocations + three scans per line).
+func parenDepthMasked(s string) int {
+	d := 0
+	i, n := 0, len(s)
+	for i < n {
+		c := s[i]
+		if c == '"' || c == '\'' {
+			q := c
+			i++
+			for i < n {
+				if s[i] == '\\' {
+					i += 2
+					continue
+				}
+				if s[i] == q {
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		if c == '/' && i+1 < n {
+			if s[i+1] == '/' {
+				break // rest is a line comment
+			}
+			if s[i+1] == '*' {
+				i += 2
+				for i < n {
+					if s[i] == '*' && i+1 < n && s[i+1] == '/' {
+						i += 2
+						break
+					}
+					i++
+				}
+				continue
+			}
+		}
+		if c == '(' {
+			d++
+		} else if c == ')' {
+			d--
+		}
+		i++
+	}
+	return d
 }
 
 // parenDepth counts unbalanced open parens.
@@ -1303,36 +1375,150 @@ func (p *Preprocessor) expandMacros(line string) string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
+	// Fast path: most lines reference no macro at all. A single O(n)
+	// identifier scan avoids the O(#macros) substring search per line that
+	// the naive loop performs (2410 macros x 88k lines was the hotspot).
+	masked := maskStrings(line)
+	if !p.scanHasMacro(masked) {
+		return line
+	}
+
 	result := line
-
-	// Expand to fixpoint: macro bodies routinely contain other macro
-	// calls (e.g. SDL_COMPILE_TIME_ASSERT wrapping SDL_static_cast) that
-	// only become visible after the outer expansion. Cap iterations to
-	// stay total (self-recursive macros stabilize or hit the cap).
 	for iter := 0; iter < 50; iter++ {
-		prev := result
-		// First expand function-like macros
-		for name, macro := range p.funcMacros {
-			if !strings.Contains(result, name) {
-				continue
-			}
-			result = p.expandFunctionMacro(result, name, macro)
-		}
-
-		// Then expand object-like macros
-		for name, value := range p.defines {
-			if !strings.Contains(result, name) {
-				continue
-			}
-			// Use word boundary matching
-			result = replaceIdentifier(result, name, value)
-		}
-		if result == prev {
+		next, changed := p.expandPass(result)
+		result = next
+		if !changed {
 			break
 		}
 	}
-
 	return result
+}
+
+// scanHasMacro reports whether any identifier outside strings is a known macro.
+func (p *Preprocessor) scanHasMacro(masked string) bool {
+	i := 0
+	for i < len(masked) {
+		if isIdentifierChar(masked[i]) {
+			start := i
+			for i < len(masked) && isIdentifierChar(masked[i]) {
+				i++
+			}
+			name := masked[start:i]
+			if _, ok := p.defines[name]; ok {
+				return true
+			}
+			if _, ok := p.funcMacros[name]; ok {
+				return true
+			}
+		} else {
+			i++
+		}
+	}
+	return false
+}
+
+// expandPass performs one left-to-right macro expansion pass.
+func (p *Preprocessor) expandPass(line string) (string, bool) {
+	masked := maskStrings(line)
+	var b strings.Builder
+	b.Grow(len(line) + 8)
+	i := 0
+	changed := false
+	for i < len(line) {
+		c := line[i]
+		if !isIdentifierChar(c) {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		start := i
+		for i < len(line) && isIdentifierChar(line[i]) {
+			i++
+		}
+		name := line[start:i]
+		// function-like macro: name followed by (
+		if macro, ok := p.funcMacros[name]; ok {
+			j := i
+			for j < len(line) && (line[j] == ' ' || line[j] == '\t') {
+				j++
+			}
+			if j < len(line) && line[j] == '(' {
+				expansion, next := p.substituteCall(line, masked, j, macro)
+				b.WriteString(expansion)
+				i = next
+				changed = true
+				continue
+			}
+			// not an invocation; emit name as-is
+			b.WriteString(name)
+			continue
+		}
+		// object-like macro
+		if val, ok := p.defines[name]; ok {
+			b.WriteString(val)
+			changed = true
+			continue
+		}
+		b.WriteString(name)
+	}
+	if !changed {
+		return line, false
+	}
+	return b.String(), true
+}
+
+// substituteCall expands a function-like macro invocation whose '(' is at
+// openIdx in line/masked. Returns the expansion and the index just past the
+// matching ')'.
+func (p *Preprocessor) substituteCall(line, masked string, openIdx int, macro *FunctionMacro) (string, int) {
+	j := openIdx + 1 // skip (
+	depth := 1
+	var args []string
+	var cur strings.Builder
+	cur.Grow(32)
+	hasContent := false
+	for j < len(masked) && depth > 0 {
+		if masked[j] == '(' {
+			depth++
+			cur.WriteByte(line[j])
+			hasContent = true
+		} else if masked[j] == ')' {
+			depth--
+			if depth == 0 {
+				if hasContent || len(args) > 0 {
+					args = append(args, strings.TrimSpace(cur.String()))
+				}
+				break
+			}
+			cur.WriteByte(line[j])
+			hasContent = true
+		} else if masked[j] == ',' && depth == 1 {
+			args = append(args, strings.TrimSpace(cur.String()))
+			cur.Reset()
+			hasContent = false
+		} else {
+			cur.WriteByte(line[j])
+			// NOTE: original tracked emptiness via currentArg != ""; a
+			// whitespace-only arg still counts as content there. Preserve
+			// that: any consumed char marks content.
+			hasContent = true
+		}
+		j++
+	}
+
+	expansion := macro.Body
+	for idx, param := range macro.Params {
+		if idx < len(args) {
+			expansion = stringifyParam(expansion, param, args[idx])
+		}
+	}
+	for idx, param := range macro.Params {
+		if idx < len(args) {
+			expansion = replaceIdentifier(expansion, param, args[idx])
+		}
+	}
+	expansion = pasteTokens(expansion)
+	return expansion, j + 1
 }
 
 // maskStrings blanks the contents of "..." and '...' literals (length
@@ -1340,6 +1526,11 @@ func (p *Preprocessor) expandMacros(line string) string {
 // parens, commas, # or ## inside them (e.g. "#?RADIANCE\n" or a
 // single-letter param inside a message string).
 func maskStrings(s string) string {
+	// Fast path: lines without quotes (the vast majority) need no work
+	// and no allocation. IndexByte is runtime-accelerated.
+	if strings.IndexByte(s, '"') < 0 && strings.IndexByte(s, '\'') < 0 {
+		return s
+	}
 	b := []byte(s)
 	i := 0
 	for i < len(b) {
@@ -1367,89 +1558,7 @@ func maskStrings(s string) string {
 	return string(b)
 }
 
-func (p *Preprocessor) expandFunctionMacro(text string, name string, macro *FunctionMacro) string {
-	var result strings.Builder
-	masked := maskStrings(text)
-	i := 0
 
-	for i < len(text) {
-		// Check if we found the macro name (outside strings)
-		if strings.HasPrefix(masked[i:], name) {
-			// Check if it's a complete identifier followed by (
-			// (masked: strings/chars can't start or split an invocation)
-			if i == 0 || !isIdentifierChar(masked[i-1]) {
-				// Check for opening paren
-				j := i + len(name)
-				// Skip whitespace
-				for j < len(masked) && (masked[j] == ' ' || masked[j] == '\t') {
-					j++
-				}
-
-				if j < len(masked) && masked[j] == '(' {
-					// This is a function macro invocation
-					// Extract arguments (structure from masked text,
-					// content from original to preserve strings)
-					j++ // skip (
-					depth := 1
-					var args []string
-					currentArg := ""
-
-					for j < len(masked) && depth > 0 {
-						if masked[j] == '(' {
-							depth++
-							currentArg += string(text[j])
-						} else if masked[j] == ')' {
-							depth--
-							if depth == 0 {
-								// End of macro invocation
-								if currentArg != "" || len(args) > 0 {
-									args = append(args, strings.TrimSpace(currentArg))
-								}
-								break
-							}
-							currentArg += string(text[j])
-						} else if masked[j] == ',' && depth == 1 {
-							// Argument separator
-							args = append(args, strings.TrimSpace(currentArg))
-							currentArg = ""
-						} else {
-							currentArg += string(text[j])
-						}
-						j++
-					}
-
-					// Substitute parameters in body (#param stringifies
-					// first, so the # doesn't survive into the output).
-					expansion := macro.Body
-					for idx, param := range macro.Params {
-						if idx < len(args) {
-							expansion = stringifyParam(expansion, param, args[idx])
-						}
-					}
-					for idx, param := range macro.Params {
-						if idx < len(args) {
-							expansion = replaceIdentifier(expansion, param, args[idx])
-						}
-					}
-					// Token pasting (SDL compile-time asserts rely on it).
-					expansion = pasteTokens(expansion)
-
-					if os.Getenv("SEAPP") != "" {
-						fmt.Fprintf(os.Stderr, "EXPAND %s args=%q -> %q\n", name, args, expansion)
-					}
-					result.WriteString(expansion)
-					i = j + 1 // Skip past the closing )
-					continue
-				}
-			}
-		}
-
-		result.WriteByte(text[i])
-		i++
-	}
-
-	return result.String()
-}
 
 // stringifyParam replaces #param with the quoted argument text (C #
 // operator). Skips ## (handled separately by pasteTokens).
@@ -1528,6 +1637,37 @@ func isIdentifierChar(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
 }
 
+// isDeclIdent reports whether s is shaped like a C identifier (used to
+// validate scavenged header declarations).
+func isDeclIdent(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !isIdentifierChar(c) {
+			return false
+		}
+		if i == 0 && c >= '0' && c <= '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isStmtKeyword reports whether s is a C statement keyword that can never
+// appear in a declaration's return type (return/if/else/for/...). Guards
+// the header declaration scavenger against lines like `return sinf(x);`.
+func isStmtKeyword(s string) bool {
+	switch s {
+	case "return", "if", "else", "for", "while", "do", "switch",
+		"case", "default", "goto", "break", "continue", "sizeof",
+		"typedef", "_Static_assert":
+		return true
+	}
+	return false
+}
+
 // ProcessFile is a convenience function to preprocess a file
 func (p *Preprocessor) ProcessFile(filename string) (string, error) {
 	content, err := os.ReadFile(filename)
@@ -1538,13 +1678,10 @@ func (p *Preprocessor) ProcessFile(filename string) (string, error) {
 	return p.Process(string(content))
 }
 
-// ExtractTypesFromHeader parses a header file to extract typedef and struct definitions
-func (p *Preprocessor) ExtractTypesFromHeader(filename string) error {
-	content, err := os.ReadFile(filename)
-	if err != nil {
-		return err
-	}
-
+// ExtractTypesFromHeader parses a header file to extract typedef and struct definitions.
+// content is the already-read file body (processInclude reads each
+// header once; re-reading here doubled header I/O).
+func (p *Preprocessor) ExtractTypesFromHeader(filename string, content []byte) error {
 	lines := strings.Split(string(content), "\n")
 
 	// First pass: collect all struct and typedef definitions
@@ -1856,6 +1993,27 @@ func (p *Preprocessor) parseFunctionDeclaration(line string) {
 	// Clean up the line
 	line = strings.TrimSpace(line)
 	line = strings.ReplaceAll(line, "RLAPI ", "")
+	// Drop comments: doc examples like `* int snprintf(...);` inside a
+	// header comment must never become signatures.
+	if idx := strings.Index(line, "//"); idx >= 0 {
+		line = strings.TrimSpace(line[:idx])
+	}
+	for {
+		start := strings.Index(line, "/*")
+		if start < 0 {
+			break
+		}
+		end := strings.Index(line[start+2:], "*/")
+		if end < 0 {
+			line = strings.TrimSpace(line[:start])
+			break
+		}
+		line = strings.TrimSpace(line[:start] + " " + line[start+2+end+2:])
+	}
+	// Comment continuations/leftovers never declare anything.
+	if line == "" || line[0] == '*' || line[0] == '/' {
+		return
+	}
 
 	// Skip if it doesn't look like a function declaration
 	if !strings.Contains(line, "(") || !strings.Contains(line, ")") {
@@ -1879,6 +2037,32 @@ func (p *Preprocessor) parseFunctionDeclaration(line string) {
 	funcName := parts[len(parts)-1]
 	returnType := strings.Join(parts[:len(parts)-1], " ")
 
+	// This scanner also sees non-declaration lines (local variable
+	// initializers with calls like `float z1 = sinf(x);`, `return f(x);`,
+	// control flow). A real prototype never has `=` before the paren,
+	// and both the name and the return type must be type-like: reject
+	// anything else, so garbage never shadows real signatures (or the
+	// libc math tables) downstream. Observed harm: `float z1 =
+	// sinf(roll*0.5f);` in raymath.h recorded sinf as returning
+	// "float z1 =" with param "roll*0.5f", which zeroed every 3D light
+	// direction and rotation in bell (calls read rax instead of xmm0,
+	// args went in rdi instead of xmm0).
+	if strings.Contains(beforeParen, "=") {
+		return
+	}
+	if !isDeclIdent(funcName) {
+		return
+	}
+	for _, tok := range strings.Fields(returnType) {
+		t := strings.Trim(tok, "*")
+		if t == "" {
+			continue // lone stars: pointer declarator, fine
+		}
+		if !isDeclIdent(t) || isStmtKeyword(t) {
+			return
+		}
+	}
+
 	// Extract parameter types
 	paramStart := parenIdx + 1
 	paramEnd := strings.Index(line[paramStart:], ")")
@@ -1894,6 +2078,19 @@ func (p *Preprocessor) parseFunctionDeclaration(line string) {
 		params := strings.Split(paramsStr, ",")
 		for _, param := range params {
 			param = strings.TrimSpace(param)
+			// A parameter of a real declaration is type-like words
+			// (plus `...`); anything else (operators, strings,
+			// parens from macro annotations or raw function-pointer
+			// params) means this line is not a plain prototype.
+			for _, tok := range strings.Fields(param) {
+				t := strings.Trim(tok, "*")
+				if t == "" || t == "..." {
+					continue
+				}
+				if !isDeclIdent(t) || isStmtKeyword(t) {
+					return
+				}
+			}
 			// Extract just the type (remove parameter name)
 			paramParts := strings.Fields(param)
 			if len(paramParts) > 0 {
